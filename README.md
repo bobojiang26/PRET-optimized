@@ -1,11 +1,11 @@
-# PRET: a Few-Shot System for Pan-Cancer Recognition Without Example Training
+# PRET is a few-shot system for pan-cancer recognition without example training
 
 
 ## Introduction
 
-**PRET** (**P**an-cancer **R**ecognition without **E**xample **T**raining) is an innovative approach for multi-cancer diagnostics and tasks that eliminates task-specific model training. Utilizing a few labeled examples, PRET empowers pathological foundation models with the capability to directly recognize pan-cancer in the manner of in-context learning (ICL) to learn from inference stage. PRET fully accounts for the unique characteristics of whole slide images, where massive patch tiles preserve rich local information, thereby facilitating exceptional recognition capabilities. By offering a flexible and cost-effective solution for pan-cancer recognition, PRET paves the way for accessible and equitable AI-based pathology systems, particularly benefiting minority populations and underserved regions.
+**PRET** (**P**an-cancer **R**ecognition without **E**xample **T**raining) is an innovative approach for multi-cancer diagnostics and tasks that eliminates task-specific model training. Utilizing a few labeled examples, PRET empowers pathological foundation models with the capability to directly recognize pan-cancer in the manner of in-context learning (ICL) to learn from the inference stage. PRET fully accounts for the unique characteristics of whole slide images, where massive patch tiles preserve rich local information, thereby facilitating exceptional recognition capabilities. By offering a flexible and cost-effective solution for pan-cancer recognition, PRET paves the way for accessible and equitable AI-based pathology systems, particularly benefiting minority populations and underserved regions.
 
-* This the data flow of our method to assist in understanding the code.
+* This is the data flow of our method to assist in understanding the code.
 
 ![](https://github.com/xmed-lab/PRET/blob/main/preview.png)
 
@@ -13,18 +13,8 @@
 
 * Besides the code, all in-house datasets and labels are available too ([HF DATA](https://huggingface.co/datasets/yili7eli/PRET/tree/main)).
 
-* **The paper will be released upon acceptance.**
-
-## Requesting Access
-As required by our data providers, you must agree to the outlined terms of use and provide the required information for approval. We will approve your request as soon as possible so that you can download the code model and data. Other reasons for your request access being denied include other mistakes in the form submitted, for example: full name includes abbreviations, affiliation is not spelled out, the described research use is not sufficient, or email domain address not recognized. We close the approval process upon paper acceptance.
-
 
 ## Download Resources
-* After request, login with your Access Token for next steps.
-```
-pip install --upgrade huggingface_hub
-huggingface-cli login
-```
 
 * Download this repo for the code:
 ```
@@ -43,13 +33,13 @@ huggingface-cli download yili7eli/PRET --local-dir data --repo-type dataset
 
 
 ## Install
-* Install python packages via pip:
+* Install Python packages via pip:
 ```
 cd PRET
 pip install -r requirements.txt
 ```
 
-* Install libvips via apt (ubuntu) for WSI slicing:
+* Install libvips via apt (Ubuntu) for WSI slicing:
 ```
 sudo apt install libvips-dev
 ```
@@ -57,7 +47,7 @@ sudo apt install libvips-dev
 
 ## Dataset Process
 Slice WSIs to patches; process annotations; generate data information (given in data_info/).
-* For In-house dataset and TCGA datasets:
+* For the in-house dataset and the TCGA datasets:
 ```
 #bash scripts/prepare_dataset.sh [DATASET_NAME]; for example:
 bash scripts/prepare_dataset.sh ESCC
@@ -72,8 +62,8 @@ bash scripts/prepare_dataset_camelyon.sh CAMELYON16
 ## Batch Evaluation
 Run scripts/batch_run.py for convenient batch evaluation after dataset processing.
 
-* The batch evaluation script run all involved tasks, prompt types, repeat experiments for a dataset.
-* The script run multiple experiments at once, the number of repeat experiments is n_tasks x n_prompts x n_repeats.
+* The batch evaluation script runs all involved tasks, prompt types, and repeat experiments for a dataset.
+* The script runs multiple experiments at once; the number of repeated experiments is n_tasks x n_prompts x n_repeats.
 
 ```
 #python scripts/batch_run.py [DATASET_NAME] [MODEL_NAME_OR_WEIGHTS] [PARALLEL_TASK_NUM]
@@ -84,8 +74,8 @@ python scripts/batch_run.py ESCC model.pth 4
 Run scripts/run.py for a single benchmark.
 
 * Run a single benchmark by assigned task, prompt.
-* The number of repeat experiment is n_repeats only.
-* The modes include default, baselines, eval (wo. hyperparameter search).
+* The number of repeated experiments is n_repeats only.
+* The modes include default, baselines, and eval (without hyperparameter search).
 ```
 #python scripts/run.py [GPU_ID] [DATASET_NAME] [TASK] [MODE] [PROMPT_TYPE] [MODEL_NAME_OR_WEIGHTS]
 python scripts/run.py 0 ESCC screening default slideLabel model.pth
@@ -96,7 +86,7 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 Code flow: a. scripts/batch_run.py -> b. core/feature_extractor.py -> c. scripts/run.py -> d. core/main.py -> e. core/modules.py
 
 
-* a. scripts/batch_run.py: It first extracts feature by invoking the core/feature_extractor.py as:
+* a. scripts/batch_run.py: It first extracts the feature by invoking the core/feature_extractor.py as:
 ```python
 # extract feature by invoking the core/feature_extractor.py (line 73)
 if not os.path.exists(FEAT_DIR):
@@ -106,16 +96,16 @@ os.system(command)
 
 * a. scripts/batch_run.py: Then, it gets commands from core/feature_extractor.py for each task, prompt, and mode as:
 ```python
-# invoke the scripts/run.py for the command for each benchmarks (line 99)
+# invoke the scripts/run.py for the command for each benchmark (line 99)
 commands.append(get_run_command(dataset, task, mode, prompt_type, model))
-# excute commands using multiprocessing.Pool with GPU management (line 116)
+# execute commands using multiprocessing.Pool with GPU management (line 116)
 pool.apply_async(execute_bash_command, args=(command, out_text), kwds={}, callback=None)
 ```
 
 * b. core/feature_extractor.py: It first loads the model, supporting diverse foundation models:
 ```python
-# We support many foundation models. Here we just show two examples for reference.
-# We havd provided the weights of default model, others need to download their code, dependencies and weights following their official websites.
+# We support many foundation models. Here, we just show two examples for reference.
+# We have provided the weights of the default model; others need to download their code, dependencies, and weights following their official websites.
 # load the default model from local weights
 if "vit_small" in args.arch:
     sys.path.append("network")
@@ -241,14 +231,14 @@ auc mean: 0.9748, auc std: 0.0181, f1 mean: 0.9124, f1 std: 0.048, acc mean: 0.8
 ### Dataset Files
 * The class.json contains the class names (e.g. {"Adenocarcinoma, NOS": 1, "Squamous cell carcinoma, NOS": 2}).
 * The label.txt contains file names with slide labels (e.g. xxx.svs,1).
-* The images and anno folders storage WSIs and annotations (via software ImageScope), respectively.
+* The images and anno folders store WSIs and annotations (via software ImageScope), respectively.
 
-### Script Explaination:
-* The scripts/batch_run.py firstly invokes core/feature_extractor.py for feature extraction. Then it generate running commands for target datasets, methods, prompts, and tasks.
-* The scripts/run.py generates command to invoke the core/main.py to run a specific task with repeat experiments (e.g., ESCC-screening-imgLabel).
-* The core/feature_extractor.py extract patch features, we have implemented some other foundation models. Some models require to save their code in the home folder, and some models use huggingface to download.
+### Script Explanation:
+* The scripts/batch_run.py firstly invokes core/feature_extractor.py for feature extraction. Then it generates running commands for target datasets, methods, prompts, and tasks.
+* The scripts/run.py generates a command to invoke the core/main.py to run a specific task with repeated experiments (e.g., ESCC-screening-imgLabel).
+* The core/feature_extractor.py extracts patch features, we have implemented some other foundation models. Some models require saving their code in the home folder, and some models use huggingface to download.
 * The core/modules.py contains the implementation of core modules, including tagger, miner, classifier, aggregator, pos pocessor.
-* The core/main.py is the main code, involving our method and baselines to evaluate multiple shot and repeats.
+* The core/main.py is the main code, involving our method and baselines to evaluate multiple shots and repeats.
 
 ### Extensive Datasets
 * The CAMELYON16-C simulates scan corruptions using the same slides of CAMELYON16, uncommand "RandomDistortions" in the core/feature_extractor.py to activate it. Besides, copy the dataset and data_info file from CAEMLYON16 to CAEMLYON16C.
@@ -256,17 +246,17 @@ auc mean: 0.9748, auc std: 0.0181, f1 mean: 0.9124, f1 std: 0.048, acc mean: 0.8
 * Experiments about external prompts needs to combine multiple datasets. You can create a new dataset (e.g., data/PTC_QP2GD) and merge their files. Besides, set the "fixed_test_set" (e.g., in data_info/PTC_QP2GD.json) to true for the external hospital.
 
 ### Reproducibility
-* The data_info provides a fixed data list. We change get a fixed data split with seed 1024 to ensure the same examples, val slides and test slides.
+* The data_info provides a fixed data list. We get a fixed data split with seed 1024 to ensure the same examples, val slides and test slides.
 * The different package versions may slightly change the results (within an acceptable range), including scikit-learn, CUDA, torch, torchvision, cv2, pillow, etc., that related to evaluation and data loading.
 
 ### Time Cost
-* Package installation usually takes less than an hour depending on network speed.
-* Dataset downloading takes hours or a few days depending on network speed (over 800GB for our in-house datasets).
-* The process involves slide slicing, feature extraction, hyperparameter search, multiple shot settings, multiple prompts, and repeated experiments, which can take a few or dozens of hours depending on the data scale, CPU, GPU, and IO speed;
+* Package installation usually takes less than an hour, depending on network speed.
+* Dataset downloading takes hours or a few day,s depending on network speed (over 800GB for our in-house datasets).
+* The process involves slide slicing, feature extraction, hyperparameter search, multiple shot settings, multiple prompts, and repeated experiments, which can take a few or dozens of hours depending on the data scale, CPU, GPU, and IO speed.
 
 ## Citation
 
-The paper is coming soon (accepted in principle currently).
+The paper is coming soon (accepted and waiting for publication).
 
 ## License
 ```
