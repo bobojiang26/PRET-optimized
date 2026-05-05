@@ -81,6 +81,92 @@ Run scripts/run.py for a single benchmark.
 python scripts/run.py 0 ESCC screening default slideLabel model.pth
 ```
 
+## H5 Feature Evaluation
+This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain two keys:
+
+* `features`: a 2D array with shape `(num_patches, feature_dim)`.
+* `coordinates`: a 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns are interpreted as patch grid coordinates `(x, y)`.
+
+Put all h5 files in one folder, for example:
+
+```
+data/MY_H5/h5/
+  slide_001.h5
+  slide_002.h5
+  slide_003.h5
+```
+
+If you have slide-level labels, create a `data_info/MY_H5.json` file whose keys match the h5 file names without extension:
+
+```json
+{
+    "slide_001": {
+        "wsi_label": 0,
+        "fixed_test_set": false
+    },
+    "slide_002": {
+        "wsi_label": 1,
+        "fixed_test_set": false
+    }
+}
+```
+
+Then run PRET directly on the h5 features:
+
+```
+python core/main.py \
+  --mode eval \
+  --topk 3 \
+  --temperature 10 \
+  --related_thresh 0.8 \
+  --example_num 1 \
+  --raw_feature_path data/MY_H5/h5 \
+  --wsi_path data/MY_H5/images \
+  --dump_features data/MY_H5/collected_features \
+  --dataset_info data_info/MY_H5.json \
+  --seed 1024 \
+  --top_instance 3 \
+  --test_num 6 \
+  --val_num 6 \
+  --prompt_type slideLabel \
+  --prompt_path data/MY_H5/anno \
+  --ignore 0 \
+  --file_min_size 0 \
+  --c 1 \
+  --runs 1 \
+  --dump_records records/MY_H5_screening_slideLabel_eval.npy
+```
+
+`--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. If `data_info/MY_H5.json` is missing, or if a slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
+
+You can create a small fake h5-only dataset for a local smoke test:
+
+```
+python scripts/make_fake_h5_dataset.py --out data/FAKEH5/h5 --slides 20 --patches 96 --dim 64
+
+python core/main.py \
+  --mode eval \
+  --topk 3 \
+  --temperature 10 \
+  --related_thresh 0.8 \
+  --example_num 1 \
+  --raw_feature_path data/FAKEH5/h5 \
+  --wsi_path data/FAKEH5/images \
+  --dump_features data/FAKEH5/collected_features \
+  --dataset_info data_info/FAKEH5.json \
+  --seed 1024 \
+  --top_instance 3 \
+  --test_num 6 \
+  --val_num 6 \
+  --prompt_type slideLabel \
+  --prompt_path data/FAKEH5/anno \
+  --ignore 0 \
+  --file_min_size 0 \
+  --c 1 \
+  --runs 1 \
+  --dump_records records/FAKEH5_screening_slideLabel_eval.npy
+```
+
 
 ## Code Explanation
 Code flow: a. scripts/batch_run.py -> b. core/feature_extractor.py -> c. scripts/run.py -> d. core/main.py -> e. core/modules.py
