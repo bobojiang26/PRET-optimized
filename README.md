@@ -111,7 +111,22 @@ If you have slide-level labels, create a `data_info/MY_H5.json` file whose keys 
 }
 ```
 
-Then run PRET directly on the h5 features:
+For binary screening, use labels `0` and `1` and set `--class_num 1`. For multi-class subtyping, use labels `1..N` and set `--class_num N`. For example, a 7-class task should use labels `1, 2, 3, 4, 5, 6, 7` and `--class_num 7`.
+
+Then run PRET directly on the h5 features with the reusable shell wrapper:
+
+```
+DATASET_NAME=MY_H5 \
+H5_DIR=data/MY_H5/h5 \
+DATASET_INFO=data_info/MY_H5.json \
+CLASS_NUM=1 \
+EXAMPLE_NUM=1 \
+VAL_NUM=6 \
+TEST_NUM=6 \
+bash scripts/run_h5_eval.sh
+```
+
+The wrapper forwards its environment variables to `core/main.py`. A direct command is equivalent:
 
 ```
 python core/main.py \
@@ -132,7 +147,7 @@ python core/main.py \
   --prompt_path data/MY_H5/anno \
   --ignore 0 \
   --file_min_size 0 \
-  --c 1 \
+  --class_num 1 \
   --runs 1 \
   --dump_records records/MY_H5_screening_slideLabel_eval.npy
 ```
@@ -142,29 +157,28 @@ python core/main.py \
 You can create a small fake h5-only dataset for a local smoke test:
 
 ```
-python scripts/make_fake_h5_dataset.py --out data/FAKEH5/h5 --slides 20 --patches 96 --dim 64
+bash scripts/run_fake_h5_binary.sh
+```
 
-python core/main.py \
-  --mode eval \
-  --topk 3 \
-  --temperature 10 \
-  --related_thresh 0.8 \
-  --example_num 1 \
-  --raw_feature_path data/FAKEH5/h5 \
-  --wsi_path data/FAKEH5/images \
-  --dump_features data/FAKEH5/collected_features \
-  --dataset_info data_info/FAKEH5.json \
-  --seed 1024 \
-  --top_instance 3 \
-  --test_num 6 \
-  --val_num 6 \
-  --prompt_type slideLabel \
-  --prompt_path data/FAKEH5/anno \
-  --ignore 0 \
-  --file_min_size 0 \
-  --c 1 \
-  --runs 1 \
-  --dump_records records/FAKEH5_screening_slideLabel_eval.npy
+You can also run a 7-class h5 smoke test:
+
+```
+bash scripts/run_fake_h5_7class.sh
+```
+
+For custom fake h5 data, control the number of generated classes:
+
+```
+python scripts/make_fake_h5_dataset.py --out data/FAKEH5_7CLASS/h5 --slides 70 --patches 96 --dim 64 --classes 7
+
+DATASET_NAME=FAKEH5_7CLASS \
+H5_DIR=data/FAKEH5_7CLASS/h5 \
+DATASET_INFO=data_info/FAKEH5_7CLASS.json \
+CLASS_NUM=7 \
+EXAMPLE_NUM=1 \
+VAL_NUM=21 \
+TEST_NUM=21 \
+bash scripts/run_h5_eval.sh
 ```
 
 

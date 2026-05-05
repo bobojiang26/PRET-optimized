@@ -985,7 +985,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_info', default='/path/to/data_list_gt_and_split', type=str, help='json file recording dataset info')
     parser.add_argument('--patch_scale', default=512, type=int, help='patch size in 40x for anno loading')
     parser.add_argument('--file_min_size', default=5000, type=int, help='skip background and patches with a few content')
-    parser.add_argument('--c', default=1, type=int, help='number of class, c >1 for subtyping')
+    parser.add_argument('--c', '--class_num', dest='c', default=1, type=int, help='number of classes; use 1 for binary screening and >1 for multi-class subtyping')
     parser.add_argument('--seg', default=False, action='store_true', help='True to evaluate segmentation task (f1 = dice)')
 
     # for weak prompts

@@ -3,7 +3,7 @@ import os, sys
 
 # ===================== generate a single command ======================
 
-def get_run_command(dataset, task, mode, prompt_type, model):
+def get_run_command(dataset, task, mode, prompt_type, model, class_num=None):
 
     # ===================== set folders ======================
 
@@ -63,6 +63,8 @@ def get_run_command(dataset, task, mode, prompt_type, model):
         FILE_MIN_SIZE=5000
     if FILE_MIN_SIZE == 15000:
         COLLECTED_FEAT_DIR += '_size15k'
+    if class_num is not None:
+        CLS_NUM = int(class_num)
 
     # ===================== generate the command ======================
 
@@ -74,7 +76,7 @@ def get_run_command(dataset, task, mode, prompt_type, model):
             ' --seed ' + str(SEED) + ' --top_instance ' + str(TOP_INS) + ' --test_num ' + str(TEST_NUM) + \
             ' --val_num ' + str(VAL_NUM) + ' --val_ratio ' + str(VAL_RATIO) + ' --prompt_type ' + prompt_type + \
             ' --prompt_path ' + PROMPT_DIR + ' --ignore ' + str(IGNORE) + ' --multiple_num 1 2 4 8 ' + \
-            ' --file_min_size ' + str(FILE_MIN_SIZE) + ' --c ' + str(CLS_NUM) + ' --ignore_query ' + \
+            ' --file_min_size ' + str(FILE_MIN_SIZE) + ' --class_num ' + str(CLS_NUM) + ' --ignore_query ' + \
             str(IGNORE_QUERY) + ' --dump_records ' + RECORDS + '.npy'
     if task == 'segmentation':
         command += ' --seg '
@@ -98,8 +100,9 @@ if __name__ == '__main__':
     mode = sys.argv[4]
     prompt_type = sys.argv[5]
     model = sys.argv[6]
+    class_num = sys.argv[7] if len(sys.argv) > 7 else None
 
-    command = get_run_command(dataset, task, mode, prompt_type, model)
+    command = get_run_command(dataset, task, mode, prompt_type, model, class_num)
     command = 'CUDA_VISIBLE_DEVICES=' + gpu_id + ' ' + command
     print(command)
     os.system(command)

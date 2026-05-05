@@ -11,8 +11,14 @@ def main():
     parser.add_argument('--slides', type=int, default=20)
     parser.add_argument('--patches', type=int, default=96)
     parser.add_argument('--dim', type=int, default=64)
+    parser.add_argument('--classes', type=int, default=2)
     parser.add_argument('--seed', type=int, default=1024)
     args = parser.parse_args()
+
+    if args.classes < 1:
+        raise ValueError('--classes must be at least 1')
+    if args.dim < args.classes:
+        raise ValueError('--dim must be greater than or equal to --classes')
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -20,7 +26,7 @@ def main():
 
     grid_w = int(np.ceil(np.sqrt(args.patches)))
     for slide_idx in range(args.slides):
-        label = slide_idx % 2
+        label = slide_idx % args.classes
         center = np.zeros(args.dim, dtype=np.float32)
         center[label] = 1.0
 
