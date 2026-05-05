@@ -18,6 +18,9 @@ import openslide
 import torch
 import cv2
 
+SIMILARITY_EXAMPLE_CHUNK = int(os.environ.get('PRET_EXAMPLE_CHUNK', 2048))
+SIMILARITY_QUERY_CHUNK = int(os.environ.get('PRET_QUERY_CHUNK', 2048))
+
 
 # ====================== prompt loader ======================
 
@@ -107,16 +110,42 @@ def load_weak_prompts(fn, wsi_label, wsi_dir, patch_labels, patch_names, anno_di
 # ====================== some util functions ======================
 
 def compute_similarity(query, example, topk=40):
-    sim = low_memory_matrix_multiply(example, query.t())
-    if topk > 0:
-        sim, _ = topk_low_memory_(sim, min(topk, sim.shape[0]))
-        sim = sim.mean(0)
-    else:
-        sim = sim.mean(0)
+    """Return per-query mean similarity without materializing example x query."""
+    if query.shape[0] == 0 or example.shape[0] == 0:
+        return torch.zeros(query.shape[0])
 
-    return sim
+    k = min(topk, example.shape[0]) if topk > 0 else -1
+    scores_out = []
+    with torch.no_grad():
+        for q_start in range(0, query.shape[0], SIMILARITY_QUERY_CHUNK):
+            query_chunk = query[q_start: q_start + SIMILARITY_QUERY_CHUNK]
+
+            if k > 0:
+                best = None
+                for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
+                    example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
+                    scores = example_chunk @ query_chunk.t()
+                    scores = scores.topk(min(k, scores.shape[0]), dim=0)[0].cpu()
+                    best = scores if best is None else torch.cat([best, scores], 0).topk(k, dim=0)[0]
+                    del scores
+                scores_out.append(best.mean(0))
+            else:
+                summed = torch.zeros(query_chunk.shape[0])
+                count = 0
+                for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
+                    example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
+                    scores = example_chunk @ query_chunk.t()
+                    summed += scores.sum(0).cpu()
+                    count += example_chunk.shape[0]
+                    del scores
+                scores_out.append(summed / max(count, 1))
+
+            torch.cuda.empty_cache()
+
+    return torch.cat(scores_out, 0)
 
 
+# Kept for compatibility with older callers; large paths should use compute_similarity.
 def low_memory_matrix_multiply(A, B, max_size=20000):
     na,  nb = A.shape[0], B.shape[-1]
     sim = torch.FloatTensor(na, nb)
@@ -226,14 +255,7 @@ def vis_heat(score, label, pos, f, wsi_dir, vis_dir, mask_dir, side=512):
 # ====================== instance miner for subtyping ======================
 
 def execute_miner(neg_example_feats, feats, names, topk=40, uncertain=0.2):
-    sim = []
-    for i in range(math.ceil(neg_example_feats.shape[0] / 10000)):
-        sim.append((neg_example_feats[i * 10000: (i + 1) * 10000] @ feats.t()).cpu())
-    sim = torch.cat(sim, 0)#.cuda()
-    #sim = neg_example_feats @ feats.t()
-
-    sim, _ = topk_low_memory_(sim, min(topk, sim.shape[0]))
-    sim = sim.mean(0)
+    sim = compute_similarity(feats, neg_example_feats, topk=topk)
     ukn = torch.ones(len(names)) == 1
     fg = torch.zeros(len(names)).long()
     fg = basic_tagger(sim, ukn, fg, uncertain, positive=False)
@@ -293,7 +315,7 @@ def execute_tagger(feats, labels, patch_names, wsi_names, \
         ukn_mask = labels[idx] == -1
         if True in ukn_mask:
             sim_ukn = compute_similarity(feats[idx][ukn_mask], feats[labels == 0], topk=topk)
-            sim_ukn = (sim_ukn - sim_ukn.min()) / (sim_ukn.max() - sim_ukn.min())
+            sim_ukn = (sim_ukn - sim_ukn.min()) / (sim_ukn.max() - sim_ukn.min()).clamp_min(1e-8)
             labels_ukn = torch.zeros(sim_ukn.shape[0]).cuda().long()
             labels_ukn = basic_tagger(sim_ukn, labels_ukn==0, labels_ukn, uncertain, positive=False)
             idx_ukn = [idx[_] for _ in ukn_mask.nonzero()[:, 0]]
@@ -359,7 +381,7 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
         info_dic[n] = {'idx': idx, 'pos': pos}
 
         sim_n = sim[idx]
-        sim_n = (sim_n - sim_n.min()) / (sim_n.max() - sim_n.min())
+        sim_n = (sim_n - sim_n.min()) / (sim_n.max() - sim_n.min()).clamp_min(1e-8)
         labels_n = torch.zeros(sim_n.shape[0]).cuda().long()
         labels_n = basic_tagger(sim_n, labels_n ==0, labels_n, uncertain, positive=False)
 
@@ -398,22 +420,10 @@ def inference(args, example_feats, example_labels, example_patch_names,
 
     # ====================== in-context classifier ======================
 
-    # we name a test case a query to avoid confusin confusion with test set
-    query_feats = query_feats.t()
-
-    # aviod out of memory to split matrix and concat in cpu
-    cosine = []
-    for i in range(math.ceil(example_feats.shape[0] / 10000)):
-        cosine.append((example_feats[i * 10000: (i + 1) * 10000] @ query_feats).cpu())
-    cosine = torch.cat(cosine, 0)#.cuda()
-    example_labels = example_labels.cpu()
-
-    pos_cosine = cosine[example_labels == 1]
-    pos_cosine, pos_example_idxs = topk_low_memory_(pos_cosine, args.topk)
-    neg_cosine = cosine[example_labels == 0]
-    neg_cosine, neg_example_idxs = topk_low_memory_(neg_cosine, args.topk)
-
-    query_logits = pos_cosine.cuda().mean(0) - neg_cosine.cuda().mean(0)
+    # Stream top-k similarities by query chunk to avoid an example x query matrix.
+    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk)
+    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk)
+    query_logits = (pos_score - neg_score).to(query_feats.device)
 
     # ====================== attention aggregator ======================
 
@@ -421,15 +431,17 @@ def inference(args, example_feats, example_labels, example_patch_names,
     top_query_num = min(top_instance, len(query_patch_names))
     top_query_logits, top_query_idxs = query_logits.topk(top_query_num)
 
-    # self-attention for test patches with high patch score
+    # self-attention for test patches with high patch score.
+    query_feats_t = query_feats.t()
     wsi_pred_list = []
     for i in range(top_query_num):
         wsi_pred, query_idx_i = top_query_logits[i], top_query_idxs[i]
-        sim = query_feats[:, query_idx_i: query_idx_i + 1].t() @ query_feats
-        sim_score, sim_idxs = sim[0].sort()
-        num = (sim_score > args.related_thresh).sum()
-        related_preds = query_logits[sim_idxs[-int(num):]]
-        w = (sim_score[-int(num):] * args.temperature).softmax(0)
+        sim_score = (query_feats[query_idx_i: query_idx_i + 1] @ query_feats_t)[0]
+        related_mask = sim_score > args.related_thresh
+        if related_mask.sum() == 0:
+            related_mask[query_idx_i] = True
+        related_preds = query_logits[related_mask]
+        w = (sim_score[related_mask] * args.temperature).softmax(0)
         wsi_pred = (w * related_preds).sum()
         wsi_pred_list.append(wsi_pred)
     wsi_pred = sum(wsi_pred_list) / len(wsi_pred_list)

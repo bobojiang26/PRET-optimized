@@ -31,6 +31,11 @@ from sklearn.metrics import precision_recall_curve
 from modules import inference, load_weak_prompts, execute_tagger, \
         execute_subtyping_tagger, execute_miner
 
+if not torch.cuda.is_available():
+    torch.Tensor.cuda = lambda self, *args, **kwargs: self
+    nn.Module.cuda = lambda self, *args, **kwargs: self
+    torch.cuda.empty_cache = lambda: None
+
 
 # ====================== collect features and information ======================
 
@@ -63,8 +68,9 @@ def feature_processor(args):
                 continue
             
             # load feature, L2 norm
-            feat = np.load(os.path.join(in_dir, 'x20', f))
-            feat = feat / np.linalg.norm(feat, ord=2, axis=0)
+            feat = np.load(os.path.join(in_dir, 'x20', f)).astype(np.float32, copy=False)
+            norm = np.linalg.norm(feat, ord=2, axis=0)
+            feat = feat / max(norm, 1e-8)
 
             # get position for vis and seg
             x, y = f.split('.')[0].split('_')
@@ -298,8 +304,8 @@ def evaluate(args, val_only=False):
 
                 example_labels.append(pl)
             
-            example_feats = torch.tensor(np.concatenate(example_feats, 0)).cuda()
-            example_labels = torch.tensor(np.concatenate(example_labels, 0)).cuda().long()
+            example_feats = torch.from_numpy(np.concatenate(example_feats, 0).astype(np.float32, copy=False)).cuda()
+            example_labels = torch.from_numpy(np.concatenate(example_labels, 0)).cuda().long()
 
             if args.dump_pseudo != '':
                 vis_info = {'wsi_dir': args.wsi_path, 'vis_dir': os.path.join(args.dump_pseudo, 'vis') + str(args.example_num) + '/' + str(i) + '/' + str(cls), \
@@ -362,7 +368,7 @@ def evaluate(args, val_only=False):
             all_query_names = val_names if val_only else val_names + test_names
             for n in all_query_names:
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
-                query_feats = torch.tensor(query_n['features']).cuda()
+                query_feats = torch.from_numpy(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
                 label = query_n['wsi_label']
                 if args.c > 1:
@@ -407,6 +413,8 @@ def evaluate(args, val_only=False):
                 else:
                     test_preds.append(pred)
                     test_labels.append(label)
+                del query_feats, query_n, pred, label
+                torch.cuda.empty_cache()
 
             # ====================== process validation set and assign label ======================
 
