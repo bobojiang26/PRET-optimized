@@ -6,6 +6,7 @@ torchvision==0.13.1
 openslide-python==1.4.1
 openslide-bin
 opencv-python==4.4.0.46
+h5py
 
 # for eval
 numpy==1.18.1

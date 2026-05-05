@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import os
+import glob
 import sys
 import argparse
 import random
 import json
 
+import h5py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,11 +39,94 @@ if not torch.cuda.is_available():
     torch.cuda.empty_cache = lambda: None
 
 
+# ====================== h5 feature input helpers ======================
+
+def find_h5_files(path):
+    if path is None:
+        return []
+    if os.path.isfile(path) and path.lower().endswith(('.h5', '.hdf5')):
+        return [path]
+    if not os.path.isdir(path):
+        return []
+    files = []
+    files.extend(glob.glob(os.path.join(path, '*.h5')))
+    files.extend(glob.glob(os.path.join(path, '*.hdf5')))
+    return sorted(files)
+
+
+def get_pseudo_label(idx, cls_num):
+    if cls_num <= 1:
+        return idx % 2
+    return idx % cls_num + 1
+
+
+def load_dataset_info(args):
+    dataset_info = {}
+    if args.dataset_info != '' and os.path.exists(args.dataset_info):
+        dataset_info = json.load(open(args.dataset_info))
+
+    h5_files = find_h5_files(args.raw_feature_path)
+    if h5_files:
+        created_or_filled = False
+        for idx, h5_path in enumerate(h5_files):
+            slide_name = os.path.splitext(os.path.basename(h5_path))[0]
+            if slide_name not in dataset_info:
+                dataset_info[slide_name] = {}
+            if 'fixed_test_set' not in dataset_info[slide_name]:
+                dataset_info[slide_name]['fixed_test_set'] = False
+            if 'wsi_label' not in dataset_info[slide_name]:
+                dataset_info[slide_name]['wsi_label'] = get_pseudo_label(idx, args.c)
+                dataset_info[slide_name]['pseudo_label'] = True
+                created_or_filled = True
+
+        if created_or_filled:
+            print('[warning] Missing slide labels for h5 inputs. PRET assigned deterministic pseudo labels by file order; metrics are for pipeline smoke tests only.')
+
+    return dataset_info
+
+
+def load_h5_feature_file(h5_path):
+    with h5py.File(h5_path, 'r') as f:
+        if 'features' not in f or 'coordinates' not in f:
+            raise KeyError(f'{h5_path} must contain h5 keys: features and coordinates')
+        feats = np.asarray(f['features'], dtype=np.float32)
+        coords = np.asarray(f['coordinates'])
+
+    if feats.ndim != 2:
+        raise ValueError(f'{h5_path}: features must be a 2D array, got shape {feats.shape}')
+    if coords.ndim != 2 or coords.shape[0] != feats.shape[0] or coords.shape[1] < 2:
+        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
+
+    norms = np.linalg.norm(feats, ord=2, axis=1, keepdims=True)
+    feats = feats / np.maximum(norms, 1e-8)
+    return feats.astype(np.float32, copy=False), coords
+
+
+def get_wsi_suffix(wsi_path):
+    if not os.path.isdir(wsi_path):
+        return None
+    files = [f for f in os.listdir(wsi_path) if not f.startswith('.')]
+    if len(files) == 0:
+        return None
+    return files[0].split('.')[-1]
+
+
+def get_wsi_size(wsi_path, slide_name, wsi_suffix, patch_scale):
+    if wsi_suffix is None:
+        return None
+    slide_path = os.path.join(wsi_path, slide_name + '.' + wsi_suffix)
+    if not os.path.exists(slide_path):
+        return None
+    wsi = openslide.OpenSlide(slide_path)
+    return (wsi.level_dimensions[0][1] // patch_scale, wsi.level_dimensions[0][0] // patch_scale)
+
+
 # ====================== collect features and information ======================
 
 def feature_processor(args):
     print('start feature processing ...')
-    dataset_info = json.load(open(args.dataset_info))
+    dataset_info = load_dataset_info(args)
+    h5_map = {os.path.splitext(os.path.basename(p))[0]: p for p in find_h5_files(args.raw_feature_path)}
     os.makedirs(args.dump_features, exist_ok=True)
 
     for k, v in dataset_info.items():
@@ -49,6 +134,17 @@ def feature_processor(args):
             continue
 
         feats, names, patch_label, wsi_label = [], [], [], -1
+
+        if k in h5_map:
+            feats, coords = load_h5_feature_file(h5_map[k])
+            names = []
+            for i in range(coords.shape[0]):
+                x, y = int(coords[i, 0]), int(coords[i, 1])
+                names.append(os.path.join('h5_features', k, f'{x}_{y}.jpeg'))
+            info = {'features': feats, 'patch_names': names, \
+                'patch_labels': np.array(patch_label), 'wsi_label': v['wsi_label']}
+            np.save(os.path.join(args.dump_features, k + '.npy'), info)
+            continue
         
         wsi_label = v['wsi_label']
 
@@ -155,8 +251,8 @@ class GaussianBlur(nn.Module):
 def evaluate(args, val_only=False):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
-    info_str = open(args.dataset_info).read()
-    dataset_info = json.load(open(args.dataset_info))
+    dataset_info = load_dataset_info(args)
+    info_str = json.dumps(dataset_info)
     all_names = dataset_info.keys()
 
     records = {}
@@ -193,8 +289,8 @@ def evaluate(args, val_only=False):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
                 
-                    # add some neg for slideLabel binary cls
-                    if args.c == 1 and dataset_info[n]['wsi_label'] == 0:
+                    # slide labels are usable prompts for both positive and negative h5-only slides.
+                    if args.c == 1:
                         labeled_names.append(n)
                 
                 # record neg names to exclude from seg val /test
@@ -364,7 +460,7 @@ def evaluate(args, val_only=False):
 
             # predict for test slides, name a test slide as query to avoid confusion with test set
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
-            wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
+            wsi_suffix = get_wsi_suffix(args.wsi_path)
             all_query_names = val_names if val_only else val_names + test_names
             for n in all_query_names:
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
@@ -384,12 +480,7 @@ def evaluate(args, val_only=False):
 
                 # ====================== inference, including classifier, aggregator, post processer ======================
 
-                wsi_path = os.path.join(args.wsi_path, n + '.' + wsi_suffix)
-                if os.path.exists(wsi_path):
-                    wsi = openslide.OpenSlide(wsi_path)
-                    size = (wsi.level_dimensions[0][1] // args.patch_scale, wsi.level_dimensions[0][0] // args.patch_scale)
-                else:
-                    size = None
+                size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
                 vis_info = None
                 
                 sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
@@ -470,7 +561,7 @@ def evaluate(args, val_only=False):
                 records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
 
-        del example_feats, query_feats
+        del example_feats
         torch.cuda.empty_cache()
 
     # ====================== count and record results ======================
@@ -503,8 +594,8 @@ def evaluate(args, val_only=False):
 def evaluate_baseline(args, mode):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
-    info_str = open(args.dataset_info).read()
-    dataset_info = json.load(open(args.dataset_info))
+    dataset_info = load_dataset_info(args)
+    info_str = json.dumps(dataset_info)
     all_names = dataset_info.keys()
 
     # skip invalid wsis
@@ -549,8 +640,8 @@ def evaluate_baseline(args, mode):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
 
-                    # add some neg for slideLabel binary tasks
-                    if args.c == 1 and dataset_info[n]['wsi_label'] == 0:
+                    # slide labels are usable prompts for both positive and negative h5-only slides.
+                    if args.c == 1:
                         labeled_names.append(n)
 
                 # record neg names to exclude from seg val /test
@@ -733,10 +824,13 @@ def evaluate_baseline(args, mode):
                     wsi_pred = prob.topk(topk)[0].mean()
 
                     if args.vis_path != '' or args.seg:
-                        wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
-                        wsi_path = os.path.join(args.wsi_path, n + '.' + wsi_suffix)
-                        wsi = openslide.OpenSlide(wsi_path)
-                        size = (wsi.level_dimensions[0][1] // args.patch_scale, wsi.level_dimensions[0][0] // args.patch_scale)
+                        wsi_suffix = get_wsi_suffix(args.wsi_path)
+                        size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
+                        if size is None:
+                            print('skip visualization or segmentation without WSI files')
+                            patch_pred = None
+                            patch_pred_list = None
+                            continue
                         patch_pred = torch.zeros(size).cuda() + 255
                         idx_in_map = []
                         for pi, pn in enumerate(query_patch_names):
