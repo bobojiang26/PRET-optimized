@@ -21,12 +21,19 @@ TEMPERATURE="${TEMPERATURE:-10}"
 RELATED_THRESH="${RELATED_THRESH:-0.8}"
 SEED="${SEED:-1024}"
 
+MULTIPLE_ARGS=()
+if [[ -n "${MULTIPLE_NUM:-}" ]]; then
+  read -r -a MULTIPLE_ARGS <<< "${MULTIPLE_NUM}"
+  MULTIPLE_ARGS=(--multiple_num "${MULTIPLE_ARGS[@]}")
+fi
+
 "${PYTHON_BIN}" core/main.py \
   --mode eval \
   --topk "${TOPK}" \
   --temperature "${TEMPERATURE}" \
   --related_thresh "${RELATED_THRESH}" \
   --example_num "${EXAMPLE_NUM}" \
+  ${MULTIPLE_ARGS[@]+"${MULTIPLE_ARGS[@]}"} \
   --raw_feature_path "${H5_DIR}" \
   --wsi_path "${WSI_DIR}" \
   --dump_features "${DUMP_FEATURES}" \
