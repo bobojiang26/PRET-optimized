@@ -18,8 +18,9 @@ import openslide
 import torch
 import cv2
 
-SIMILARITY_EXAMPLE_CHUNK = int(os.environ.get('PRET_EXAMPLE_CHUNK', 2048))
-SIMILARITY_QUERY_CHUNK = int(os.environ.get('PRET_QUERY_CHUNK', 2048))
+SIMILARITY_EXAMPLE_CHUNK = int(os.environ.get('PRET_EXAMPLE_CHUNK', 4096))
+SIMILARITY_QUERY_CHUNK = int(os.environ.get('PRET_QUERY_CHUNK', 4096))
+ATTENTION_QUERY_CHUNK = int(os.environ.get('PRET_ATTENTION_QUERY_CHUNK', 512))
 
 
 # ====================== prompt loader ======================
@@ -112,7 +113,7 @@ def load_weak_prompts(fn, wsi_label, wsi_dir, patch_labels, patch_names, anno_di
 def compute_similarity(query, example, topk=40):
     """Return per-query mean similarity without materializing example x query."""
     if query.shape[0] == 0 or example.shape[0] == 0:
-        return torch.zeros(query.shape[0])
+        return torch.zeros(query.shape[0], device=query.device)
 
     k = min(topk, example.shape[0]) if topk > 0 else -1
     scores_out = []
@@ -125,24 +126,42 @@ def compute_similarity(query, example, topk=40):
                 for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
                     example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
                     scores = example_chunk @ query_chunk.t()
-                    scores = scores.topk(min(k, scores.shape[0]), dim=0)[0].cpu()
+                    scores = scores.topk(min(k, scores.shape[0]), dim=0)[0]
                     best = scores if best is None else torch.cat([best, scores], 0).topk(k, dim=0)[0]
                     del scores
                 scores_out.append(best.mean(0))
             else:
-                summed = torch.zeros(query_chunk.shape[0])
+                summed = torch.zeros(query_chunk.shape[0], device=query.device)
                 count = 0
                 for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
                     example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
                     scores = example_chunk @ query_chunk.t()
-                    summed += scores.sum(0).cpu()
+                    summed += scores.sum(0)
                     count += example_chunk.shape[0]
                     del scores
                 scores_out.append(summed / max(count, 1))
 
-            torch.cuda.empty_cache()
-
     return torch.cat(scores_out, 0)
+
+
+def aggregate_query_logits(query_feats, query_logits, top_instance, related_thresh, temperature):
+    """Vectorized attention aggregation over top query patches."""
+    top_query_num = min(top_instance, query_logits.shape[0])
+    top_query_idxs = query_logits.topk(top_query_num)[1]
+
+    query_feats_t = query_feats.t()
+    wsi_pred_list = []
+    for start in range(0, top_query_num, ATTENTION_QUERY_CHUNK):
+        idxs = top_query_idxs[start: start + ATTENTION_QUERY_CHUNK]
+        sim_scores = query_feats[idxs] @ query_feats_t
+        related_mask = sim_scores > related_thresh
+        empty_rows = related_mask.sum(1) == 0
+        if empty_rows.any():
+            related_mask[empty_rows, idxs[empty_rows]] = True
+        masked_scores = sim_scores.masked_fill(~related_mask, -1e9)
+        weights = (masked_scores * temperature).softmax(1)
+        wsi_pred_list.append((weights * query_logits.reshape(1, -1)).sum(1))
+    return torch.cat(wsi_pred_list, 0).mean()
 
 
 # Kept for compatibility with older callers; large paths should use compute_similarity.
@@ -427,24 +446,9 @@ def inference(args, example_feats, example_labels, example_patch_names,
 
     # ====================== attention aggregator ======================
 
-    # using related patchs and topk
-    top_query_num = min(top_instance, len(query_patch_names))
-    top_query_logits, top_query_idxs = query_logits.topk(top_query_num)
-
-    # self-attention for test patches with high patch score.
-    query_feats_t = query_feats.t()
-    wsi_pred_list = []
-    for i in range(top_query_num):
-        wsi_pred, query_idx_i = top_query_logits[i], top_query_idxs[i]
-        sim_score = (query_feats[query_idx_i: query_idx_i + 1] @ query_feats_t)[0]
-        related_mask = sim_score > args.related_thresh
-        if related_mask.sum() == 0:
-            related_mask[query_idx_i] = True
-        related_preds = query_logits[related_mask]
-        w = (sim_score[related_mask] * args.temperature).softmax(0)
-        wsi_pred = (w * related_preds).sum()
-        wsi_pred_list.append(wsi_pred)
-    wsi_pred = sum(wsi_pred_list) / len(wsi_pred_list)
+    wsi_pred = aggregate_query_logits(
+        query_feats, query_logits, top_instance, args.related_thresh, args.temperature
+    )
 
     # ====================== patch reshape to wsi for heatmap / seg ======================
 

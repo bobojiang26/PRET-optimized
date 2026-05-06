@@ -109,6 +109,162 @@ class StageTimer:
         print(f'[timing] {self.label}: {timing} | memory: {format_memory_usage()}')
 
 
+FEATURE_DIM_WARNING_KEYS = set()
+
+
+def warn_feature_dim_change(context, original_dim, target_dim):
+    if original_dim == target_dim:
+        return
+    key = (context, original_dim, target_dim)
+    if key in FEATURE_DIM_WARNING_KEYS:
+        return
+    FEATURE_DIM_WARNING_KEYS.add(key)
+    action = 'truncate' if original_dim > target_dim else 'zero-pad'
+    print(f'[warning] {context}: feature dim {original_dim} -> {target_dim}; {action} and L2-normalize for this run.')
+
+
+def normalize_numpy_features(feats):
+    norms = np.linalg.norm(feats, ord=2, axis=1, keepdims=True)
+    return feats / np.maximum(norms, 1e-8)
+
+
+def align_numpy_feature_dim(feats, target_dim, context):
+    feats = feats.astype(np.float32, copy=False)
+    if feats.ndim != 2:
+        raise ValueError(f'{context}: features must be 2D, got shape {feats.shape}')
+    original_dim = feats.shape[1]
+    if original_dim == target_dim:
+        return feats
+    warn_feature_dim_change(context, original_dim, target_dim)
+    if original_dim > target_dim:
+        feats = feats[:, :target_dim]
+    else:
+        feats = np.pad(feats, ((0, 0), (0, target_dim - original_dim)), mode='constant')
+    return normalize_numpy_features(feats).astype(np.float32, copy=False)
+
+
+def align_numpy_vector_dim(vec, target_dim, context):
+    vec = vec.astype(np.float32, copy=False)
+    original_dim = vec.shape[0]
+    if original_dim == target_dim:
+        return vec
+    warn_feature_dim_change(context, original_dim, target_dim)
+    if original_dim > target_dim:
+        return vec[:target_dim]
+    return np.pad(vec, (0, target_dim - original_dim), mode='constant').astype(np.float32, copy=False)
+
+
+def align_torch_feature_dim(feats, target_dim, context):
+    original_dim = feats.shape[1]
+    if original_dim == target_dim:
+        return feats
+    warn_feature_dim_change(context, original_dim, target_dim)
+    if original_dim > target_dim:
+        feats = feats[:, :target_dim]
+    else:
+        feats = F.pad(feats, (0, target_dim - original_dim))
+    return F.normalize(feats.float(), p=2, dim=1, eps=1e-8)
+
+
+def align_torch_feature_pair(example_feats, query_feats, context):
+    target_dim = min(example_feats.shape[1], query_feats.shape[1])
+    example_feats = align_torch_feature_dim(example_feats, target_dim, context + ' examples')
+    query_feats = align_torch_feature_dim(query_feats, target_dim, context + ' query')
+    return example_feats, query_feats
+
+
+def get_min_feature_dim(feat_list, context):
+    dims = [feat.shape[1] for feat in feat_list if feat.shape[0] > 0]
+    if len(dims) == 0:
+        raise ValueError(f'{context}: no features available')
+    target_dim = min(dims)
+    dim_counts = {dim: dims.count(dim) for dim in sorted(set(dims))}
+    if len(dim_counts) > 1:
+        summary = ', '.join(f'{dim}:{count}' for dim, count in dim_counts.items())
+        print(f'[warning] {context}: mixed feature dims ({summary}); aligning all features to {target_dim}.')
+    return target_dim
+
+
+def sparsify_reference_tokens(example_feats, example_labels, budget, random_ratio=0.1):
+    if budget <= 0 or example_feats.shape[0] <= budget:
+        return example_feats, example_labels
+
+    labels = torch.unique(example_labels)
+    valid_labels = [label for label in labels.tolist() if label in [0, 1, 255]]
+    label_idxs = {
+        label: (example_labels == label).nonzero(as_tuple=False).reshape(-1)
+        for label in valid_labels
+    }
+    total_tokens = sum(idx.shape[0] for idx in label_idxs.values())
+    if total_tokens == 0:
+        return example_feats, example_labels
+
+    quotas = {}
+    selected_total = 0
+    for label, idx in label_idxs.items():
+        quota = int(round(budget * idx.shape[0] / total_tokens))
+        if idx.shape[0] > 0:
+            quota = max(1, min(quota, idx.shape[0]))
+        quotas[label] = quota
+        selected_total += quota
+
+    while selected_total > budget:
+        label = max(quotas, key=lambda _: quotas[_])
+        if quotas[label] <= 1:
+            break
+        quotas[label] -= 1
+        selected_total -= 1
+    while selected_total < budget:
+        room = {label: label_idxs[label].shape[0] - quotas[label] for label in quotas}
+        label = max(room, key=room.get)
+        if room[label] <= 0:
+            break
+        quotas[label] += 1
+        selected_total += 1
+
+    keep_idxs = []
+    for label in valid_labels:
+        idx = label_idxs[label]
+        per_label_budget = quotas[label]
+        if idx.shape[0] <= per_label_budget:
+            keep_idxs.append(idx)
+            continue
+
+        feats_l = example_feats[idx]
+        centroid = F.normalize(feats_l.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+        scores = (feats_l @ centroid.t()).reshape(-1)
+        sorted_idx = scores.argsort(descending=True)
+
+        if per_label_budget == 1:
+            selected = sorted_idx[:1]
+        else:
+            positions = torch.linspace(0, sorted_idx.shape[0] - 1, per_label_budget, device=sorted_idx.device)
+            selected = sorted_idx[positions.round().long().unique()]
+            if selected.shape[0] < per_label_budget:
+                picked = torch.zeros(sorted_idx.shape[0], dtype=torch.bool, device=sorted_idx.device)
+                picked[positions.round().long().unique()] = True
+                fill = sorted_idx[~picked][:per_label_budget - selected.shape[0]]
+                selected = torch.cat([selected, fill], 0)
+
+        random_keep = int(per_label_budget * random_ratio)
+        random_keep = min(random_keep, max(per_label_budget - 1, 0))
+        if random_keep > 0:
+            remaining = torch.ones(idx.shape[0], dtype=torch.bool, device=idx.device)
+            remaining[selected] = False
+            remaining_idxs = remaining.nonzero(as_tuple=False).reshape(-1)
+            if remaining_idxs.shape[0] > 0:
+                perm = torch.randperm(remaining_idxs.shape[0], device=idx.device)[:random_keep]
+                selected = torch.cat([selected[:-random_keep], remaining_idxs[perm]], 0)
+        keep_idxs.append(idx[selected])
+
+    keep_idxs = torch.cat(keep_idxs, 0)
+    if keep_idxs.shape[0] > budget:
+        keep_idxs = keep_idxs[torch.randperm(keep_idxs.shape[0], device=keep_idxs.device)[:budget]]
+    keep_idxs = keep_idxs.sort()[0]
+    print(f'[reference] sparsified tokens: {example_feats.shape[0]} -> {keep_idxs.shape[0]}')
+    return example_feats[keep_idxs], example_labels[keep_idxs]
+
+
 # ====================== h5 feature input helpers ======================
 
 def find_h5_files(path):
@@ -519,11 +675,13 @@ def evaluate(args, val_only=False):
 
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
+            example_feature_names = []
             io_start = time.perf_counter()
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
+                example_feature_names.append(n)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
@@ -560,6 +718,11 @@ def evaluate(args, val_only=False):
 
                 example_labels.append(pl)
             
+            example_feature_dim = get_min_feature_dim(example_feats, f'evaluate repeat={i} class={cls} examples')
+            example_feats = [
+                align_numpy_feature_dim(feat, example_feature_dim, f'example slide {name}')
+                for feat, name in zip(example_feats, example_feature_names)
+            ]
             example_feats = torch.from_numpy(np.concatenate(example_feats, 0).astype(np.float32, copy=False)).cuda()
             example_labels = torch.from_numpy(np.concatenate(example_labels, 0)).cuda().long()
             class_timer.add('io.examples', time.perf_counter() - io_start)
@@ -619,6 +782,15 @@ def evaluate(args, val_only=False):
                         example_labels[example_labels_this == 0] = 255
             class_timer.add('tagger', time.perf_counter() - tagger_start)
 
+            sparse_start = time.perf_counter()
+            example_feats, example_labels = sparsify_reference_tokens(
+                example_feats,
+                example_labels,
+                args.reference_token_budget,
+                args.reference_random_ratio
+            )
+            class_timer.add('reference_sparse', time.perf_counter() - sparse_start)
+
             # ====================== predict for test slides (queries)======================
 
             # predict for test slides, name a test slide as query to avoid confusion with test set
@@ -635,13 +807,16 @@ def evaluate(args, val_only=False):
                     label = int(label == cls)
                 
                 class_timer.add('io.query', time.perf_counter() - io_start)
+                example_feats_for_query, query_feats = align_torch_feature_pair(
+                    example_feats, query_feats, f'evaluate repeat={i} class={cls} query {n}'
+                )
                 # ====================== discriminative instance miner for subtyping ======================
 
                 # use fg patches for subtyping
                 #if args.c > 1 and not args.seg and args.vis_path == '': # vis wo fg
                 if args.c > 1 and not args.seg:
                     miner_start = time.perf_counter()
-                    query_feats, query_patch_names = execute_miner(example_feats[example_labels == 255], \
+                    query_feats, query_patch_names = execute_miner(example_feats_for_query[example_labels == 255], \
                         query_feats, query_patch_names, uncertain=args.ignore_query)
                     class_timer.add('miner', time.perf_counter() - miner_start)
 
@@ -652,7 +827,7 @@ def evaluate(args, val_only=False):
                 vis_info = None
                 
                 sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
-                wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
+                wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats_for_query, example_labels, example_patch_names, \
                     query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm)
                 class_timer.add('infer', time.perf_counter() - infer_start)
 
@@ -710,8 +885,10 @@ def evaluate(args, val_only=False):
                 labels = test_labels
 
             acc = ((thresh_preds == labels).sum() / labels.shape[0]).cpu().item()
-            rec = ((thresh_preds * labels).sum() / labels.sum()).cpu().item()
-            pre = ((thresh_preds * labels).sum() / thresh_preds.sum()).cpu().item()
+            label_pos = labels.sum().clamp_min(1)
+            pred_pos = thresh_preds.sum().clamp_min(1)
+            rec = ((thresh_preds * labels).sum() / label_pos).cpu().item()
+            pre = ((thresh_preds * labels).sum() / pred_pos).cpu().item()
             auc = aucroc(preds, labels).item()
             if (rec + pre) != 0:
                 f1 = rec * pre * 2 / (rec + pre)
@@ -962,6 +1139,15 @@ def evaluate_baseline(args, mode):
 
             if 'prototype' in mode:
                 example_labels = [1, 0]
+                prototype_feature_dim = get_min_feature_dim(pos_feats + neg_feats, f'baseline {mode} repeat={i} class={cls} examples')
+                pos_feats = [
+                    align_numpy_feature_dim(feat, prototype_feature_dim, 'baseline positive prototype examples')
+                    for feat in pos_feats if feat.shape[0] > 0
+                ]
+                neg_feats = [
+                    align_numpy_feature_dim(feat, prototype_feature_dim, 'baseline negative prototype examples')
+                    for feat in neg_feats if feat.shape[0] > 0
+                ]
                 pos_feats = np.concatenate(pos_feats, 0)
                 neg_feats = np.concatenate(neg_feats, 0)
 
@@ -977,6 +1163,11 @@ def evaluate_baseline(args, mode):
                 else:
                     example_feats = [pos_feats.mean(0, keepdims=True), neg_feats.mean(0, keepdims=True)]
 
+            example_feature_dim = get_min_feature_dim(example_feats, f'baseline {mode} repeat={i} class={cls} examples')
+            example_feats = [
+                align_numpy_feature_dim(feat, example_feature_dim, f'baseline {mode} example vector')
+                for feat in example_feats
+            ]
             example_feats = torch.tensor(np.concatenate(example_feats, 0)).cuda()
             example_labels = torch.tensor(example_labels).cuda()
 
@@ -987,20 +1178,26 @@ def evaluate_baseline(args, mode):
             all_query_names = val_names + test_names
             for n in all_query_names:
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
-                query_feats = torch.tensor(query_n['features']).cuda()
+                query_feats = torch.tensor(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
                 if args.c > 1:
                     label = query_n['wsi_label'] == cls
                 else:
                     label = query_n['wsi_label']
 
+                example_feats_for_query, query_feats = align_torch_feature_pair(
+                    example_feats, query_feats, f'baseline {mode} repeat={i} class={cls} query {n}'
+                )
                 if 'prototype' in mode:
                     if 'simple_shot' in mode:
-                        query_feats -= torch.tensor(mean_feat).cuda()
+                        mean_feat_for_query = align_numpy_vector_dim(
+                            mean_feat, query_feats.shape[1], 'baseline simple_shot mean feature'
+                        )
+                        query_feats -= torch.tensor(mean_feat_for_query).cuda()
                         query_feats = query_feats / torch.linalg.norm(query_feats, 2, 1, keepdims=True)
 
                     topk = min(args.top_instance, query_feats.shape[0])
-                    prob = query_feats @ example_feats[0]
+                    prob = query_feats @ example_feats_for_query[0]
                     wsi_pred = prob.topk(topk)[0].mean()
 
                     if args.vis_path != '' or args.seg:
@@ -1047,7 +1244,8 @@ def evaluate_baseline(args, mode):
                     else:
                         print('false eval mode')
                    
-                    pos_example_feats, neg_example_feats = example_feats[example_labels == 1], example_feats[example_labels == 0]
+                    pos_example_feats = example_feats_for_query[example_labels == 1]
+                    neg_example_feats = example_feats_for_query[example_labels == 0]
                     wsi_pred = (pos_example_feats @ query_feats).topk(min(5, pos_example_feats.shape[0]))[0].mean() - \
                             (neg_example_feats @ query_feats).topk(min(5, neg_example_feats.shape[0]))[0].mean()
                     
@@ -1093,8 +1291,10 @@ def evaluate_baseline(args, mode):
             thresh_preds = (test_preds > thresh).float()
             labels = test_labels
             acc = ((thresh_preds == labels).sum() / labels.shape[0]).cpu().item()
-            rec = ((thresh_preds * labels).sum() / labels.sum()).cpu().item()
-            pre = ((thresh_preds * labels).sum() / thresh_preds.sum()).cpu().item()
+            label_pos = labels.sum().clamp_min(1)
+            pred_pos = thresh_preds.sum().clamp_min(1)
+            rec = ((thresh_preds * labels).sum() / label_pos).cpu().item()
+            pre = ((thresh_preds * labels).sum() / pred_pos).cpu().item()
             auc = aucroc(preds, labels).item()
             f1 = rec * pre * 2 / (rec + pre) if rec + pre > 0 else 0
 
@@ -1154,6 +1354,10 @@ if __name__ == '__main__':
     parser.add_argument('--related_thresh', default=0.88, type=float, help='cosine similarity threshold to select related patchs')
     parser.add_argument('--example_num', default=3, type=int, help='number of wsi for init example')
     parser.add_argument('--multiple_num', type=int, nargs='+', default=None, help='multi example num')
+    parser.add_argument('--reference_token_budget', default=0, type=int,
+        help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
+    parser.add_argument('--reference_random_ratio', default=0.1, type=float,
+        help='fraction of sparse reference budget reserved for random diversity')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
@@ -1183,6 +1387,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     random.seed(args.seed)
+    torch.manual_seed(args.seed)
     os.makedirs(args.dump_features, exist_ok=True)
     print_memory_usage('startup')
 
