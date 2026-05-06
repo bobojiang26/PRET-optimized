@@ -68,6 +68,7 @@ def load_dataset_info(args):
     h5_files = find_h5_files(args.raw_feature_path)
     if h5_files:
         created_or_filled = False
+        missing_label_slides = []
         for idx, h5_path in enumerate(h5_files):
             slide_name = os.path.splitext(os.path.basename(h5_path))[0]
             if slide_name not in dataset_info:
@@ -78,9 +79,14 @@ def load_dataset_info(args):
                 dataset_info[slide_name]['wsi_label'] = get_pseudo_label(idx, args.c)
                 dataset_info[slide_name]['pseudo_label'] = True
                 created_or_filled = True
+                missing_label_slides.append(slide_name)
 
         if created_or_filled:
             print('[warning] Missing slide labels for h5 inputs. PRET assigned deterministic pseudo labels by file order; metrics are for pipeline smoke tests only.')
+            preview = ', '.join(missing_label_slides[:20])
+            print(f'[warning] Missing wsi_label for {len(missing_label_slides)} h5 slide(s): {preview}')
+            if len(missing_label_slides) > 20:
+                print(f'[warning] ... {len(missing_label_slides) - 20} more h5 slide(s) omitted.')
 
     return dataset_info
 
