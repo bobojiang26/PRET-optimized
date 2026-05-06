@@ -354,6 +354,65 @@ auc mean: 0.9748, auc std: 0.0181, f1 mean: 0.9124, f1 std: 0.048, acc mean: 0.8
 * Dataset downloading takes hours or a few day,s depending on network speed (over 800GB for our in-house datasets).
 * The process involves slide slicing, feature extraction, hyperparameter search, multiple shot settings, multiple prompts, and repeated experiments, which can take a few or dozens of hours depending on the data scale, CPU, GPU, and IO speed.
 
+
+### Optimization
+我对比的是本地 `/Users/chenbozhou/Desktop/PRET` 的已提交 `main`，相对于上游 `origin/main`。本地记录显示：
+
+- 上游 `xmed-lab/PRET`: `c2ecd93 Update README.md`
+- 本地 `PRET-optimized`: `2a3651f Support h5 features without coordinates`
+- 中间新增 5 个提交：`f1d011f`、`c4e6818`、`0eedd91`、`577f50a`、`2a3651f`
+
+GitHub 页面也确认了上游仓库是 [xmed-lab/PRET](https://github.com/xmed-lab/PRET)。终端里直接 `git ls-remote` 失败了，原因是当前环境无法解析 `github.com`，所以精确 diff 基于本地已有的 `origin/main`。
+
+**主要优化/增强如下：**
+
+1. **大数据内存优化**
+   - [core/modules.py](/Users/chenbozhou/Desktop/PRET/core/modules.py:21) 新增 `PRET_EXAMPLE_CHUNK`、`PRET_QUERY_CHUNK`。
+   - [compute_similarity](/Users/chenbozhou/Desktop/PRET/core/modules.py:112) 改成按 query/example chunk 流式计算 top-k similarity，避免一次性构造巨大的 `example x query` 相似度矩阵。
+   - [inference](/Users/chenbozhou/Desktop/PRET/core/modules.py:423) 也改为流式计算正负样本 similarity，降低显存/内存峰值。
+   - [execute_miner](/Users/chenbozhou/Desktop/PRET/core/modules.py:257) 复用新的 chunked similarity，不再手动拼接大矩阵。
+
+2. **支持直接读取 `.h5/.hdf5` 特征**
+   - [core/main.py](/Users/chenbozhou/Desktop/PRET/core/main.py:44) 新增 h5 文件发现逻辑。
+   - [core/main.py](/Users/chenbozhou/Desktop/PRET/core/main.py:96) 可读取 h5 中的 `features`，并把每个 h5 当作一个 slide。
+   - [feature_processor](/Users/chenbozhou/Desktop/PRET/core/main.py:149) 新增 h5 分支，会把 h5 特征转换成原 PRET 后续流程需要的 `.npy` 信息结构。
+
+3. **兼容没有 `coordinates` 的 h5**
+   - [core/main.py](/Users/chenbozhou/Desktop/PRET/core/main.py:88) 新增 synthetic coordinates。
+   - 如果 h5 只有 `features`，没有 `coordinates`，会自动生成 row-major 坐标，保证 slide-level h5 流程能继续跑。
+
+4. **h5-only 数据集可以没有真实 WSI/annotation**
+   - [get_wsi_suffix](/Users/chenbozhou/Desktop/PRET/core/main.py:116) 和 [get_wsi_size](/Users/chenbozhou/Desktop/PRET/core/main.py:125) 允许 `wsi_path` 不存在。
+   - h5-only 的 `slideLabel` 评估不再强依赖真实 WSI 文件、xml、mask 等。
+
+5. **缺失 `data_info` 或 label 时可 smoke test**
+   - [load_dataset_info](/Users/chenbozhou/Desktop/PRET/core/main.py:63) 如果 h5 输入没有完整 `data_info`，会按文件顺序生成 deterministic pseudo label。
+   - 这主要用于 pipeline smoke test，不适合真实指标评估。
+
+6. **slideLabel 逻辑更适合 h5-only**
+   - [core/main.py](/Users/chenbozhou/Desktop/PRET/core/main.py:298) 对 binary `slideLabel`，正负 slide 都可作为 labeled examples。
+   - 原版更偏向已有 patch/slide 数据组织，优化版更适合只有 slide-level h5 特征的场景。
+
+7. **运行脚本增强**
+   - 新增 [scripts/run_h5_eval.sh](/Users/chenbozhou/Desktop/PRET/scripts/run_h5_eval.sh:1)，封装 h5 特征评估，默认使用 `--prompt_type slideLabel`。
+   - 新增 [scripts/run_fake_h5_binary.sh](/Users/chenbozhou/Desktop/PRET/scripts/run_fake_h5_binary.sh:1) 和 [scripts/run_fake_h5_7class.sh](/Users/chenbozhou/Desktop/PRET/scripts/run_fake_h5_7class.sh:1)。
+   - [scripts/run.py](/Users/chenbozhou/Desktop/PRET/scripts/run.py:6) 支持额外传入 `class_num`，并统一使用 `--class_num`。
+
+8. **多分类 h5 支持更明确**
+   - [core/main.py](/Users/chenbozhou/Desktop/PRET/core/main.py:999) 增加 `--class_num` 作为 `--c` 的别名。
+   - fake h5 生成脚本支持 `--classes N`，方便测 7 类等多分类任务。
+
+9. **本地测试/假数据工具**
+   - 新增 [scripts/make_fake_h5_dataset.py](/Users/chenbozhou/Desktop/PRET/scripts/make_fake_h5_dataset.py:1)。
+   - 支持生成带 `coordinates` 或不带 `coordinates` 的 h5 假数据。
+   - 仓库里还加入了 `data_info/FAKE500.json` 和一批 `data/FAKE500` 测试 fixture。
+
+10. **健壮性细节**
+   - 特征归一化加了 `1e-8` 防止除零。
+   - similarity 归一化加了 `clamp_min(1e-8)`，避免全相同分数时出现 NaN。
+   - 多处改用 `torch.from_numpy(...astype(np.float32, copy=False))`，减少不必要拷贝。
+   - query 循环里显式 `del` 和 `torch.cuda.empty_cache()`，进一步控制显存峰值。
+
 ## Citation
 
 The paper is coming soon (accepted and waiting for publication).
