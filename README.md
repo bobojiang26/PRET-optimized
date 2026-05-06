@@ -82,10 +82,10 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 ```
 
 ## H5 Feature Evaluation
-This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain two keys:
+This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain a `features` key. A `coordinates` key is optional:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coordinates`: a 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns are interpreted as patch grid coordinates `(x, y)`.
+* `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns are interpreted as patch grid coordinates `(x, y)`. If this key is missing, PRET generates deterministic row-major synthetic coordinates so slide-level h5 evaluation can continue.
 
 Put all h5 files in one folder, for example:
 
@@ -166,7 +166,7 @@ You can also run a 7-class h5 smoke test:
 bash scripts/run_fake_h5_7class.sh
 ```
 
-For custom fake h5 data, control the number of generated classes:
+For custom fake h5 data, control the number of generated classes. Add `--omit_coordinates` to smoke-test h5 inputs that only contain `features`:
 
 ```
 python scripts/make_fake_h5_dataset.py --out data/FAKEH5_7CLASS/h5 --slides 70 --patches 96 --dim 64 --classes 7

@@ -13,6 +13,8 @@ def main():
     parser.add_argument('--dim', type=int, default=64)
     parser.add_argument('--classes', type=int, default=2)
     parser.add_argument('--seed', type=int, default=1024)
+    parser.add_argument('--omit_coordinates', action='store_true',
+        help='Write only the features key to test h5 inputs without coordinates')
     args = parser.parse_args()
 
     if args.classes < 1:
@@ -43,9 +45,12 @@ def main():
         h5_path = out_dir / f'fake_h5_slide_{slide_idx:02d}.h5'
         with h5py.File(h5_path, 'w') as f:
             f.create_dataset('features', data=np.stack(features, 0))
-            f.create_dataset('coordinates', data=np.asarray(coordinates, dtype=np.int32))
+            if not args.omit_coordinates:
+                f.create_dataset('coordinates', data=np.asarray(coordinates, dtype=np.int32))
 
     print(f'Wrote {args.slides} h5 files to {out_dir}')
+    if args.omit_coordinates:
+        print('No coordinates were written; PRET will generate synthetic row-major patch coordinates.')
     print('No labels were written; PRET will assign deterministic pseudo labels for smoke tests.')
 
 

@@ -85,15 +85,26 @@ def load_dataset_info(args):
     return dataset_info
 
 
+def make_synthetic_coordinates(num_patches):
+    if num_patches == 0:
+        return np.empty((0, 2), dtype=np.int32)
+    grid_w = int(np.ceil(np.sqrt(num_patches)))
+    patch_idxs = np.arange(num_patches, dtype=np.int32)
+    return np.stack((patch_idxs % grid_w, patch_idxs // grid_w), axis=1)
+
+
 def load_h5_feature_file(h5_path):
     with h5py.File(h5_path, 'r') as f:
-        if 'features' not in f or 'coordinates' not in f:
-            raise KeyError(f'{h5_path} must contain h5 keys: features and coordinates')
+        if 'features' not in f:
+            raise KeyError(f'{h5_path} must contain h5 key: features')
         feats = np.asarray(f['features'], dtype=np.float32)
-        coords = np.asarray(f['coordinates'])
+        coords = np.asarray(f['coordinates']) if 'coordinates' in f else None
 
     if feats.ndim != 2:
         raise ValueError(f'{h5_path}: features must be a 2D array, got shape {feats.shape}')
+    if coords is None:
+        coords = make_synthetic_coordinates(feats.shape[0])
+        print(f'[warning] {h5_path} has no coordinates key. PRET generated synthetic row-major patch coordinates.')
     if coords.ndim != 2 or coords.shape[0] != feats.shape[0] or coords.shape[1] < 2:
         raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
 
