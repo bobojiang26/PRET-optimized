@@ -18,6 +18,8 @@ import sys
 import argparse
 import random
 import json
+import time
+from contextlib import contextmanager
 
 import h5py
 import torch
@@ -33,10 +35,78 @@ from sklearn.metrics import precision_recall_curve
 from modules import inference, load_weak_prompts, execute_tagger, \
         execute_subtyping_tagger, execute_miner
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import resource
+except ImportError:
+    resource = None
+
 if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
     nn.Module.cuda = lambda self, *args, **kwargs: self
     torch.cuda.empty_cache = lambda: None
+
+
+# ====================== runtime diagnostics ======================
+
+def get_cpu_memory_mb():
+    if psutil is not None:
+        return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    if resource is not None:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == 'darwin':
+            return rss / 1024 / 1024
+        return rss / 1024
+    return None
+
+
+def format_memory_usage():
+    cpu_mem = get_cpu_memory_mb()
+    parts = []
+    if cpu_mem is not None:
+        parts.append(f'cpu_rss={cpu_mem:.1f}MB')
+    else:
+        parts.append('cpu_rss=unknown')
+
+    if torch.cuda.is_available():
+        parts.append(f'cuda_alloc={torch.cuda.memory_allocated() / 1024 / 1024:.1f}MB')
+        parts.append(f'cuda_reserved={torch.cuda.memory_reserved() / 1024 / 1024:.1f}MB')
+        parts.append(f'cuda_max_alloc={torch.cuda.max_memory_allocated() / 1024 / 1024:.1f}MB')
+    return ', '.join(parts)
+
+
+def print_memory_usage(label):
+    print(f'[memory] {label}: {format_memory_usage()}')
+
+
+class StageTimer:
+    def __init__(self, label):
+        self.label = label
+        self.times = {}
+        self.counts = {}
+
+    @contextmanager
+    def stage(self, name):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - start)
+
+    def add(self, name, elapsed):
+        self.times[name] = self.times.get(name, 0.0) + elapsed
+        self.counts[name] = self.counts.get(name, 0) + 1
+
+    def report(self):
+        timing = ', '.join(
+            f'{name}={self.times[name]:.3f}s/{self.counts[name]}x'
+            for name in self.times
+        )
+        print(f'[timing] {self.label}: {timing} | memory: {format_memory_usage()}')
 
 
 # ====================== h5 feature input helpers ======================
@@ -142,6 +212,9 @@ def get_wsi_size(wsi_path, slide_name, wsi_suffix, patch_scale):
 
 def feature_processor(args):
     print('start feature processing ...')
+    timer = StageTimer('feature_processor')
+    print_memory_usage('feature_processor start')
+    io_start = time.perf_counter()
     dataset_info = load_dataset_info(args)
     h5_map = {os.path.splitext(os.path.basename(p))[0]: p for p in find_h5_files(args.raw_feature_path)}
     os.makedirs(args.dump_features, exist_ok=True)
@@ -203,6 +276,8 @@ def feature_processor(args):
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
     
     print('finish feature processing and saving!')
+    timer.add('io', time.perf_counter() - io_start)
+    timer.report()
 
 
 # ====================== some util functions ======================
@@ -231,6 +306,64 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
         names.extend(v[:example_num])
 
     return names
+
+
+def label_counts(names, dataset_info):
+    counts = {}
+    for n in names:
+        label = dataset_info[n]['wsi_label']
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def format_label_counts(counts):
+    return ', '.join(f'{k}:{counts[k]}' for k in sorted(counts))
+
+
+def select_validation_names(rest_names, dataset_info, val_num, balanced=False):
+    if val_num <= 0 or len(rest_names) == 0:
+        return []
+
+    val_num = min(val_num, len(rest_names))
+    if not balanced:
+        return rest_names[:val_num]
+
+    grouped = {}
+    for n in rest_names:
+        label = dataset_info[n]['wsi_label']
+        grouped.setdefault(label, []).append(n)
+
+    if len(grouped) <= 1:
+        return rest_names[:val_num]
+
+    labels = list(grouped.keys())
+    random.shuffle(labels)
+    base = val_num // len(labels)
+    quotas = {label: min(base, len(grouped[label])) for label in labels}
+    selected = sum(quotas.values())
+
+    while selected < val_num:
+        progressed = False
+        labels_by_remaining = sorted(
+            labels,
+            key=lambda label: len(grouped[label]) - quotas[label],
+            reverse=True
+        )
+        for label in labels_by_remaining:
+            if selected >= val_num:
+                break
+            if quotas[label] < len(grouped[label]):
+                quotas[label] += 1
+                selected += 1
+                progressed = True
+        if not progressed:
+            break
+
+    val_names = []
+    for label in labels:
+        val_names.extend(grouped[label][:quotas[label]])
+    random.shuffle(val_names)
+    return val_names
 
 
 def check_different_patient(example_names, query_candidates, mode='TCGA'):
@@ -279,6 +412,8 @@ def evaluate(args, val_only=False):
     for i in range(args.runs):
         records['repeat_' + str(i)] = {}
         
+        repeat_timer = StageTimer(f'evaluate repeat={i}')
+        split_start = time.perf_counter()
         # ====================== data split ======================
 
         labeled_names, neg_names, test_names, rest_names = [], [], [], []
@@ -351,14 +486,18 @@ def evaluate(args, val_only=False):
 
         random.shuffle(rest_names)
         val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        val_names = rest_names[:val_num]
+        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=args.c > 1)
+        val_name_set = set(val_names)
+        remaining_names = [n for n in rest_names if n not in val_name_set]
+        if args.c > 1:
+            print('[split] repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
 
         # split test set by ratio, if no fixed test set
         if len(test_names) == 0:
             if args.val_ratio < 0:
-                test_names = rest_names[-args.test_num:]
+                test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
             else:
-                test_names = rest_names[val_num:]
+                test_names = remaining_names
             if len(val_names) + len(test_names) > len(rest_names):
                 print('wrong split size !!!')
         else: # take partial test slides for tcga cross races
@@ -367,6 +506,8 @@ def evaluate(args, val_only=False):
                 test_names = test_names[:args.test_num]
         
         records['repeat_' + str(i)]['split'] = {'example_names': example_names, 'val_names': val_names, 'test_names': test_names}
+        repeat_timer.add('split', time.perf_counter() - split_start)
+        repeat_timer.report()
 
         # ====================== run for each class ======================
 
@@ -374,9 +515,11 @@ def evaluate(args, val_only=False):
         for cls in range(1, args.c + 1):
 
             # ====================== process example and prompts ======================
+            class_timer = StageTimer(f'evaluate repeat={i} class={cls}')
 
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
+            io_start = time.perf_counter()
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 example_patch_names = example_patch_names + example_n['patch_names']
@@ -419,6 +562,7 @@ def evaluate(args, val_only=False):
             
             example_feats = torch.from_numpy(np.concatenate(example_feats, 0).astype(np.float32, copy=False)).cuda()
             example_labels = torch.from_numpy(np.concatenate(example_labels, 0)).cuda().long()
+            class_timer.add('io.examples', time.perf_counter() - io_start)
 
             if args.dump_pseudo != '':
                 vis_info = {'wsi_dir': args.wsi_path, 'vis_dir': os.path.join(args.dump_pseudo, 'vis') + str(args.example_num) + '/' + str(i) + '/' + str(cls), \
@@ -434,6 +578,7 @@ def evaluate(args, val_only=False):
 
             # ====================== apply in-context tagger ======================
 
+            tagger_start = time.perf_counter()
             # assign in-context tags for weak prompts (binary tasks: 1 pos, 0 neg, -1 unknown)
             if args.prompt_type != 'mask' and args.c == 1:
                 example_labels = execute_tagger(example_feats, example_labels, example_patch_names, example_names, \
@@ -472,6 +617,7 @@ def evaluate(args, val_only=False):
                     if (example_labels == 255).sum() == 0:
                         example_labels[example_labels_others == 0] = 255
                         example_labels[example_labels_this == 0] = 255
+            class_timer.add('tagger', time.perf_counter() - tagger_start)
 
             # ====================== predict for test slides (queries)======================
 
@@ -480,6 +626,7 @@ def evaluate(args, val_only=False):
             wsi_suffix = get_wsi_suffix(args.wsi_path)
             all_query_names = val_names if val_only else val_names + test_names
             for n in all_query_names:
+                io_start = time.perf_counter()
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.from_numpy(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
@@ -487,22 +634,27 @@ def evaluate(args, val_only=False):
                 if args.c > 1:
                     label = int(label == cls)
                 
+                class_timer.add('io.query', time.perf_counter() - io_start)
                 # ====================== discriminative instance miner for subtyping ======================
 
                 # use fg patches for subtyping
                 #if args.c > 1 and not args.seg and args.vis_path == '': # vis wo fg
                 if args.c > 1 and not args.seg:
+                    miner_start = time.perf_counter()
                     query_feats, query_patch_names = execute_miner(example_feats[example_labels == 255], \
                         query_feats, query_patch_names, uncertain=args.ignore_query)
+                    class_timer.add('miner', time.perf_counter() - miner_start)
 
                 # ====================== inference, including classifier, aggregator, post processer ======================
 
+                infer_start = time.perf_counter()
                 size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
                 vis_info = None
                 
                 sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
                 wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
                     query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm)
+                class_timer.add('infer', time.perf_counter() - infer_start)
 
                 if patch_pred != None and args.vis_path != '' and n in test_names:
                     os.makedirs(args.vis_path, exist_ok=True)
@@ -528,6 +680,7 @@ def evaluate(args, val_only=False):
 
             # Evaluate on the val set to make sure qualified results for application
             # Val set also guidances to select prediction threshod, f1 for seg. acc for others
+            validation_start = time.perf_counter()
             val_preds = torch.cat(val_preds).cpu()
             val_labels = torch.cat(val_labels)
             val_auc = aucroc(val_preds, val_labels).item()
@@ -578,6 +731,8 @@ def evaluate(args, val_only=False):
                 records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
 
+            class_timer.add('validation', time.perf_counter() - validation_start)
+            class_timer.report()
         del example_feats
         torch.cuda.empty_cache()
 
@@ -629,6 +784,8 @@ def evaluate_baseline(args, mode):
     for i in range(args.runs):
         records['repeat_' + str(i)] = {}
 
+        repeat_timer = StageTimer(f'baseline {mode} repeat={i}')
+        split_start = time.perf_counter()
         # ====================== data split ======================
 
         # data split
@@ -703,14 +860,18 @@ def evaluate_baseline(args, mode):
 
         random.shuffle(rest_names)
         val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        val_names = rest_names[:val_num]
+        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=args.c > 1)
+        val_name_set = set(val_names)
+        remaining_names = [n for n in rest_names if n not in val_name_set]
+        if args.c > 1:
+            print('[split] baseline ' + mode + ' repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
 
         # split test set by ratio, if no fixed test set
         if len(test_names) == 0:
             if args.val_ratio < 0:
-                test_names = rest_names[-args.test_num:]
+                test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
             else:
-                test_names = rest_names[val_num:]
+                test_names = remaining_names
             if len(val_names) + len(test_names) > len(rest_names):
                 print('wrong split size !!!')
         else: # take partial test slides for tcga cross races
@@ -719,6 +880,8 @@ def evaluate_baseline(args, mode):
                 test_names = test_names[:args.test_num]
 
         records['repeat_' + str(i)]['split'] = {'example_names': example_names, 'val_names': val_names, 'test_names': test_names}
+        repeat_timer.add('split', time.perf_counter() - split_start)
+        repeat_timer.report()
 
         # ====================== run for each class ======================
 
@@ -1021,6 +1184,7 @@ if __name__ == '__main__':
 
     random.seed(args.seed)
     os.makedirs(args.dump_features, exist_ok=True)
+    print_memory_usage('startup')
 
     # collect features and information
     feature_processor(args)
