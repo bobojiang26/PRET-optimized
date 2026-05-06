@@ -185,7 +185,52 @@ def get_min_feature_dim(feat_list, context):
     return target_dim
 
 
-def sparsify_reference_tokens(example_feats, example_labels, budget, random_ratio=0.1):
+def normalize_score_range(scores):
+    if scores.numel() == 0:
+        return scores
+    score_min = scores.min()
+    score_max = scores.max()
+    if (score_max - score_min).abs() < 1e-8:
+        return torch.ones_like(scores)
+    return (scores - score_min) / (score_max - score_min + 1e-8)
+
+
+def select_high_quality_tokens(feats, importance, budget, anchor_ratio=0.25):
+    if feats.shape[0] <= budget:
+        return torch.arange(feats.shape[0], device=feats.device)
+
+    budget = min(budget, feats.shape[0])
+    anchor_budget = min(max(1, int(round(budget * anchor_ratio))), budget)
+    anchors = importance.topk(anchor_budget, largest=True).indices
+    if anchor_budget == budget:
+        return anchors.sort()[0]
+
+    selected_mask = torch.zeros(feats.shape[0], dtype=torch.bool, device=feats.device)
+    selected_mask[anchors] = True
+    selected = anchors.tolist()
+
+    anchor_feats = feats[anchors]
+    min_distance = (1 - feats @ anchor_feats.t()).min(1).values
+    min_distance[selected_mask] = -1
+    importance_norm = normalize_score_range(importance)
+
+    while len(selected) < budget:
+        diversity = min_distance.clamp_min(0)
+        score = importance_norm * (0.35 + diversity)
+        score[selected_mask] = -1
+        next_idx = int(score.argmax().item())
+        if selected_mask[next_idx]:
+            break
+        selected.append(next_idx)
+        selected_mask[next_idx] = True
+        next_distance = 1 - feats @ feats[next_idx: next_idx + 1].t()
+        min_distance = torch.minimum(min_distance, next_distance[:, 0])
+        min_distance[selected_mask] = -1
+
+    return torch.tensor(selected, device=feats.device, dtype=torch.long).sort()[0]
+
+
+def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_ratio=0.25):
     if budget <= 0 or example_feats.shape[0] <= budget:
         return example_feats, example_labels
 
@@ -222,6 +267,12 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, random_rati
         quotas[label] += 1
         selected_total += 1
 
+    centroids = {}
+    for label, idx in label_idxs.items():
+        if idx.shape[0] == 0:
+            continue
+        centroids[label] = F.normalize(example_feats[idx].mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+
     keep_idxs = []
     for label in valid_labels:
         idx = label_idxs[label]
@@ -231,30 +282,17 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, random_rati
             continue
 
         feats_l = example_feats[idx]
-        centroid = F.normalize(feats_l.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
-        scores = (feats_l @ centroid.t()).reshape(-1)
-        sorted_idx = scores.argsort(descending=True)
-
-        if per_label_budget == 1:
-            selected = sorted_idx[:1]
+        own_centroid = centroids[label]
+        own_score = (feats_l @ own_centroid.t()).reshape(-1)
+        other_centroids = [centroids[_] for _ in valid_labels if _ != label and _ in centroids]
+        if len(other_centroids) > 0:
+            other_centroids = torch.cat(other_centroids, 0)
+            other_score = (feats_l @ other_centroids.t()).max(1).values
         else:
-            positions = torch.linspace(0, sorted_idx.shape[0] - 1, per_label_budget, device=sorted_idx.device)
-            selected = sorted_idx[positions.round().long().unique()]
-            if selected.shape[0] < per_label_budget:
-                picked = torch.zeros(sorted_idx.shape[0], dtype=torch.bool, device=sorted_idx.device)
-                picked[positions.round().long().unique()] = True
-                fill = sorted_idx[~picked][:per_label_budget - selected.shape[0]]
-                selected = torch.cat([selected, fill], 0)
+            other_score = torch.zeros_like(own_score)
 
-        random_keep = int(per_label_budget * random_ratio)
-        random_keep = min(random_keep, max(per_label_budget - 1, 0))
-        if random_keep > 0:
-            remaining = torch.ones(idx.shape[0], dtype=torch.bool, device=idx.device)
-            remaining[selected] = False
-            remaining_idxs = remaining.nonzero(as_tuple=False).reshape(-1)
-            if remaining_idxs.shape[0] > 0:
-                perm = torch.randperm(remaining_idxs.shape[0], device=idx.device)[:random_keep]
-                selected = torch.cat([selected[:-random_keep], remaining_idxs[perm]], 0)
+        importance = normalize_score_range(own_score) + normalize_score_range(own_score - other_score)
+        selected = select_high_quality_tokens(feats_l, importance, per_label_budget, anchor_ratio=anchor_ratio)
         keep_idxs.append(idx[selected])
 
     keep_idxs = torch.cat(keep_idxs, 0)
@@ -787,7 +825,7 @@ def evaluate(args, val_only=False):
                 example_feats,
                 example_labels,
                 args.reference_token_budget,
-                args.reference_random_ratio
+                args.reference_anchor_ratio
             )
             class_timer.add('reference_sparse', time.perf_counter() - sparse_start)
 
@@ -1356,8 +1394,8 @@ if __name__ == '__main__':
     parser.add_argument('--multiple_num', type=int, nargs='+', default=None, help='multi example num')
     parser.add_argument('--reference_token_budget', default=0, type=int,
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
-    parser.add_argument('--reference_random_ratio', default=0.1, type=float,
-        help='fraction of sparse reference budget reserved for random diversity')
+    parser.add_argument('--reference_anchor_ratio', default=0.25, type=float,
+        help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
