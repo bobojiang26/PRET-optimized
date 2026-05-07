@@ -20,12 +20,24 @@ TOP_INSTANCE="${TOP_INSTANCE:-3}"
 TEMPERATURE="${TEMPERATURE:-10}"
 RELATED_THRESH="${RELATED_THRESH:-0.8}"
 SEED="${SEED:-1024}"
+REFERENCE_TOKEN_BUDGET="${REFERENCE_TOKEN_BUDGET:-}"
+REFERENCE_ANCHOR_RATIO="${REFERENCE_ANCHOR_RATIO:-}"
 
 MULTIPLE_ARGS=()
 if [[ -n "${MULTIPLE_NUM:-}" ]]; then
   read -r -a MULTIPLE_ARGS <<< "${MULTIPLE_NUM}"
   MULTIPLE_ARGS=(--multiple_num "${MULTIPLE_ARGS[@]}")
 fi
+
+SPARSE_ARGS=()
+if [[ -n "${REFERENCE_TOKEN_BUDGET}" ]]; then
+  SPARSE_ARGS+=(--reference_token_budget "${REFERENCE_TOKEN_BUDGET}")
+fi
+if [[ -n "${REFERENCE_ANCHOR_RATIO}" ]]; then
+  SPARSE_ARGS+=(--reference_anchor_ratio "${REFERENCE_ANCHOR_RATIO}")
+fi
+
+EXTRA_ARGS=("$@")
 
 "${PYTHON_BIN}" core/main.py \
   --mode eval \
@@ -48,4 +60,6 @@ fi
   --file_min_size 0 \
   --class_num "${CLASS_NUM}" \
   --runs "${RUNS}" \
-  --dump_records "${DUMP_RECORDS}"
+  --dump_records "${DUMP_RECORDS}" \
+  ${SPARSE_ARGS[@]+"${SPARSE_ARGS[@]}"} \
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
