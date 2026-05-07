@@ -356,13 +356,7 @@ auc mean: 0.9748, auc std: 0.0181, f1 mean: 0.9124, f1 std: 0.048, acc mean: 0.8
 
 
 ### Optimization
-我对比的是本地 `/Users/chenbozhou/Desktop/PRET` 的已提交 `main`，相对于上游 `origin/main`。本地记录显示：
 
-- 上游 `xmed-lab/PRET`: `c2ecd93 Update README.md`
-- 本地 `PRET-optimized`: `2a3651f Support h5 features without coordinates`
-- 中间新增 5 个提交：`f1d011f`、`c4e6818`、`0eedd91`、`577f50a`、`2a3651f`
-
-GitHub 页面也确认了上游仓库是 [xmed-lab/PRET](https://github.com/xmed-lab/PRET)。终端里直接 `git ls-remote` 失败了，原因是当前环境无法解析 `github.com`，所以精确 diff 基于本地已有的 `origin/main`。
 
 **主要优化/增强如下：**
 
