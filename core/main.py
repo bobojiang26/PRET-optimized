@@ -101,11 +101,20 @@ class StageTimer:
         self.times[name] = self.times.get(name, 0.0) + elapsed
         self.counts[name] = self.counts.get(name, 0) + 1
 
-    def report(self):
-        timing = ', '.join(
+    def merge(self, other):
+        for name, elapsed in other.times.items():
+            self.times[name] = self.times.get(name, 0.0) + elapsed
+            self.counts[name] = self.counts.get(name, 0) + other.counts.get(name, 0)
+
+    def report(self, total_elapsed=None):
+        parts = []
+        if total_elapsed is not None:
+            parts.append(f'total={total_elapsed:.3f}s')
+        parts.extend(
             f'{name}={self.times[name]:.3f}s/{self.counts[name]}x'
             for name in self.times
         )
+        timing = ', '.join(parts) if parts else 'total=0.000s'
         print(f'[timing] {self.label}: {timing} | memory: {format_memory_usage()}')
 
 
@@ -607,6 +616,7 @@ def evaluate(args, val_only=False):
         records['repeat_' + str(i)] = {}
         
         repeat_timer = StageTimer(f'evaluate repeat={i}')
+        repeat_start = time.perf_counter()
         split_start = time.perf_counter()
         # ====================== data split ======================
 
@@ -701,7 +711,6 @@ def evaluate(args, val_only=False):
         
         records['repeat_' + str(i)]['split'] = {'example_names': example_names, 'val_names': val_names, 'test_names': test_names}
         repeat_timer.add('split', time.perf_counter() - split_start)
-        repeat_timer.report()
 
         # ====================== run for each class ======================
 
@@ -947,9 +956,10 @@ def evaluate(args, val_only=False):
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
 
             class_timer.add('validation', time.perf_counter() - validation_start)
-            class_timer.report()
+            repeat_timer.merge(class_timer)
         del example_feats
         torch.cuda.empty_cache()
+        repeat_timer.report(total_elapsed=time.perf_counter() - repeat_start)
 
     # ====================== count and record results ======================
 
