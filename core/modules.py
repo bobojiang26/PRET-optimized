@@ -16,6 +16,7 @@ import os, math, copy, math
 import numpy as np
 import openslide
 import torch
+import torch.nn.functional as F
 import cv2
 
 SIMILARITY_EXAMPLE_CHUNK = int(os.environ.get('PRET_EXAMPLE_CHUNK', 4096))
@@ -142,6 +143,16 @@ def compute_similarity(query, example, topk=40):
                 scores_out.append(summed / max(count, 1))
 
     return torch.cat(scores_out, 0)
+
+
+def compute_prototype_logits(query, pos_examples, neg_examples):
+    """Return prototype-difference logits for positive versus negative references."""
+    if pos_examples.shape[0] == 0 or neg_examples.shape[0] == 0:
+        return None
+
+    pos_proto = F.normalize(pos_examples.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+    neg_proto = F.normalize(neg_examples.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+    return (query @ pos_proto.t()).reshape(-1) - (query @ neg_proto.t()).reshape(-1)
 
 
 def aggregate_query_logits(query_feats, query_logits, top_instance, related_thresh, temperature):
@@ -440,9 +451,16 @@ def inference(args, example_feats, example_labels, example_patch_names,
     # ====================== in-context classifier ======================
 
     # Stream top-k similarities by query chunk to avoid an example x query matrix.
-    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk)
-    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk)
+    pos_examples = example_feats[example_labels == 1]
+    neg_examples = example_feats[example_labels == 0]
+    pos_score = compute_similarity(query_feats, pos_examples, topk=args.topk)
+    neg_score = compute_similarity(query_feats, neg_examples, topk=args.topk)
     query_logits = (pos_score - neg_score).to(query_feats.device)
+    if args.prototype_blend > 0:
+        prototype_logits = compute_prototype_logits(query_feats, pos_examples, neg_examples)
+        if prototype_logits is not None:
+            blend = min(max(args.prototype_blend, 0.0), 1.0)
+            query_logits = (1 - blend) * query_logits + blend * prototype_logits.to(query_feats.device)
 
     # ====================== attention aggregator ======================
 
