@@ -792,12 +792,16 @@ def evaluate(args, val_only=False):
             # assign in-context tags for weak prompts (binary tasks: 1 pos, 0 neg, -1 unknown)
             if args.prompt_type != 'mask' and args.c == 1:
                 example_labels = execute_tagger(example_feats, example_labels, example_patch_names, example_names, \
-                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                    similarity_reduction=args.similarity_reduction,
+                    similarity_temperature=args.similarity_temperature)
 
             # assign in-context tags for subtyping from slideLabel (255 normal, 254 uncertain, 1 this class, 0 other classes)
             if args.prompt_type == 'slideLabel' and args.c > 1:
                 example_labels = execute_subtyping_tagger(example_feats, example_labels, example_patch_names, \
-                    example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                    example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                    similarity_reduction=args.similarity_reduction,
+                    similarity_temperature=args.similarity_temperature)
             
             # subtyping + box / roughMask. Need to process "execute_tagger" twice. 
             # Once for shared bg and this class, another for shared bg and other classes
@@ -809,7 +813,9 @@ def evaluate(args, val_only=False):
                     example_labels_this[example_labels_this == 255] = 0 # subtyping bg label to binary neg label
                     example_labels_this[example_labels_this == 1] = -1  # this class to undertain to relabel
                     example_labels_this = execute_tagger(example_feats, example_labels_this, example_patch_names, example_names, \
-                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                        similarity_reduction=args.similarity_reduction,
+                        similarity_temperature=args.similarity_temperature)
 
                     vis_info = None
                     example_labels_others = example_labels.clone()
@@ -817,7 +823,9 @@ def evaluate(args, val_only=False):
                     example_labels_others[example_labels_others == 0] = -1  # other class to undertain to relabel
                     example_labels_others[example_labels_others == 255] = 0 # subtyping bg label to binary neg label
                     example_labels_others = execute_tagger(example_feats, example_labels_others, example_patch_names, example_names, \
-                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                        similarity_reduction=args.similarity_reduction,
+                        similarity_temperature=args.similarity_temperature)
 
                     example_labels[:] = 255 # default bg
                     example_labels[example_labels_this == 1] = 1     # this class
@@ -864,7 +872,9 @@ def evaluate(args, val_only=False):
                 if args.c > 1 and not args.seg:
                     miner_start = time.perf_counter()
                     query_feats, query_patch_names = execute_miner(example_feats_for_query[example_labels == 255], \
-                        query_feats, query_patch_names, uncertain=args.ignore_query)
+                        query_feats, query_patch_names, uncertain=args.ignore_query,
+                        similarity_reduction=args.similarity_reduction,
+                        similarity_temperature=args.similarity_temperature)
                     class_timer.add('miner', time.perf_counter() - miner_start)
 
                 # ====================== inference, including classifier, aggregator, post processer ======================
@@ -1406,6 +1416,10 @@ if __name__ == '__main__':
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
     parser.add_argument('--reference_anchor_ratio', default=0.25, type=float,
         help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
+    parser.add_argument('--similarity_reduction', default='mean', choices=['mean', 'softmax', 'max'],
+        help='how to reduce top-k reference similarities for tagger, miner, and inference')
+    parser.add_argument('--similarity_temperature', default=10.0, type=float,
+        help='temperature used when --similarity_reduction softmax is enabled')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)

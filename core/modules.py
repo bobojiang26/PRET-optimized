@@ -110,12 +110,26 @@ def load_weak_prompts(fn, wsi_label, wsi_dir, patch_labels, patch_names, anno_di
 
 # ====================== some util functions ======================
 
-def compute_similarity(query, example, topk=40):
+def reduce_similarity_scores(scores, reduction='mean', temperature=10.0):
+    reduction = reduction.lower()
+    if reduction == 'mean':
+        return scores.mean(0)
+    if reduction == 'max':
+        return scores.max(0).values
+    if reduction == 'softmax':
+        temperature = max(float(temperature), 1e-6)
+        weights = (scores * temperature).softmax(0)
+        return (weights * scores).sum(0)
+    raise ValueError(f'unsupported similarity reduction: {reduction}')
+
+
+def compute_similarity(query, example, topk=40, reduction='mean', temperature=10.0):
     """Return per-query mean similarity without materializing example x query."""
     if query.shape[0] == 0 or example.shape[0] == 0:
         return torch.zeros(query.shape[0], device=query.device)
 
     k = min(topk, example.shape[0]) if topk > 0 else -1
+    reduction = reduction.lower()
     scores_out = []
     with torch.no_grad():
         for q_start in range(0, query.shape[0], SIMILARITY_QUERY_CHUNK):
@@ -129,17 +143,51 @@ def compute_similarity(query, example, topk=40):
                     scores = scores.topk(min(k, scores.shape[0]), dim=0)[0]
                     best = scores if best is None else torch.cat([best, scores], 0).topk(k, dim=0)[0]
                     del scores
-                scores_out.append(best.mean(0))
+                scores_out.append(reduce_similarity_scores(best, reduction, temperature))
             else:
-                summed = torch.zeros(query_chunk.shape[0], device=query.device)
-                count = 0
-                for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
-                    example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
-                    scores = example_chunk @ query_chunk.t()
-                    summed += scores.sum(0)
-                    count += example_chunk.shape[0]
-                    del scores
-                scores_out.append(summed / max(count, 1))
+                if reduction == 'mean':
+                    summed = torch.zeros(query_chunk.shape[0], device=query.device)
+                    count = 0
+                    for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
+                        example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
+                        scores = example_chunk @ query_chunk.t()
+                        summed += scores.sum(0)
+                        count += example_chunk.shape[0]
+                        del scores
+                    scores_out.append(summed / max(count, 1))
+                elif reduction == 'max':
+                    best = None
+                    for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
+                        example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
+                        scores = example_chunk @ query_chunk.t()
+                        chunk_best = scores.max(0).values
+                        best = chunk_best if best is None else torch.maximum(best, chunk_best)
+                        del scores
+                    scores_out.append(best)
+                elif reduction == 'softmax':
+                    temperature = max(float(temperature), 1e-6)
+                    max_score, sum_exp, weighted_sum = None, None, None
+                    for e_start in range(0, example.shape[0], SIMILARITY_EXAMPLE_CHUNK):
+                        example_chunk = example[e_start: e_start + SIMILARITY_EXAMPLE_CHUNK]
+                        scores = example_chunk @ query_chunk.t()
+                        scaled = scores * temperature
+                        chunk_max = scaled.max(0).values
+                        if max_score is None:
+                            max_score = chunk_max
+                            exp_scores = (scaled - max_score).exp()
+                            sum_exp = exp_scores.sum(0)
+                            weighted_sum = (exp_scores * scores).sum(0)
+                        else:
+                            next_max = torch.maximum(max_score, chunk_max)
+                            old_scale = (max_score - next_max).exp()
+                            exp_scores = (scaled - next_max).exp()
+                            sum_exp = sum_exp * old_scale + exp_scores.sum(0)
+                            weighted_sum = weighted_sum * old_scale + (exp_scores * scores).sum(0)
+                            max_score = next_max
+                        del scores
+                    scores_out.append(weighted_sum / sum_exp.clamp_min(1e-8))
+                else:
+                    raise ValueError(f'unsupported similarity reduction: {reduction}')
 
     return torch.cat(scores_out, 0)
 
@@ -273,8 +321,12 @@ def vis_heat(score, label, pos, f, wsi_dir, vis_dir, mask_dir, side=512):
 
 # ====================== instance miner for subtyping ======================
 
-def execute_miner(neg_example_feats, feats, names, topk=40, uncertain=0.2):
-    sim = compute_similarity(feats, neg_example_feats, topk=topk)
+def execute_miner(neg_example_feats, feats, names, topk=40, uncertain=0.2,
+        similarity_reduction='mean', similarity_temperature=10.0):
+    sim = compute_similarity(
+        feats, neg_example_feats, topk=topk,
+        reduction=similarity_reduction, temperature=similarity_temperature
+    )
     ukn = torch.ones(len(names)) == 1
     fg = torch.zeros(len(names)).long()
     fg = basic_tagger(sim, ukn, fg, uncertain, positive=False)
@@ -315,7 +367,8 @@ def basic_tagger(ukn_sim, ukn_mask, label, uncertain, positive=False):
 
 # binary classification via sparse annotations (slideLabel, box, roughMask)
 def execute_tagger(feats, labels, patch_names, wsi_names, \
-        vis_info=None, uncertain=0.1, topk=40, sampling_size=-1):
+        vis_info=None, uncertain=0.1, topk=40, sampling_size=-1,
+        similarity_reduction='mean', similarity_temperature=10.0):
 
     # assign init label for each wsi
     # record uncertain positive and normal patch idx
@@ -333,7 +386,10 @@ def execute_tagger(feats, labels, patch_names, wsi_names, \
 
         ukn_mask = labels[idx] == -1
         if True in ukn_mask:
-            sim_ukn = compute_similarity(feats[idx][ukn_mask], feats[labels == 0], topk=topk)
+            sim_ukn = compute_similarity(
+                feats[idx][ukn_mask], feats[labels == 0], topk=topk,
+                reduction=similarity_reduction, temperature=similarity_temperature
+            )
             sim_ukn = (sim_ukn - sim_ukn.min()) / (sim_ukn.max() - sim_ukn.min()).clamp_min(1e-8)
             labels_ukn = torch.zeros(sim_ukn.shape[0]).cuda().long()
             labels_ukn = basic_tagger(sim_ukn, labels_ukn==0, labels_ukn, uncertain, positive=False)
@@ -349,8 +405,14 @@ def execute_tagger(feats, labels, patch_names, wsi_names, \
         idx_n = info_dic[n]['idx']
         if -1 in labels[idx_n]:
             feats_n = feats[idx_n]
-            sim_pos = compute_similarity(feats_n, feats[pos_idx], topk=topk)
-            sim_neg = compute_similarity(feats_n, feats[neg_idx], topk=topk)
+            sim_pos = compute_similarity(
+                feats_n, feats[pos_idx], topk=topk,
+                reduction=similarity_reduction, temperature=similarity_temperature
+            )
+            sim_neg = compute_similarity(
+                feats_n, feats[neg_idx], topk=topk,
+                reduction=similarity_reduction, temperature=similarity_temperature
+            )
             score = sim_pos - sim_neg
             score = torch.clamp(score, -0.5, 0.5) + 0.5 # norm to 0-1 for vis via clamp
 
@@ -369,18 +431,31 @@ def execute_tagger(feats, labels, patch_names, wsi_names, \
 
 # 1.dataset similarity 2.init pseudo in each wsi 3.refine via dataset pseduo
 def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
-        vis_info=None, uncertain=0.1, topk=40, sampling_size=40000):
+        vis_info=None, uncertain=0.1, topk=40, sampling_size=40000,
+        similarity_reduction='mean', similarity_temperature=10.0):
     
     # step1 similarity cross wsi-level label
     pos, neg = labels == 1, labels == 0
     if sampling_size > 0:
         sampled_idx = torch.randint(0, feats[neg].shape[0], (1, sampling_size))[0]
-        sim_pos = compute_similarity(feats[pos], feats[neg][sampled_idx[:sampling_size], :], topk=topk)
+        sim_pos = compute_similarity(
+            feats[pos], feats[neg][sampled_idx[:sampling_size], :], topk=topk,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
         sampled_idx = torch.randint(0, feats[pos].shape[0], (1, sampling_size))[0]
-        sim_neg = compute_similarity(feats[neg], feats[pos][sampled_idx[:sampling_size], :], topk=topk)
+        sim_neg = compute_similarity(
+            feats[neg], feats[pos][sampled_idx[:sampling_size], :], topk=topk,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
     else:
-        sim_pos = compute_similarity(feats[pos], feats[neg], topk=topk)
-        sim_neg = compute_similarity(feats[neg], feats[pos], topk=topk)
+        sim_pos = compute_similarity(
+            feats[pos], feats[neg], topk=topk,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
+        sim_neg = compute_similarity(
+            feats[neg], feats[pos], topk=topk,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
     sim = torch.zeros(feats.shape[0]).cuda()
     sim[pos] = sim_pos.cuda()
     sim[neg] = sim_neg.cuda()
@@ -413,8 +488,14 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
         idx_n = info_dic[n]['idx']
         feats_n = feats[idx_n]
         wsi_label = labels[idx_n[0]].item()
-        sim_pos = compute_similarity(feats_n, feats[labeled_idx_dic[wsi_label]], topk=-1)
-        sim_neg = compute_similarity(feats_n, feats[labeled_idx_dic[255]], topk=-1)
+        sim_pos = compute_similarity(
+            feats_n, feats[labeled_idx_dic[wsi_label]], topk=-1,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
+        sim_neg = compute_similarity(
+            feats_n, feats[labeled_idx_dic[255]], topk=-1,
+            reduction=similarity_reduction, temperature=similarity_temperature
+        )
         score = sim_pos - sim_neg
         score = torch.clamp(score, -0.5, 0.5) + 0.5 # norm to 0-1 for vis via clamp
 
@@ -440,8 +521,14 @@ def inference(args, example_feats, example_labels, example_patch_names,
     # ====================== in-context classifier ======================
 
     # Stream top-k similarities by query chunk to avoid an example x query matrix.
-    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk)
-    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk)
+    pos_score = compute_similarity(
+        query_feats, example_feats[example_labels == 1], topk=args.topk,
+        reduction=args.similarity_reduction, temperature=args.similarity_temperature
+    )
+    neg_score = compute_similarity(
+        query_feats, example_feats[example_labels == 0], topk=args.topk,
+        reduction=args.similarity_reduction, temperature=args.similarity_temperature
+    )
     query_logits = (pos_score - neg_score).to(query_feats.device)
 
     # ====================== attention aggregator ======================
