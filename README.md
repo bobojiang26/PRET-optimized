@@ -413,6 +413,51 @@ GitHub 页面也确认了上游仓库是 [xmed-lab/PRET](https://github.com/xmed
    - 多处改用 `torch.from_numpy(...astype(np.float32, copy=False))`，减少不必要拷贝。
    - query 循环里显式 `del` 和 `torch.cuda.empty_cache()`，进一步控制显存峰值。
 
+11. **多分类评估路径加速**
+   - 原版在多分类评估时，会对每个类别单独走一遍 `tagger -> miner -> inference -> validation`，外层是 class-level `for` 循环，这部分很难完全改成“所有类别一步并行”，因为每个类别的 pseudo label、foreground miner、threshold search 都依赖该类别自己的 reference 和分数分布。
+   - 优化版没有强行把 class loop 改成多进程/多线程去抢一张 GPU，而是优先把真正的热点变成 GPU 上的批量矩阵运算：
+     - [`compute_similarity`](core/modules.py#L112) 维持 query/example chunk 流式计算，但把 chunk 内 top-k 和 reduce 保留在 GPU 上，不再每个 chunk 强制 `.cpu()`。
+     - [`aggregate_query_logits`](core/modules.py#L147) 把原来 top-instance 一个个 patch 做 self-attention 聚合的循环，改成按 `ATTENTION_QUERY_CHUNK` 的小批量矩阵运算。
+   - 这意味着“类别间逻辑仍是串行的”，但“每个类别内部最耗时的相似度和聚合”已经更接近 GPU 友好的并行实现，通常比直接开 CPU 并行更稳，也更不容易因为显存争抢反而变慢。
+
+12. **提升 GPU 占用率与利用率**
+   - 原版 GPU 利用率偏低的核心原因，是相似度计算虽然在 GPU 上做了乘法，但每个 chunk 立刻 `.cpu()`，导致频繁的 device sync 和 host-device 拷贝。
+   - 优化版把中间 top-k scores 保留在 GPU 上，直到该阶段真正结束再做后续处理，减少了同步开销。
+   - 默认 chunk 也从 `2048` 提高到 `4096`：
+     - `PRET_EXAMPLE_CHUNK`
+     - `PRET_QUERY_CHUNK`
+     - `PRET_ATTENTION_QUERY_CHUNK`
+   - 这几个参数都可以通过环境变量覆盖，用于按具体 GPU 显存容量调优。例如：
+
+```bash
+PRET_EXAMPLE_CHUNK=8192 PRET_QUERY_CHUNK=4096 PRET_ATTENTION_QUERY_CHUNK=1024 \
+python core/main.py ...
+```
+
+   - 另外，终端现在会输出 `[timing]` 和 `[memory]`，便于直接观察 `io/query/miner/infer` 哪一段才是真正瓶颈，而不是只盯着 `nvidia-smi`。
+
+13. **高质量 reference token 稀疏化**
+   - reference token 的目标不是“随机删点”，而是“尽量保留最强、最有区分度、同时又不完全重复的 token”。
+   - 旧版实验性实现里带有少量随机补位；当前版本已经改成**全确定性选择**，核心思路是一个 `importance-aware coreset`：
+     - 先按 label (`0 / 1 / 255`) 给 token 分预算，避免某一类 token 被整体压得过狠。
+     - 对每个 label 内的 token，计算 importance：
+       - `own-centroid similarity`：token 和本类中心有多接近。
+       - `margin to other centroids`：token 相对其他类中心有多可分。
+     - 先保留一批最强的 `anchor tokens`。
+     - 再用带 diversity 的贪心选择继续补点：已经选中的 token 越能覆盖当前分布，后续就越倾向补那些“同样重要但和已选 token 不那么相似”的点。
+   - 相关实现见：
+     - [`sparsify_reference_tokens`](core/main.py#L233)
+     - [`select_high_quality_tokens`](core/main.py#L198)
+   - 开关参数：
+     - `--reference_token_budget`：reference token 总预算；`0` 表示不稀疏化。
+     - `--reference_anchor_ratio`：预算中先分给 strongest anchors 的比例，默认 `0.25`。
+   - 本地 smoke test 的结论是：功能上没有问题，但如果预算压得太狠，精度仍可能下降。因此默认仍建议 `--reference_token_budget 0`，或者先用较保守的预算，从保留 70%-85% token 开始试。
+
+14. **混合特征维度兼容**
+   - 某些多分类数据可能会混用不同 foundation model 导出的特征，例如一部分 slide 是 `768` 维，另一部分是 `1536` 维。原版会在 `np.concatenate(example_feats, 0)` 处直接报错。
+   - 优化版会在 example/query 进入主流程前自动对齐到共享维度，并在终端打印 warning，说明哪些 slide/query 发生了 truncation/padding。
+   - 这主要用于保证 pipeline 能跑通和方便定位数据源问题；如果追求严格 benchmark，一般仍建议统一上游特征维度。
+
 ## Citation
 
 The paper is coming soon (accepted and waiting for publication).
