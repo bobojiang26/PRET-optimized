@@ -16,6 +16,7 @@ import os, math, copy, math
 import numpy as np
 import openslide
 import torch
+import torch.nn.functional as F
 import cv2
 
 SIMILARITY_EXAMPLE_CHUNK = int(os.environ.get('PRET_EXAMPLE_CHUNK', 4096))
@@ -144,10 +145,43 @@ def compute_similarity(query, example, topk=40):
     return torch.cat(scores_out, 0)
 
 
-def aggregate_query_logits(query_feats, query_logits, top_instance, related_thresh, temperature):
+def select_diverse_top_queries(query_feats, query_logits, top_query_num, diversity_lambda=1.0):
+    """Select high-scoring but less redundant query anchors with MMR."""
+    top_query_num = min(top_query_num, query_logits.shape[0])
+    if top_query_num <= 0:
+        return torch.empty(0, dtype=torch.long, device=query_logits.device)
+    if diversity_lambda >= 0.999 or top_query_num == 1:
+        return query_logits.topk(top_query_num)[1]
+
+    diversity_lambda = min(max(float(diversity_lambda), 0.0), 1.0)
+    score = query_logits
+    score = (score - score.min()) / (score.max() - score.min()).clamp_min(1e-8)
+    feats = F.normalize(query_feats, p=2, dim=1, eps=1e-8)
+
+    selected = [int(score.argmax().item())]
+    selected_mask = torch.zeros(query_logits.shape[0], dtype=torch.bool, device=query_logits.device)
+    selected_mask[selected[0]] = True
+    max_selected_sim = feats @ feats[selected[0]:selected[0] + 1].t()
+    max_selected_sim = max_selected_sim.reshape(-1)
+
+    while len(selected) < top_query_num:
+        mmr = diversity_lambda * score - (1 - diversity_lambda) * max_selected_sim
+        mmr[selected_mask] = -1e9
+        next_idx = int(mmr.argmax().item())
+        if selected_mask[next_idx]:
+            break
+        selected.append(next_idx)
+        selected_mask[next_idx] = True
+        next_sim = feats @ feats[next_idx:next_idx + 1].t()
+        max_selected_sim = torch.maximum(max_selected_sim, next_sim.reshape(-1))
+
+    return torch.tensor(selected, dtype=torch.long, device=query_logits.device)
+
+
+def aggregate_query_logits(query_feats, query_logits, top_instance, related_thresh, temperature, diversity_lambda=1.0):
     """Vectorized attention aggregation over top query patches."""
     top_query_num = min(top_instance, query_logits.shape[0])
-    top_query_idxs = query_logits.topk(top_query_num)[1]
+    top_query_idxs = select_diverse_top_queries(query_feats, query_logits, top_query_num, diversity_lambda)
 
     query_feats_t = query_feats.t()
     wsi_pred_list = []
@@ -447,7 +481,8 @@ def inference(args, example_feats, example_labels, example_patch_names,
     # ====================== attention aggregator ======================
 
     wsi_pred = aggregate_query_logits(
-        query_feats, query_logits, top_instance, args.related_thresh, args.temperature
+        query_feats, query_logits, top_instance, args.related_thresh, args.temperature,
+        args.top_instance_diversity_lambda
     )
 
     # ====================== patch reshape to wsi for heatmap / seg ======================

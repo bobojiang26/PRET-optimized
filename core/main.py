@@ -1406,6 +1406,8 @@ if __name__ == '__main__':
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
     parser.add_argument('--reference_anchor_ratio', default=0.25, type=float,
         help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
+    parser.add_argument('--top_instance_diversity_lambda', default=1.0, type=float,
+        help='MMR lambda for diverse top-instance aggregation; 1.0 keeps original top-logit selection')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
