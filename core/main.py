@@ -388,6 +388,7 @@ def load_dataset_info(args):
             slide_name = os.path.splitext(os.path.basename(h5_path))[0]
             if slide_name not in dataset_info:
                 dataset_info[slide_name] = {}
+            dataset_info[slide_name]['h5_input'] = True
             if 'fixed_test_set' not in dataset_info[slide_name]:
                 dataset_info[slide_name]['fixed_test_set'] = False
             if 'wsi_label' not in dataset_info[slide_name]:
@@ -687,9 +688,12 @@ def evaluate(args, val_only=False):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
                 
-                    # Positive slides with patch annotations were already added above.
-                    # For slide-label binary runs, add negatives and h5-only positives once.
-                    if args.c == 1 and 'pos_patch_num' not in dataset_info[n]:
+                    # Keep original binary WSI behavior: only add negatives here.
+                    # h5-only slide-label datasets have no patch labels, so they need both classes.
+                    if args.c == 1 and (
+                        dataset_info[n].get('wsi_label') == 0 or
+                        (dataset_info[n].get('h5_input', False) and 'pos_patch_num' not in dataset_info[n])
+                    ):
                         labeled_names.append(n)
                 
                 # record neg names to exclude from seg val /test
@@ -1087,9 +1091,12 @@ def evaluate_baseline(args, mode):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
 
-                    # Positive slides with patch annotations were already added above.
-                    # For slide-label binary runs, add negatives and h5-only positives once.
-                    if args.c == 1 and 'pos_patch_num' not in dataset_info[n]:
+                    # Keep original binary WSI behavior: only add negatives here.
+                    # h5-only slide-label datasets have no patch labels, so they need both classes.
+                    if args.c == 1 and (
+                        dataset_info[n].get('wsi_label') == 0 or
+                        (dataset_info[n].get('h5_input', False) and 'pos_patch_num' not in dataset_info[n])
+                    ):
                         labeled_names.append(n)
 
                 # record neg names to exclude from seg val /test
