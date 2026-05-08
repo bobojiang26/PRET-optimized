@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET_NAME="${DATASET_NAME:-MY_H5}"
 H5_DIR="${H5_DIR:-data/${DATASET_NAME}/h5}"
