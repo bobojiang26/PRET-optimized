@@ -645,8 +645,9 @@ def evaluate(args, val_only=False):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
                 
-                    # slide labels are usable prompts for both positive and negative h5-only slides.
-                    if args.c == 1:
+                    # Positive slides with patch annotations were already added above.
+                    # For slide-label binary runs, add negatives and h5-only positives once.
+                    if args.c == 1 and 'pos_patch_num' not in dataset_info[n]:
                         labeled_names.append(n)
                 
                 # record neg names to exclude from seg val /test
@@ -1039,8 +1040,9 @@ def evaluate_baseline(args, mode):
                     if args.c > 1 and 'pos_patch_num' not in info_str:
                         labeled_names.append(n)
 
-                    # slide labels are usable prompts for both positive and negative h5-only slides.
-                    if args.c == 1:
+                    # Positive slides with patch annotations were already added above.
+                    # For slide-label binary runs, add negatives and h5-only positives once.
+                    if args.c == 1 and 'pos_patch_num' not in dataset_info[n]:
                         labeled_names.append(n)
 
                 # record neg names to exclude from seg val /test
