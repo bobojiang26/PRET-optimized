@@ -557,7 +557,7 @@ def macro_value(l, n):
     return out
 
 
-def get_example_names_at_same_num(all_names, dataset_info, example_num, check_num=False):
+def get_example_names_at_same_num(all_names, dataset_info, example_num, check_num=False, expected_labels=None):
     record = {}
     for n in all_names:
         lb = dataset_info[n]['wsi_label']
@@ -565,12 +565,26 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
             record[lb] = []
         record[lb].append(n)
 
+    labels = list(expected_labels) if expected_labels is not None else list(record.keys())
+    if check_num:
+        shortages = []
+        for k in labels:
+            candidate_num = len(record.get(k, []))
+            if candidate_num < example_num:
+                shortages.append(f'{k}: need {example_num}, found {candidate_num}')
+        if shortages:
+            counts = ', '.join(f'{k}:{len(record[k])}' for k in sorted(record))
+            raise ValueError(
+                'Insufficient example WSIs for balanced multiclass sampling. '
+                f'Missing/short classes: {", ".join(shortages)}. '
+                f'Candidate label counts: {counts}. '
+                'For slideLabel multiclass runs, make sure every class has at least '
+                'example_num non-fixed-test WSI candidates.'
+            )
+
     names = []
-    for k, v in record.items():
-        if check_num == True and len(v) < (example_num):
-            print('exist! insufficient samples. ' + str(k))
-            sys.exit(0)
-        names.extend(v[:example_num])
+    for k in labels:
+        names.extend(record.get(k, [])[:example_num])
 
     return names
 
@@ -669,7 +683,6 @@ def evaluate(args, val_only=False):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
     dataset_info = load_dataset_info(args)
-    info_str = json.dumps(dataset_info)
     all_names = dataset_info.keys()
 
     records = {}
@@ -705,8 +718,8 @@ def evaluate(args, val_only=False):
                         labeled_names.append(n)
                 
                 if args.prompt_type == 'slideLabel':
-                    # add neg and pos for subtyping (no labeled wsis)
-                    if args.c > 1 and 'pos_patch_num' not in info_str:
+                    # For multiclass slide-level prompts, every labeled WSI can be an example.
+                    if args.c > 1 and n not in labeled_names:
                         labeled_names.append(n)
                 
                     # Keep original binary WSI behavior: only add negatives here.
@@ -728,7 +741,10 @@ def evaluate(args, val_only=False):
             # randomly select "args.example_num" examples for each class
             # note: for binary tasks 'slideLabel' use N // 2 pos and N // 2 neg
             if args.c > 1 or args.prompt_type == 'slideLabel':
-                example_i = get_example_names_at_same_num(labeled_names, dataset_info, args.example_num, args.c > 1)
+                expected_labels = range(1, args.c + 1) if args.c > 1 else None
+                example_i = get_example_names_at_same_num(
+                    labeled_names, dataset_info, args.example_num, args.c > 1, expected_labels
+                )
 
             # randomly select "args.example_num" positive examples for binary tasks
             else:
@@ -740,6 +756,8 @@ def evaluate(args, val_only=False):
                 example_list.append(example_i)
                 example_names = example_i
                 break
+        if args.c > 1:
+            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
 
         # split val set out of example and test set
         for n in all_names:
@@ -1066,7 +1084,6 @@ def evaluate_baseline(args, mode):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
     dataset_info = load_dataset_info(args)
-    info_str = json.dumps(dataset_info)
     all_names = dataset_info.keys()
 
     # skip invalid wsis
@@ -1109,8 +1126,8 @@ def evaluate_baseline(args, mode):
                         labeled_names.append(n)
 
                 if args.prompt_type == 'slideLabel':
-                    # add neg and pos for subtyping (no labeled wsis)
-                    if args.c > 1 and 'pos_patch_num' not in info_str:
+                    # For multiclass slide-level prompts, every labeled WSI can be an example.
+                    if args.c > 1 and n not in labeled_names:
                         labeled_names.append(n)
 
                     # Keep original binary WSI behavior: only add negatives here.
@@ -1132,7 +1149,10 @@ def evaluate_baseline(args, mode):
             # randomly select "args.example_num" examples for each class
             # note: for binary tasks 'slideLabel' use N // 2 pos and N // 2 neg
             if args.c > 1 or args.prompt_type == 'slideLabel':
-                example_i = get_example_names_at_same_num(labeled_names, dataset_info, args.example_num, args.c > 1)
+                expected_labels = range(1, args.c + 1) if args.c > 1 else None
+                example_i = get_example_names_at_same_num(
+                    labeled_names, dataset_info, args.example_num, args.c > 1, expected_labels
+                )
 
             # randomly select "args.example_num" positive examples for binary tasks
             else:
@@ -1144,6 +1164,8 @@ def evaluate_baseline(args, mode):
                 example_list.append(example_i)
                 example_names = example_i
                 break
+        if args.c > 1:
+            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
 
         # split val set out of example and test set
         for n in all_names:

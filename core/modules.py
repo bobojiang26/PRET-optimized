@@ -384,8 +384,8 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
         raise ValueError(
             'Subtyping tagger needs both positive (1) and negative (0) example tokens, '
             f'but got pos={pos_count}, neg={neg_count}. Label counts: {label_counts}. '
-            'For multiclass runs, check that WSI labels use PRET class ids 1..class_num '
-            'or provide dataset_info so zero-based labels can be remapped before evaluation.'
+            'This usually means the selected example WSIs do not contain at least one '
+            'slide from the current class and one slide from other classes.'
         )
 
     if sampling_size > 0:
