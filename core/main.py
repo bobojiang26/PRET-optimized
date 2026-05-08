@@ -274,12 +274,93 @@ def select_centroid_rank_tokens(feats, budget, random_ratio=0.1):
     return selected.sort()[0]
 
 
+def hierarchical_cluster_priority(feats, idxs):
+    if idxs.shape[0] <= 1:
+        return -1.0
+    feats_c = feats[idxs]
+    centroid = F.normalize(feats_c.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+    compactness = (feats_c @ centroid.t()).reshape(-1).mean()
+    spread = (1 - compactness).clamp_min(0)
+    return float((spread * idxs.shape[0]).item())
+
+
+def split_hierarchical_cluster(feats, idxs, importance):
+    if idxs.shape[0] <= 1:
+        return None, None
+
+    feats_c = feats[idxs]
+    seed_a = int(idxs[int(importance[idxs].argmax().item())].item())
+    sim_a = (feats_c @ feats[seed_a: seed_a + 1].t()).reshape(-1)
+    seed_b = int(idxs[int(sim_a.argmin().item())].item())
+    sim_b = (feats_c @ feats[seed_b: seed_b + 1].t()).reshape(-1)
+    left_mask = sim_a >= sim_b
+
+    if left_mask.all() or (~left_mask).all():
+        centroid = F.normalize(feats_c.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+        scores = (feats_c @ centroid.t()).reshape(-1)
+        order = scores.argsort(descending=True)
+        half = max(1, idxs.shape[0] // 2)
+        left_mask = torch.zeros(idxs.shape[0], dtype=torch.bool, device=idxs.device)
+        left_mask[order[:half]] = True
+
+    return idxs[left_mask], idxs[~left_mask]
+
+
+def select_hierarchical_tokens(feats, importance, budget):
+    if feats.shape[0] <= budget:
+        return torch.arange(feats.shape[0], device=feats.device)
+
+    budget = min(budget, feats.shape[0])
+    importance_norm = normalize_score_range(importance)
+    clusters = [
+        (hierarchical_cluster_priority(feats, torch.arange(feats.shape[0], device=feats.device)),
+         torch.arange(feats.shape[0], device=feats.device))
+    ]
+
+    while len(clusters) < budget:
+        split_pos = max(
+            range(len(clusters)),
+            key=lambda pos: (clusters[pos][0], int(clusters[pos][1].shape[0]))
+        )
+        priority, idxs = clusters.pop(split_pos)
+        if priority < 0 or idxs.shape[0] <= 1:
+            clusters.append((priority, idxs))
+            break
+
+        left, right = split_hierarchical_cluster(feats, idxs, importance_norm)
+        if left is None or right is None or left.shape[0] == 0 or right.shape[0] == 0:
+            clusters.append((priority, idxs))
+            break
+        clusters.append((hierarchical_cluster_priority(feats, left), left))
+        clusters.append((hierarchical_cluster_priority(feats, right), right))
+
+    selected = []
+    for _, idxs in clusters:
+        feats_c = feats[idxs]
+        centroid = F.normalize(feats_c.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+        centrality = normalize_score_range((feats_c @ centroid.t()).reshape(-1))
+        score = importance_norm[idxs] + centrality
+        selected.append(idxs[int(score.argmax().item())])
+
+    selected = torch.stack(selected)
+    if selected.shape[0] < budget:
+        selected_mask = torch.zeros(feats.shape[0], dtype=torch.bool, device=feats.device)
+        selected_mask[selected] = True
+        fill = importance_norm.clone()
+        fill[selected_mask] = -1
+        fill_num = min(budget - selected.shape[0], feats.shape[0] - selected.shape[0])
+        if fill_num > 0:
+            selected = torch.cat([selected, fill.topk(fill_num).indices], 0)
+
+    return selected[:budget].sort()[0]
+
+
 def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_ratio=0.25,
                               strategy='quality', random_ratio=0.1):
     if budget <= 0 or example_feats.shape[0] <= budget:
         return example_feats, example_labels
     strategy = strategy.lower()
-    if strategy not in ['quality', 'legacy']:
+    if strategy not in ['quality', 'legacy', 'hierarchical']:
         raise ValueError(f'unsupported reference sparsification strategy: {strategy}')
 
     labels = torch.unique(example_labels)
@@ -343,7 +424,10 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_rati
                 other_score = torch.zeros_like(own_score)
 
             importance = normalize_score_range(own_score) + normalize_score_range(own_score - other_score)
-            selected = select_high_quality_tokens(feats_l, importance, per_label_budget, anchor_ratio=anchor_ratio)
+            if strategy == 'hierarchical':
+                selected = select_hierarchical_tokens(feats_l, importance, per_label_budget)
+            else:
+                selected = select_high_quality_tokens(feats_l, importance, per_label_budget, anchor_ratio=anchor_ratio)
         keep_idxs.append(idx[selected])
 
     keep_idxs = torch.cat(keep_idxs, 0)
@@ -1507,7 +1591,7 @@ if __name__ == '__main__':
     parser.add_argument('--reference_token_budget', default=0, type=int,
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
     parser.add_argument('--reference_sparsify_strategy', default='auto',
-        choices=['auto', 'quality', 'legacy'],
+        choices=['auto', 'quality', 'legacy', 'hierarchical'],
         help='reference token sparsification strategy; auto uses legacy for binary and quality for multi-class')
     parser.add_argument('--reference_anchor_ratio', default=0.25, type=float,
         help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
