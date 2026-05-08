@@ -373,6 +373,21 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
     
     # step1 similarity cross wsi-level label
     pos, neg = labels == 1, labels == 0
+    pos_count = int(pos.sum().item())
+    neg_count = int(neg.sum().item())
+    if pos_count == 0 or neg_count == 0:
+        unique_labels, unique_counts = torch.unique(labels.detach().cpu(), return_counts=True)
+        label_counts = ', '.join(
+            f'{int(label.item())}:{int(count.item())}'
+            for label, count in zip(unique_labels, unique_counts)
+        )
+        raise ValueError(
+            'Subtyping tagger needs both positive (1) and negative (0) example tokens, '
+            f'but got pos={pos_count}, neg={neg_count}. Label counts: {label_counts}. '
+            'For multiclass runs, check that WSI labels use PRET class ids 1..class_num '
+            'or provide dataset_info so zero-based labels can be remapped before evaluation.'
+        )
+
     if sampling_size > 0:
         sampled_idx = torch.randint(0, feats[neg].shape[0], (1, sampling_size))[0]
         sim_pos = compute_similarity(feats[pos], feats[neg][sampled_idx[:sampling_size], :], topk=topk)

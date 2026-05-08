@@ -375,6 +375,26 @@ def get_pseudo_label(idx, cls_num):
     return idx % cls_num + 1
 
 
+def normalize_multiclass_wsi_labels(dataset_info, class_num):
+    if class_num <= 1:
+        return
+
+    labels = []
+    for info in dataset_info.values():
+        if 'wsi_label' not in info:
+            continue
+        try:
+            labels.append(int(info['wsi_label']))
+        except (TypeError, ValueError):
+            return
+
+    unique_labels = set(labels)
+    if unique_labels == set(range(class_num)):
+        for info in dataset_info.values():
+            info['wsi_label'] = int(info['wsi_label']) + 1
+        print(f'[warning] Detected zero-based multiclass wsi labels 0..{class_num - 1}; remapped to 1..{class_num} for PRET.')
+
+
 def load_dataset_info(args):
     dataset_info = {}
     if args.dataset_info != '' and os.path.exists(args.dataset_info):
@@ -404,6 +424,7 @@ def load_dataset_info(args):
             if len(missing_label_slides) > 20:
                 print(f'[warning] ... {len(missing_label_slides) - 20} more h5 slide(s) omitted.')
 
+    normalize_multiclass_wsi_labels(dataset_info, args.c)
     return dataset_info
 
 
@@ -773,6 +794,7 @@ def evaluate(args, val_only=False):
             io_start = time.perf_counter()
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else example_n['wsi_label']
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
                 example_feature_names.append(n)
@@ -784,7 +806,7 @@ def evaluate(args, val_only=False):
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        if example_n['wsi_label'] != cls:
+                        if example_wsi_label != cls:
                             pl[pl == 1] = 0
                         else:
                             pl[pl == 1] = 1
@@ -795,20 +817,20 @@ def evaluate(args, val_only=False):
                 # load weak prompts
                 # slideLabel + subtyping is uniqe in pseudo label generation
                 if args.prompt_type == "slideLabel" and args.c > 1:
-                    if example_n['wsi_label'] != cls:
+                    if example_wsi_label != cls:
                         pl[:] = 0
                     else:
                         pl[:] = 1
 
                 # for box, RoughMask and binary + slideLabel, -1 is uncertain pos, 0 is normal
                 elif args.prompt_type != 'mask' :
-                    pl = load_weak_prompts(n, example_n['wsi_label'], args.wsi_path, pl, \
+                    pl = load_weak_prompts(n, example_wsi_label, args.wsi_path, pl, \
                         example_n['patch_names'], args.prompt_path, args.prompt_type, side=args.patch_scale)
                     
                     #  record wsi label for each patch for later label convert
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        pl[pl == -1] = 1 if example_n['wsi_label'] == cls else 0
+                        pl[pl == -1] = 1 if example_wsi_label == cls else 0
 
                 example_labels.append(pl)
             
@@ -901,7 +923,7 @@ def evaluate(args, val_only=False):
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.from_numpy(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
-                label = query_n['wsi_label']
+                label = dataset_info[n]['wsi_label'] if n in dataset_info else query_n['wsi_label']
                 if args.c > 1:
                     label = int(label == cls)
                 
@@ -1177,6 +1199,7 @@ def evaluate_baseline(args, mode):
 
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else example_n['wsi_label']
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
@@ -1185,7 +1208,7 @@ def evaluate_baseline(args, mode):
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        if example_n['wsi_label'] != cls:
+                        if example_wsi_label != cls:
                             pl[pl == 1] = 0
                         else:
                             pl[pl == 1] = 1
@@ -1196,20 +1219,20 @@ def evaluate_baseline(args, mode):
                 # load sparse label
                 # slideLabel + subtyping is uniqe in pseudo label generation
                 if args.prompt_type == "slideLabel" and args.c > 1:
-                    if example_n['wsi_label'] != cls:
+                    if example_wsi_label != cls:
                         pl[:] = 0
                     else:
                         pl[:] = 1
 
                 # for box, RoughMask and binary + slideLabel, -1 is uncertain pos, 0 is normal
                 elif args.prompt_type != 'mask' :
-                    pl = load_weak_prompts(n, example_n['wsi_label'], args.wsi_path, pl, \
+                    pl = load_weak_prompts(n, example_wsi_label, args.wsi_path, pl, \
                         example_n['patch_names'], args.prompt_path, args.prompt_type, side=args.patch_scale)
 
                     #  record wsi label for each patch for later label convert
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        pl[pl == -1] = 1 if example_n['wsi_label'] == cls else 0
+                        pl[pl == -1] = 1 if example_wsi_label == cls else 0
                 
                 if 'prototype' in mode:
                     pos_feats.append(example_n['features'][(pl != 0) * (pl != 255)])
@@ -1239,7 +1262,7 @@ def evaluate_baseline(args, mode):
                             example_feats.append(feat.mean(0, keepdims=True))
                         elif 'max' in mode:
                             example_feats.append(feat.max(0, keepdims=True))
-                        example_labels.append(1 if example_n['wsi_label'] == cls else 0)
+                        example_labels.append(1 if example_wsi_label == cls else 0)
 
             if 'prototype' in mode:
                 example_labels = [1, 0]
@@ -1284,10 +1307,11 @@ def evaluate_baseline(args, mode):
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.tensor(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
+                query_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else query_n['wsi_label']
                 if args.c > 1:
-                    label = query_n['wsi_label'] == cls
+                    label = query_wsi_label == cls
                 else:
-                    label = query_n['wsi_label']
+                    label = query_wsi_label
 
                 example_feats_for_query, query_feats = align_torch_feature_pair(
                     example_feats, query_feats, f'baseline {mode} repeat={i} class={cls} query {n}'
