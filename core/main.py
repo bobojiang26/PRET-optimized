@@ -239,9 +239,48 @@ def select_high_quality_tokens(feats, importance, budget, anchor_ratio=0.25):
     return torch.tensor(selected, device=feats.device, dtype=torch.long).sort()[0]
 
 
-def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_ratio=0.25):
+def select_centroid_rank_tokens(feats, budget, random_ratio=0.1):
+    if feats.shape[0] <= budget:
+        return torch.arange(feats.shape[0], device=feats.device)
+
+    budget = min(budget, feats.shape[0])
+    centroid = F.normalize(feats.mean(0, keepdim=True), p=2, dim=1, eps=1e-8)
+    scores = (feats @ centroid.t()).reshape(-1)
+    sorted_idx = scores.argsort(descending=True)
+
+    if budget == 1:
+        selected = sorted_idx[:1]
+    else:
+        positions = torch.linspace(0, sorted_idx.shape[0] - 1, budget, device=sorted_idx.device)
+        position_idxs = positions.round().long().unique()
+        selected = sorted_idx[position_idxs]
+        if selected.shape[0] < budget:
+            picked_positions = torch.zeros(sorted_idx.shape[0], dtype=torch.bool, device=sorted_idx.device)
+            picked_positions[position_idxs] = True
+            fill = sorted_idx[~picked_positions][:budget - selected.shape[0]]
+            selected = torch.cat([selected, fill], 0)
+
+    random_keep = int(budget * random_ratio)
+    random_keep = min(random_keep, max(budget - 1, 0))
+    if random_keep > 0:
+        remaining = torch.ones(feats.shape[0], dtype=torch.bool, device=feats.device)
+        remaining[selected] = False
+        remaining_idxs = remaining.nonzero(as_tuple=False).reshape(-1)
+        if remaining_idxs.shape[0] > 0:
+            take = min(random_keep, remaining_idxs.shape[0])
+            perm = torch.randperm(remaining_idxs.shape[0], device=feats.device)[:take]
+            selected = torch.cat([selected[:-take], remaining_idxs[perm]], 0)
+
+    return selected.sort()[0]
+
+
+def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_ratio=0.25,
+                              strategy='quality', random_ratio=0.1):
     if budget <= 0 or example_feats.shape[0] <= budget:
         return example_feats, example_labels
+    strategy = strategy.lower()
+    if strategy not in ['quality', 'legacy']:
+        raise ValueError(f'unsupported reference sparsification strategy: {strategy}')
 
     labels = torch.unique(example_labels)
     valid_labels = [label for label in labels.tolist() if label in [0, 1, 255]]
@@ -291,24 +330,27 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_rati
             continue
 
         feats_l = example_feats[idx]
-        own_centroid = centroids[label]
-        own_score = (feats_l @ own_centroid.t()).reshape(-1)
-        other_centroids = [centroids[_] for _ in valid_labels if _ != label and _ in centroids]
-        if len(other_centroids) > 0:
-            other_centroids = torch.cat(other_centroids, 0)
-            other_score = (feats_l @ other_centroids.t()).max(1).values
+        if strategy == 'legacy':
+            selected = select_centroid_rank_tokens(feats_l, per_label_budget, random_ratio=random_ratio)
         else:
-            other_score = torch.zeros_like(own_score)
+            own_centroid = centroids[label]
+            own_score = (feats_l @ own_centroid.t()).reshape(-1)
+            other_centroids = [centroids[_] for _ in valid_labels if _ != label and _ in centroids]
+            if len(other_centroids) > 0:
+                other_centroids = torch.cat(other_centroids, 0)
+                other_score = (feats_l @ other_centroids.t()).max(1).values
+            else:
+                other_score = torch.zeros_like(own_score)
 
-        importance = normalize_score_range(own_score) + normalize_score_range(own_score - other_score)
-        selected = select_high_quality_tokens(feats_l, importance, per_label_budget, anchor_ratio=anchor_ratio)
+            importance = normalize_score_range(own_score) + normalize_score_range(own_score - other_score)
+            selected = select_high_quality_tokens(feats_l, importance, per_label_budget, anchor_ratio=anchor_ratio)
         keep_idxs.append(idx[selected])
 
     keep_idxs = torch.cat(keep_idxs, 0)
     if keep_idxs.shape[0] > budget:
         keep_idxs = keep_idxs[torch.randperm(keep_idxs.shape[0], device=keep_idxs.device)[:budget]]
     keep_idxs = keep_idxs.sort()[0]
-    print(f'[reference] sparsified tokens: {example_feats.shape[0]} -> {keep_idxs.shape[0]}')
+    print(f'[reference] sparsified tokens ({strategy}): {example_feats.shape[0]} -> {keep_idxs.shape[0]}')
     return example_feats[keep_idxs], example_labels[keep_idxs]
 
 
@@ -831,11 +873,16 @@ def evaluate(args, val_only=False):
             class_timer.add('tagger', time.perf_counter() - tagger_start)
 
             sparse_start = time.perf_counter()
+            sparsify_strategy = args.reference_sparsify_strategy
+            if sparsify_strategy == 'auto':
+                sparsify_strategy = 'legacy' if args.c == 1 else 'quality'
             example_feats, example_labels = sparsify_reference_tokens(
                 example_feats,
                 example_labels,
                 args.reference_token_budget,
-                args.reference_anchor_ratio
+                args.reference_anchor_ratio,
+                strategy=sparsify_strategy,
+                random_ratio=args.reference_random_ratio
             )
             class_timer.add('reference_sparse', time.perf_counter() - sparse_start)
 
@@ -1406,8 +1453,13 @@ if __name__ == '__main__':
     parser.add_argument('--multiple_num', type=int, nargs='+', default=None, help='multi example num')
     parser.add_argument('--reference_token_budget', default=0, type=int,
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
+    parser.add_argument('--reference_sparsify_strategy', default='auto',
+        choices=['auto', 'quality', 'legacy'],
+        help='reference token sparsification strategy; auto uses legacy for binary and quality for multi-class')
     parser.add_argument('--reference_anchor_ratio', default=0.25, type=float,
         help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
+    parser.add_argument('--reference_random_ratio', default=0.1, type=float,
+        help='fraction of legacy sparse reference budget reserved for random diversity')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
