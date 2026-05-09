@@ -110,8 +110,39 @@ def load_weak_prompts(fn, wsi_label, wsi_dir, patch_labels, patch_names, anno_di
 
 # ====================== some util functions ======================
 
-def compute_similarity(query, example, topk=40):
-    """Return per-query mean similarity without materializing example x query."""
+def _reduce_topk_scores(best, aggregation='mean', softmax_temperature=10.0,
+    adaptive_min_k=1, adaptive_window=0.6):
+    aggregation = (aggregation or 'mean').lower()
+    if aggregation == 'mean':
+        return best.mean(0)
+
+    if aggregation == 'softmax':
+        weights = (best * softmax_temperature).softmax(0)
+        return (weights * best).sum(0)
+
+    if aggregation == 'adaptive':
+        if best.shape[0] == 1:
+            return best[0]
+        adaptive_min_k = max(1, min(int(adaptive_min_k), best.shape[0]))
+        spread = (best[0] - best[-1]).clamp_min(1e-8).reshape(1, -1)
+        keep = (best[0:1] - best) <= (spread * adaptive_window)
+        keep[:adaptive_min_k] = True
+        masked = best.masked_fill(~keep, -1e9)
+        weights = (masked * softmax_temperature).softmax(0).masked_fill(~keep, 0)
+        weights = weights / weights.sum(0, keepdim=True).clamp_min(1e-8)
+        return (weights * best).sum(0)
+
+    raise ValueError(f'unsupported similarity aggregation: {aggregation}')
+
+
+def compute_similarity(query, example, topk=40, aggregation='mean', softmax_temperature=10.0,
+    adaptive_min_k=1, adaptive_window=0.6):
+    """Return per-query similarity without materializing example x query.
+
+    The default aggregation matches the original PRET behavior: average the top-k
+    reference similarities for each query token. Optional softmax/adaptive modes are
+    training-free research extensions that emphasize the most relevant references.
+    """
     if query.shape[0] == 0 or example.shape[0] == 0:
         return torch.zeros(query.shape[0], device=query.device)
 
@@ -129,7 +160,10 @@ def compute_similarity(query, example, topk=40):
                     scores = scores.topk(min(k, scores.shape[0]), dim=0)[0]
                     best = scores if best is None else torch.cat([best, scores], 0).topk(k, dim=0)[0]
                     del scores
-                scores_out.append(best.mean(0))
+                scores_out.append(_reduce_topk_scores(
+                    best, aggregation=aggregation, softmax_temperature=softmax_temperature,
+                    adaptive_min_k=adaptive_min_k, adaptive_window=adaptive_window
+                ))
             else:
                 summed = torch.zeros(query_chunk.shape[0], device=query.device)
                 count = 0
@@ -142,6 +176,53 @@ def compute_similarity(query, example, topk=40):
                 scores_out.append(summed / max(count, 1))
 
     return torch.cat(scores_out, 0)
+
+
+def parse_patch_xy(name):
+    try:
+        x, y = os.path.basename(name).split('.')[0].split('_')[:2]
+        return int(x), int(y)
+    except (TypeError, ValueError):
+        return None
+
+
+def spatially_smooth_logits(query_logits, query_patch_names, radius=1, strength=0.0,
+    query_feats=None, feature_weight=0.0):
+    if strength <= 0 or radius <= 0 or len(query_patch_names) <= 1:
+        return query_logits
+
+    coords = [parse_patch_xy(name) for name in query_patch_names]
+    if any(coord is None for coord in coords):
+        return query_logits
+
+    coord_to_idx = {coord: idx for idx, coord in enumerate(coords)}
+    out = query_logits.clone()
+    strength = max(0.0, min(float(strength), 1.0))
+    radius = int(radius)
+
+    for idx, (x, y) in enumerate(coords):
+        neighbor_idxs, weights = [], []
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                dist = abs(dx) + abs(dy)
+                if dist > radius:
+                    continue
+                n_idx = coord_to_idx.get((x + dx, y + dy))
+                if n_idx is None:
+                    continue
+                weight = math.exp(-dist / max(radius, 1))
+                if query_feats is not None and feature_weight > 0:
+                    sim = torch.clamp(query_feats[idx] @ query_feats[n_idx], min=0).item()
+                    weight *= math.exp(feature_weight * sim)
+                neighbor_idxs.append(n_idx)
+                weights.append(weight)
+        if len(neighbor_idxs) <= 1:
+            continue
+        idx_tensor = torch.tensor(neighbor_idxs, device=query_logits.device, dtype=torch.long)
+        weight_tensor = torch.tensor(weights, device=query_logits.device, dtype=query_logits.dtype)
+        local = (query_logits[idx_tensor] * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-8)
+        out[idx] = (1 - strength) * query_logits[idx] + strength * local
+    return out
 
 
 def aggregate_query_logits(query_feats, query_logits, top_instance, related_thresh, temperature):
@@ -455,9 +536,22 @@ def inference(args, example_feats, example_labels, example_patch_names,
     # ====================== in-context classifier ======================
 
     # Stream top-k similarities by query chunk to avoid an example x query matrix.
-    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk)
-    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk)
+    similarity_kwargs = {
+        'aggregation': getattr(args, 'similarity_aggregation', 'mean'),
+        'softmax_temperature': getattr(args, 'similarity_temperature', 10.0),
+        'adaptive_min_k': getattr(args, 'adaptive_min_topk', 1),
+        'adaptive_window': getattr(args, 'adaptive_window', 0.6),
+    }
+    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk, **similarity_kwargs)
+    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk, **similarity_kwargs)
     query_logits = (pos_score - neg_score).to(query_feats.device)
+    query_logits = spatially_smooth_logits(
+        query_logits, query_patch_names,
+        radius=getattr(args, 'spatial_smooth_radius', 1),
+        strength=getattr(args, 'spatial_smooth_strength', 0.0),
+        query_feats=query_feats,
+        feature_weight=getattr(args, 'spatial_feature_weight', 0.0),
+    )
 
     # ====================== attention aggregator ======================
 

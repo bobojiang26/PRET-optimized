@@ -204,6 +204,65 @@ def normalize_score_range(scores):
     return (scores - score_min) / (score_max - score_min + 1e-8)
 
 
+def normalize_torch_rows(feats):
+    return F.normalize(feats.float(), p=2, dim=1, eps=1e-8)
+
+
+def apply_context_feature_centering(example_feats, query_feats, mode='none'):
+    mode = (mode or 'none').lower()
+    if mode == 'none':
+        return example_feats, query_feats
+    if mode == 'example':
+        center = example_feats.mean(0, keepdim=True)
+    elif mode == 'query':
+        center = query_feats.mean(0, keepdim=True)
+    elif mode == 'joint':
+        center = torch.cat([example_feats, query_feats], 0).mean(0, keepdim=True)
+    else:
+        raise ValueError(f'unsupported context centering mode: {mode}')
+    return normalize_torch_rows(example_feats - center), normalize_torch_rows(query_feats - center)
+
+
+def save_numpy_records(path, records):
+    if path == '':
+        return
+    out_dir = os.path.dirname(path)
+    if out_dir != '':
+        os.makedirs(out_dir, exist_ok=True)
+    np.save(path, records)
+
+
+def binary_conformal_summary(calib_scores, calib_labels, eval_scores, eval_labels, threshold, alpha):
+    if alpha <= 0 or alpha >= 1 or calib_scores.numel() == 0 or eval_scores.numel() == 0:
+        return None
+
+    calib_prob = torch.sigmoid((calib_scores.float() - float(threshold))).cpu().numpy()
+    calib_labels_np = calib_labels.float().cpu().numpy()
+    true_prob = np.where(calib_labels_np > 0.5, calib_prob, 1.0 - calib_prob)
+    nonconformity = 1.0 - true_prob
+    nonconformity = np.sort(nonconformity)
+    rank = int(np.ceil((len(nonconformity) + 1) * (1 - alpha))) - 1
+    rank = min(max(rank, 0), len(nonconformity) - 1)
+    qhat = float(nonconformity[rank])
+
+    eval_prob = torch.sigmoid((eval_scores.float() - float(threshold))).cpu().numpy()
+    eval_labels_np = eval_labels.float().cpu().numpy()
+    include_pos = (1.0 - eval_prob) <= qhat
+    include_neg = eval_prob <= qhat
+    set_size = include_pos.astype(np.float32) + include_neg.astype(np.float32)
+    covered = np.where(eval_labels_np > 0.5, include_pos, include_neg)
+
+    return {
+        'alpha': float(alpha),
+        'qhat': round(qhat, 6),
+        'coverage': round(float(covered.mean()), 4),
+        'avg_set_size': round(float(set_size.mean()), 4),
+        'singleton_rate': round(float((set_size == 1).mean()), 4),
+        'empty_rate': round(float((set_size == 0).mean()), 4),
+        'both_rate': round(float((set_size == 2).mean()), 4),
+    }
+
+
 def select_high_quality_tokens(feats, importance, budget, anchor_ratio=0.25):
     if feats.shape[0] <= budget:
         return torch.arange(feats.shape[0], device=feats.device)
@@ -1033,6 +1092,9 @@ def evaluate(args, val_only=False):
                 example_feats_for_query, query_feats = align_torch_feature_pair(
                     example_feats, query_feats, f'evaluate repeat={i} class={cls} query {n}'
                 )
+                example_feats_for_query, query_feats = apply_context_feature_centering(
+                    example_feats_for_query, query_feats, args.context_centering
+                )
                 # ====================== discriminative instance miner for subtyping ======================
 
                 # use fg patches for subtyping
@@ -1121,15 +1183,25 @@ def evaluate(args, val_only=False):
             f1_list.append(f1)
             acc_list.append(acc)
             if not val_only:
+                conformal = binary_conformal_summary(
+                    val_preds, val_labels, preds, labels, thresh, args.conformal_alpha
+                )
                 s = 'class:' + str(cls) + ' val auc:' + str(round(val_auc, 4)) + ', test auc:' + str(round(auc, 4)) + \
                     ', val acc: ' + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + \
                     ', test acc: ' + str(round(acc, 4))
                 print(s)
                 txt_rec.append(s)
+                if conformal is not None:
+                    conformal_s = 'class:' + str(cls) + ' conformal coverage:' + str(conformal['coverage']) + \
+                        ', avg set size:' + str(conformal['avg_set_size'])
+                    print(conformal_s)
+                    txt_rec.append(conformal_s)
                 records['repeat_' + str(i)]['results_cls' + str(cls)] = {'val_auc': round(val_auc, 4), 'test_auc': round(auc, 4), \
                         'val_acc': round(best_acc_score, 4), 'test_f1': round(f1, 4), 'test_acc': round(acc, 4)}
                 records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
+                if conformal is not None:
+                    records['repeat_' + str(i)]['conformal_cls' + str(cls)] = conformal
 
             class_timer.add('validation', time.perf_counter() - validation_start)
             repeat_timer.merge(class_timer)
@@ -1422,6 +1494,9 @@ def evaluate_baseline(args, mode):
                 example_feats_for_query, query_feats = align_torch_feature_pair(
                     example_feats, query_feats, f'baseline {mode} repeat={i} class={cls} query {n}'
                 )
+                example_feats_for_query, query_feats = apply_context_feature_centering(
+                    example_feats_for_query, query_feats, args.context_centering
+                )
                 if 'prototype' in mode:
                     if 'simple_shot' in mode:
                         mean_feat_for_query = align_numpy_vector_dim(
@@ -1536,14 +1611,24 @@ def evaluate_baseline(args, mode):
             f1_list.append(f1)
             acc_list.append(acc)
 
+            conformal = binary_conformal_summary(
+                val_preds, val_labels, preds, labels, thresh, args.conformal_alpha
+            )
             s = 'class:' + str(cls) + ' val auc:' + str(round(val_auc, 4)) + ', test auc:' + str(round(auc, 4)) + ', val acc: ' \
                  + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + ', test acc: ' + str(round(acc, 4))
             print(s)
             txt_rec.append(s)
+            if conformal is not None:
+                conformal_s = 'class:' + str(cls) + ' conformal coverage:' + str(conformal['coverage']) + \
+                    ', avg set size:' + str(conformal['avg_set_size'])
+                print(conformal_s)
+                txt_rec.append(conformal_s)
             records['repeat_' + str(i)]['results_cls' + str(cls)] = {'val_auc': round(val_auc, 4), 'test_auc': round(auc, 4), \
                     'val_acc': round(best_acc_score, 4), 'test_f1': round(f1, 4), 'test_acc': round(acc, 4)}
             records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                     'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
+            if conformal is not None:
+                records['repeat_' + str(i)]['conformal_cls' + str(cls)] = conformal
 
     # ====================== count and record results ======================
 
@@ -1597,6 +1682,24 @@ if __name__ == '__main__':
         help='fraction of sparse reference budget reserved for strongest anchor tokens before diversity selection')
     parser.add_argument('--reference_random_ratio', default=0.1, type=float,
         help='fraction of legacy sparse reference budget reserved for random diversity')
+    parser.add_argument('--similarity_aggregation', default='mean', choices=['mean', 'softmax', 'adaptive'],
+        help='training-free query/reference similarity reducer; mean reproduces original PRET')
+    parser.add_argument('--similarity_temperature', default=10.0, type=float,
+        help='temperature for softmax/adaptive top-k similarity aggregation')
+    parser.add_argument('--adaptive_min_topk', default=1, type=int,
+        help='minimum number of top-k neighbors retained by adaptive similarity aggregation')
+    parser.add_argument('--adaptive_window', default=0.6, type=float,
+        help='adaptive similarity keeps neighbors within this fraction of the top-k score spread')
+    parser.add_argument('--context_centering', default='none', choices=['none', 'example', 'query', 'joint'],
+        help='training-free feature centering before query inference to reduce feature-domain shift')
+    parser.add_argument('--spatial_smooth_strength', default=0.0, type=float,
+        help='blend strength for coordinate-neighborhood smoothing of query patch logits')
+    parser.add_argument('--spatial_smooth_radius', default=1, type=int,
+        help='Manhattan radius for coordinate-neighborhood smoothing of query patch logits')
+    parser.add_argument('--spatial_feature_weight', default=0.0, type=float,
+        help='optional feature-similarity weight for spatial smoothing neighbors')
+    parser.add_argument('--conformal_alpha', default=0.0, type=float,
+        help='if >0, report validation-calibrated conformal prediction-set statistics at this alpha')
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
@@ -1647,8 +1750,7 @@ if __name__ == '__main__':
             res, rec = evaluate(args)
             records[str(p) + '-shot'] = rec
 
-        if args.dump_records != '':
-            np.save(args.dump_records, records)
+        save_numpy_records(args.dump_records, records)
     
     # run baselines
     if args.mode == 'baselines':
@@ -1681,8 +1783,7 @@ if __name__ == '__main__':
             rec_simp = evaluate_baseline(args, 'prototype_simple_shot')
             records[str(p) + '-shot']['simple_Shot'] = rec_simp
 
-        if args.dump_records != '':
-            np.save(args.dump_records, records)
+        save_numpy_records(args.dump_records, records)
 
     # run in val-test set with hyperparameter search
     if args.mode == 'default': 
@@ -1789,5 +1890,4 @@ if __name__ == '__main__':
             records[str(p) + '-shot'] = rec
         
         # save results
-        if args.dump_records != '':
-            np.save(args.dump_records, records)
+        save_numpy_records(args.dump_records, records)

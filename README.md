@@ -454,6 +454,18 @@ python core/main.py ...
    - 优化版会在 example/query 进入主流程前自动对齐到共享维度，并在终端打印 warning，说明哪些 slide/query 发生了 truncation/padding。
    - 这主要用于保证 pipeline 能跑通和方便定位数据源问题；如果追求严格 benchmark，一般仍建议统一上游特征维度。
 
+
+15. **Training-free research extensions for stronger PRET variants**
+   - `--similarity_aggregation mean|softmax|adaptive` keeps the original top-k mean as default, and adds softmax/adaptive top-k reducers that emphasize closer in-context references without training.
+   - `--context_centering none|example|query|joint` adds SimpleShot-style feature centering before each query, useful for cross-scanner or cross-foundation-model shifts.
+   - `--spatial_smooth_strength`, `--spatial_smooth_radius`, and `--spatial_feature_weight` add coordinate-aware neighborhood smoothing over patch logits before WSI aggregation, injecting WSI spatial coherence while preserving the original attention aggregator.
+   - `--conformal_alpha` records validation-calibrated conformal prediction-set statistics such as coverage, singleton rate, and average set size. This does not change PRET predictions; it adds uncertainty reporting for deployment and paper analysis.
+   - The h5 wrapper forwards these settings through environment variables, for example:
+
+```bash
+SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=0.25 SPATIAL_SMOOTH_RADIUS=1 CONFORMAL_ALPHA=0.1 bash scripts/run_h5_eval.sh
+```
+
 ## Citation
 
 The paper is coming soon (accepted and waiting for publication).
