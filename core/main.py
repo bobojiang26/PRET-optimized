@@ -919,10 +919,15 @@ def evaluate(args, val_only=False):
 
         random.shuffle(rest_names)
         val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=args.c > 1)
-        val_name_set = set(val_names)
-        remaining_names = [n for n in rest_names if n not in val_name_set]
-        if args.c > 1:
+        use_balanced_val = getattr(args, 'balanced_val_split', False)
+        use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
+        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+        if use_disjoint_split:
+            val_name_set = set(val_names)
+            remaining_names = [n for n in rest_names if n not in val_name_set]
+        else:
+            remaining_names = rest_names
+        if args.c > 1 and use_balanced_val:
             print('[split] repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
 
         # split test set by ratio, if no fixed test set
@@ -930,7 +935,7 @@ def evaluate(args, val_only=False):
             if args.val_ratio < 0:
                 test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
             else:
-                test_names = remaining_names
+                test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
             if len(val_names) + len(test_names) > len(rest_names):
                 print('wrong split size !!!')
         else: # take partial test slides for tcga cross races
@@ -1341,10 +1346,15 @@ def evaluate_baseline(args, mode):
 
         random.shuffle(rest_names)
         val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=args.c > 1)
-        val_name_set = set(val_names)
-        remaining_names = [n for n in rest_names if n not in val_name_set]
-        if args.c > 1:
+        use_balanced_val = getattr(args, 'balanced_val_split', False)
+        use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
+        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+        if use_disjoint_split:
+            val_name_set = set(val_names)
+            remaining_names = [n for n in rest_names if n not in val_name_set]
+        else:
+            remaining_names = rest_names
+        if args.c > 1 and use_balanced_val:
             print('[split] baseline ' + mode + ' repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
 
         # split test set by ratio, if no fixed test set
@@ -1352,7 +1362,7 @@ def evaluate_baseline(args, mode):
             if args.val_ratio < 0:
                 test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
             else:
-                test_names = remaining_names
+                test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
             if len(val_names) + len(test_names) > len(rest_names):
                 print('wrong split size !!!')
         else: # take partial test slides for tcga cross races
@@ -1726,10 +1736,17 @@ if __name__ == '__main__':
     parser.add_argument('--val_num', default=100, type=int, help='number of validation WSIs')
     parser.add_argument('--test_num', default=129, type=int, help='number of test WSIs')
     parser.add_argument('--val_ratio', default=-1, type=float, help='split val test via ratio to replace specific number')
+    parser.add_argument('--balanced_val_split', default=False, action='store_true',
+        help='balance validation slides by class label; default off to preserve original PRET split semantics')
+    parser.add_argument('--disjoint_val_test_split', default=False, action='store_true',
+        help='remove validation slides before selecting test slides; default off to preserve original PRET split semantics')
+    parser.add_argument('--seed_torch_sampling', default=False, action='store_true',
+        help='also seed torch random sampling; default off to preserve original PRET subtyping sampler behavior')
     args = parser.parse_args()
 
     random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    if args.seed_torch_sampling:
+        torch.manual_seed(args.seed)
     os.makedirs(args.dump_features, exist_ok=True)
     print_memory_usage('startup')
 

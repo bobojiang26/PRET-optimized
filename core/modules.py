@@ -238,7 +238,8 @@ def aggregate_query_logits(query_feats, query_logits, top_instance, related_thre
         related_mask = sim_scores > related_thresh
         empty_rows = related_mask.sum(1) == 0
         if empty_rows.any():
-            related_mask[empty_rows, idxs[empty_rows]] = True
+            # Match original PRET slicing behavior: sim_idxs[-0:] selects all patches.
+            related_mask[empty_rows] = True
         masked_scores = sim_scores.masked_fill(~related_mask, -1e9)
         weights = (masked_scores * temperature).softmax(1)
         wsi_pred_list.append((weights * query_logits.reshape(1, -1)).sum(1))

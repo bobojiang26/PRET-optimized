@@ -8,8 +8,8 @@ CORE = os.path.join(ROOT, "core")
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
-from modules import compute_similarity, spatially_smooth_logits
-from main import apply_context_feature_centering, binary_conformal_summary
+from modules import compute_similarity, spatially_smooth_logits, aggregate_query_logits
+from main import apply_context_feature_centering, binary_conformal_summary, select_validation_names
 
 
 def test_compute_similarity_keeps_original_mean_behavior():
@@ -19,6 +19,30 @@ def test_compute_similarity_keeps_original_mean_behavior():
     out = compute_similarity(query, example, topk=2)
 
     assert torch.allclose(out, torch.tensor([0.9, 0.6]), atol=1e-6)
+
+
+def test_attention_empty_related_fallback_matches_original_all_patch_behavior():
+    query_feats = torch.eye(3)
+    query_logits = torch.tensor([2.0, 0.0, -2.0])
+
+    out = aggregate_query_logits(
+        query_feats, query_logits, top_instance=1, related_thresh=1.1, temperature=10.0
+    )
+    expected = (torch.softmax(torch.tensor([1.0, 0.0, 0.0]) * 10.0, 0) * query_logits).sum()
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_default_validation_selection_preserves_original_order():
+    names = ["a", "b", "c", "d"]
+    dataset_info = {
+        "a": {"wsi_label": 1},
+        "b": {"wsi_label": 2},
+        "c": {"wsi_label": 1},
+        "d": {"wsi_label": 2},
+    }
+
+    assert select_validation_names(names, dataset_info, 2, balanced=False) == ["a", "b"]
 
 
 def test_adaptive_similarity_emphasizes_close_references():
