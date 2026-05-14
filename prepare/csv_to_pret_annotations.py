@@ -271,9 +271,133 @@ def write_mask_files(regions_by_slide, mask_out, patch_scale):
     return pos_counts, written
 
 
-def write_data_info(regions_by_slide, data_info_out, mask_out, pos_counts, wsi_label_mode):
+def find_h5_files(path):
+    if not path:
+        return {}
+    h5_files = {}
+    for name in sorted(os.listdir(path)):
+        if name.lower().endswith(('.h5', '.hdf5')):
+            h5_files[os.path.splitext(name)[0]] = os.path.join(path, name)
+    return h5_files
+
+
+def rasterize_mid_mask(regions, patch_scale):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires cv2 and numpy') from exc
+
+    width, height = regions[0]['size']
+    mid_scale = max(1, patch_scale // 32)
+    while patch_scale % mid_scale != 0:
+        mid_scale -= 1
+    mid_h = int(math.ceil(height / mid_scale))
+    mid_w = int(math.ceil(width / mid_scale))
+    mid = np.zeros((mid_h, mid_w), dtype=np.uint8)
+
+    for region in regions:
+        contour = np.array(
+            [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5)] for x, y in region['points']],
+            dtype=np.int32,
+        )
+        if contour.shape[0] >= 3:
+            cv2.fillPoly(mid, [contour], 1)
+    return mid, mid_scale
+
+
+def labels_for_h5_coordinates(regions, h5_path, patch_scale):
+    try:
+        import h5py
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires h5py and numpy') from exc
+
+    with h5py.File(h5_path, 'r') as f:
+        if 'coordinates' not in f:
+            raise KeyError(f'{h5_path} must contain h5 key: coordinates')
+        coords = np.asarray(f['coordinates'])
+        if 'features' in f and f['features'].shape[0] != coords.shape[0]:
+            raise ValueError(
+                f'{h5_path}: features and coordinates must have the same first dimension, '
+                f'got {f["features"].shape[0]} and {coords.shape[0]}'
+            )
+
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
+
+    mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
+    labels = np.zeros(coords.shape[0], dtype=np.uint8)
+    mid_h, mid_w = mid.shape
+
+    for idx, coord in enumerate(coords):
+        x0 = float(coord[0])
+        y0 = float(coord[1])
+        x1 = x0 + patch_scale
+        y1 = y0 + patch_scale
+        mx0 = max(0, int(math.floor(x0 / mid_scale)))
+        my0 = max(0, int(math.floor(y0 / mid_scale)))
+        mx1 = min(mid_w, int(math.ceil(x1 / mid_scale)))
+        my1 = min(mid_h, int(math.ceil(y1 / mid_scale)))
+        if mx1 <= mx0 or my1 <= my0:
+            continue
+        labels[idx] = 1 if mid[my0:my1, mx0:mx1].max() > 0 else 0
+    return labels
+
+
+def write_h5_label_files(regions_by_slide, h5_dir, h5_label_out, patch_scale):
+    if not h5_label_out:
+        return {}, 0
+    if not h5_dir:
+        raise ValueError('--h5-dir is required when --h5-label-out is set')
+
+    h5_files = find_h5_files(h5_dir)
+    if not h5_files:
+        raise ValueError(f'No .h5/.hdf5 files found in {h5_dir}')
+
+    os.makedirs(h5_label_out, exist_ok=True)
+    pos_counts = {}
+    written = 0
+    missing = []
+    for slide_name, regions in sorted(regions_by_slide.items()):
+        if slide_name not in h5_files:
+            missing.append(slide_name)
+            continue
+        labels = labels_for_h5_coordinates(regions, h5_files[slide_name], patch_scale)
+        out_path = os.path.join(h5_label_out, slide_name + '.npy')
+        np_save(out_path, labels)
+        pos_counts[slide_name] = int((labels == 1).sum())
+        written += 1
+
+    if missing:
+        preview = ', '.join(missing[:10])
+        raise ValueError(
+            f'Missing h5 files for {len(missing)} annotated slide(s): {preview}. '
+            'H5 file stems must match CSV-derived slide names.'
+        )
+    return pos_counts, written
+
+
+def np_save(path, value):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+    np.save(path, value)
+
+
+def write_data_info(
+    regions_by_slide,
+    data_info_out,
+    mask_out,
+    pos_counts,
+    wsi_label_mode,
+    h5_label_out='',
+    h5_pos_counts=None,
+):
     if not data_info_out:
         return
+    h5_pos_counts = h5_pos_counts or {}
     out = {}
     for slide_name, regions in sorted(regions_by_slide.items()):
         label_ids = sorted({int(r['label_id']) for r in regions})
@@ -292,7 +416,10 @@ def write_data_info(regions_by_slide, data_info_out, mask_out, pos_counts, wsi_l
         }
         if mask_out:
             item['patch_labels'] = os.path.join(mask_out, slide_name + '.png')
-            item['pos_patch_num'] = int(pos_counts.get(slide_name, 0))
+        if h5_label_out:
+            item['h5_patch_labels'] = os.path.join(h5_label_out, slide_name + '.npy')
+        if mask_out or h5_label_out:
+            item['pos_patch_num'] = int(h5_pos_counts.get(slide_name, pos_counts.get(slide_name, 0)))
         out[slide_name] = item
 
     out_dir = os.path.dirname(data_info_out)
@@ -310,6 +437,9 @@ def parse_args():
     parser.add_argument('--label-map', required=True, help='JSON mapping label names to integer ids')
     parser.add_argument('--xml-out', default='', help='directory to write PRET-compatible XML files')
     parser.add_argument('--mask-out', default='', help='optional directory to write PRET patch-grid PNG masks')
+    parser.add_argument('--h5-dir', default='', help='optional directory containing per-slide h5 feature files')
+    parser.add_argument('--h5-label-out', default='',
+        help='optional directory to write per-h5 patch label .npy arrays aligned to h5 feature order')
     parser.add_argument('--data-info-out', default='', help='optional data_info JSON for annotated slides')
     parser.add_argument('--size-json', default='', help='optional slide size JSON for formats OpenSlide cannot read')
     parser.add_argument('--patch-scale', type=int, default=512, help='level-0 pixels per PRET patch; usually 512')
@@ -329,8 +459,10 @@ def parse_args():
     parser.add_argument('--no-clip', action='store_true',
         help='raise on normalized coordinates outside [0,1] instead of clipping')
     args = parser.parse_args()
-    if not args.xml_out and not args.mask_out and not args.data_info_out:
-        parser.error('provide at least one of --xml-out, --mask-out, or --data-info-out')
+    if not args.xml_out and not args.mask_out and not args.h5_label_out and not args.data_info_out:
+        parser.error('provide at least one of --xml-out, --mask-out, --h5-label-out, or --data-info-out')
+    if args.h5_label_out and not args.h5_dir:
+        parser.error('--h5-dir is required when --h5-label-out is set')
     if args.patch_scale <= 0:
         parser.error('--patch-scale must be positive')
     return args
@@ -346,7 +478,18 @@ def main():
 
     xml_count = write_xml_files(regions_by_slide, args.xml_out)
     pos_counts, mask_count = write_mask_files(regions_by_slide, args.mask_out, args.patch_scale)
-    write_data_info(regions_by_slide, args.data_info_out, args.mask_out, pos_counts, args.wsi_label_mode)
+    h5_pos_counts, h5_label_count = write_h5_label_files(
+        regions_by_slide, args.h5_dir, args.h5_label_out, args.patch_scale
+    )
+    write_data_info(
+        regions_by_slide,
+        args.data_info_out,
+        args.mask_out,
+        pos_counts,
+        args.wsi_label_mode,
+        h5_label_out=args.h5_label_out,
+        h5_pos_counts=h5_pos_counts,
+    )
 
     region_count = sum(len(v) for v in regions_by_slide.values())
     print(f'converted slides: {len(regions_by_slide)}')
@@ -355,6 +498,8 @@ def main():
         print(f'xml files written: {xml_count} -> {args.xml_out}')
     if mask_count:
         print(f'mask png files written: {mask_count} -> {args.mask_out}')
+    if h5_label_count:
+        print(f'h5 patch label arrays written: {h5_label_count} -> {args.h5_label_out}')
     if args.data_info_out:
         print(f'data_info written: {args.data_info_out}')
     if skipped:

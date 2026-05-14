@@ -599,6 +599,44 @@ def load_h5_feature_file(h5_path):
     return feats.astype(np.float32, copy=False), coords
 
 
+def get_h5_patch_size(args):
+    return args.h5_patch_size if args.h5_patch_size > 0 else args.patch_scale
+
+
+def h5_coord_to_patch_xy(coord, args):
+    if args.h5_coordinate_mode == 'pixel':
+        patch_size = get_h5_patch_size(args)
+        return int(float(coord[0]) // patch_size), int(float(coord[1]) // patch_size)
+    return int(coord[0]), int(coord[1])
+
+
+def load_h5_patch_labels(info, coords, args):
+    if 'h5_patch_labels' in info:
+        labels = np.load(info['h5_patch_labels']).astype(np.uint8, copy=False)
+        if labels.shape[0] != coords.shape[0]:
+            raise ValueError(
+                f"{info['h5_patch_labels']}: expected {coords.shape[0]} labels, got {labels.shape[0]}"
+            )
+        return labels
+
+    if 'patch_labels' not in info:
+        return np.array([], dtype=np.uint8)
+
+    mask = cv2.imread(info['patch_labels'])
+    if mask is None:
+        raise ValueError(f"Cannot read patch label mask: {info['patch_labels']}")
+    mask = mask[:, :, 0]
+
+    labels = []
+    for coord in coords:
+        x, y = h5_coord_to_patch_xy(coord, args)
+        if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:
+            labels.append(mask[y, x])
+        else:
+            labels.append(0)
+    return np.asarray(labels, dtype=np.uint8)
+
+
 def get_wsi_suffix(wsi_path):
     if not os.path.isdir(wsi_path):
         return None
@@ -637,9 +675,10 @@ def feature_processor(args):
 
         if k in h5_map:
             feats, coords = load_h5_feature_file(h5_map[k])
+            patch_label = load_h5_patch_labels(v, coords, args)
             names = []
             for i in range(coords.shape[0]):
-                x, y = int(coords[i, 0]), int(coords[i, 1])
+                x, y = h5_coord_to_patch_xy(coords[i], args)
                 names.append(os.path.join('h5_features', k, f'{x}_{y}.jpeg'))
             info = {'features': feats, 'patch_names': names, \
                 'patch_labels': np.array(patch_label), 'wsi_label': v['wsi_label']}
@@ -1720,6 +1759,10 @@ if __name__ == '__main__':
     parser.add_argument('--vis_path', default='', help='Path where to save heatmap')
     parser.add_argument('--dataset_info', default='/path/to/data_list_gt_and_split', type=str, help='json file recording dataset info')
     parser.add_argument('--patch_scale', default=512, type=int, help='patch size in 40x for anno loading')
+    parser.add_argument('--h5_coordinate_mode', default='grid', choices=['grid', 'pixel'],
+        help='interpret h5 coordinates as patch-grid indices or level-0 pixel top-left coordinates')
+    parser.add_argument('--h5_patch_size', default=0, type=int,
+        help='level-0 patch size for h5 pixel coordinates; 0 reuses --patch_scale')
     parser.add_argument('--file_min_size', default=5000, type=int, help='skip background and patches with a few content')
     parser.add_argument('--c', '--class_num', dest='c', default=1, type=int, help='number of classes; use 1 for binary screening and >1 for multi-class subtyping')
     parser.add_argument('--seg', default=False, action='store_true', help='True to evaluate segmentation task (f1 = dice)')

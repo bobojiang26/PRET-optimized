@@ -12,9 +12,12 @@ WSI_DIR="${WSI_DIR:-data/${DATASET_NAME}/images}"
 ANNO_DIR="${ANNO_DIR:-data/${DATASET_NAME}/anno}"
 DATASET_INFO="${DATASET_INFO:-data_info/${DATASET_NAME}.json}"
 DUMP_FEATURES="${DUMP_FEATURES:-data/${DATASET_NAME}/collected_features}"
-DUMP_RECORDS="${DUMP_RECORDS:-records/${DATASET_NAME}_slideLabel_eval.npy}"
+PROMPT_TYPE="${PROMPT_TYPE:-slideLabel}"
+DUMP_RECORDS="${DUMP_RECORDS:-records/${DATASET_NAME}_${PROMPT_TYPE}_eval.npy}"
 
 CLASS_NUM="${CLASS_NUM:-1}"
+H5_COORDINATE_MODE="${H5_COORDINATE_MODE:-grid}"
+H5_PATCH_SIZE="${H5_PATCH_SIZE:-0}"
 EXAMPLE_NUM="${EXAMPLE_NUM:-1}"
 RUNS="${RUNS:-1}"
 VAL_NUM="${VAL_NUM:-6}"
@@ -104,11 +107,13 @@ EXTRA_ARGS=("$@")
   --top_instance "${TOP_INSTANCE}" \
   --test_num "${TEST_NUM}" \
   --val_num "${VAL_NUM}" \
-  --prompt_type slideLabel \
+  --prompt_type "${PROMPT_TYPE}" \
   --prompt_path "${ANNO_DIR}" \
   --ignore 0 \
   --file_min_size 0 \
   --class_num "${CLASS_NUM}" \
+  --h5_coordinate_mode "${H5_COORDINATE_MODE}" \
+  --h5_patch_size "${H5_PATCH_SIZE}" \
   --runs "${RUNS}" \
   --dump_records "${DUMP_RECORDS}" \
   ${SPARSE_ARGS[@]+"${SPARSE_ARGS[@]}"} \

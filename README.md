@@ -154,6 +154,74 @@ python core/main.py \
 
 `--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. If `data_info/MY_H5.json` is missing, or if a slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
 
+### H5 mask evaluation from CSV annotations
+
+For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
+
+* `features`: a 2D array with shape `(num_patches, feature_dim)`.
+* `coordinates`: a 2D array with shape `(num_patches, >=2)`.
+
+When `coordinates` are level-0 pixel coordinates for the top-left corner of each patch, set `H5_COORDINATE_MODE=pixel` and set `H5_PATCH_SIZE` to the patch side length in level-0 pixels. For example, use `H5_PATCH_SIZE=256` for `256 x 256` patches.
+
+The CSV annotation file must have three columns:
+
+```
+wsi_path,labels,coordinates
+```
+
+`wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. Because `.sdpc` files are often not readable by OpenSlide, provide a slide-size JSON so normalized coordinates can be converted to level-0 pixels:
+
+```json
+{
+    "slide_001": {"width": 120000, "height": 80000},
+    "slide_002": {"width": 100000, "height": 90000}
+}
+```
+
+First generate h5-aligned patch labels and a PRET `data_info` file:
+
+```
+python prepare/csv_to_pret_annotations.py \
+  --csv /path/to/annotations.csv \
+  --label-map /path/to/label_map.json \
+  --size-json /path/to/slide_sizes.json \
+  --h5-dir data/MY_H5/h5 \
+  --h5-label-out data/MY_H5/patch/h5_labels \
+  --mask-out data/MY_H5/patch/gt \
+  --data-info-out data_info/MY_H5_mask.json \
+  --patch-scale 256 \
+  --prompt-type mask \
+  --no-openslide
+```
+
+This writes:
+
+* `data/MY_H5/patch/h5_labels/{slide}.npy`: one label array per slide, strictly aligned to the h5 `features` row order.
+* `data/MY_H5/patch/gt/{slide}.png`: optional patch-grid mask PNGs for inspection or non-h5 workflows.
+* `data_info/MY_H5_mask.json`: slide-level labels plus `h5_patch_labels`, `patch_labels`, and `pos_patch_num`.
+
+By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for evaluation, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`.
+
+Then run h5 `mask` evaluation:
+
+```
+DATASET_NAME=MY_H5 \
+H5_DIR=data/MY_H5/h5 \
+DATASET_INFO=data_info/MY_H5_mask.json \
+DUMP_FEATURES=data/MY_H5/collected_features_mask \
+PROMPT_TYPE=mask \
+CLASS_NUM=1 \
+H5_COORDINATE_MODE=pixel \
+H5_PATCH_SIZE=256 \
+EXAMPLE_NUM=8 \
+VAL_NUM=100 \
+TEST_NUM=-1 \
+RUNS=5 \
+bash scripts/run_h5_eval.sh
+```
+
+Use a fresh `DUMP_FEATURES` directory for mask runs, because PRET skips feature collection when a cached `dump_features/{slide}.npy` file already exists.
+
 You can create a small fake h5-only dataset for a local smoke test:
 
 ```
