@@ -60,7 +60,8 @@ def resolve_wsi_path(raw_path, csv_path):
     return os.path.abspath(os.path.join(os.path.dirname(csv_path), raw_path))
 
 
-def lookup_slide_size(wsi_path, slide_name, size_map, use_openslide=True):
+def lookup_slide_size(wsi_path, slide_name, size_map, h5_size_map=None, use_openslide=True):
+    h5_size_map = h5_size_map or {}
     candidates = [
         wsi_path,
         os.path.abspath(wsi_path),
@@ -70,10 +71,14 @@ def lookup_slide_size(wsi_path, slide_name, size_map, use_openslide=True):
     for key in candidates:
         if key in size_map:
             return size_map[key]
+    for key in candidates:
+        if key in h5_size_map:
+            return h5_size_map[key]
 
     if not use_openslide:
         raise ValueError(
-            f'No size entry found for {wsi_path}. Add it to --size-json or allow OpenSlide.'
+            f'No size entry found for {wsi_path}. Add it to --size-json, '
+            'provide a matching h5 file via --h5-dir, or allow OpenSlide.'
         )
 
     try:
@@ -142,7 +147,7 @@ def pret_annotation_id(label_id, prompt_type):
     return PRET_XML_IDS[prompt_type]
 
 
-def read_regions(args, label_map, size_map):
+def read_regions(args, label_map, size_map, h5_size_map=None):
     regions_by_slide = defaultdict(list)
     skipped = defaultdict(int)
     csv_path = os.path.abspath(args.csv)
@@ -169,7 +174,7 @@ def read_regions(args, label_map, size_map):
             wsi_path = resolve_wsi_path(raw_wsi_path, csv_path)
             slide_name = slide_name_from_path(wsi_path, args.name_mode)
             width, height = lookup_slide_size(
-                wsi_path, slide_name, size_map, use_openslide=not args.no_openslide
+                wsi_path, slide_name, size_map, h5_size_map, use_openslide=not args.no_openslide
             )
             points = parse_points(coords, width, height, clip=not args.no_clip)
             regions_by_slide[slide_name].append({
@@ -281,12 +286,131 @@ def find_h5_files(path):
     return h5_files
 
 
-def rasterize_mid_mask(regions, patch_scale):
+def infer_axis_step(values):
+    values = sorted({int(round(float(value))) for value in values})
+    diffs = [b - a for a, b in zip(values, values[1:]) if b > a]
+    if not diffs:
+        return None
+    step = diffs[0]
+    for diff in diffs[1:]:
+        step = math.gcd(step, diff)
+    if step <= 0:
+        return None
+    return step
+
+
+def infer_patch_scale_from_coordinates(coords):
+    steps = []
+    x_step = infer_axis_step(coords[:, 0])
+    y_step = infer_axis_step(coords[:, 1])
+    if x_step is not None:
+        steps.append(x_step)
+    if y_step is not None:
+        steps.append(y_step)
+    if not steps:
+        return None
+    return min(steps)
+
+
+def read_h5_coordinates(h5_path):
     try:
-        import cv2
+        import h5py
         import numpy as np
     except ImportError as exc:
-        raise RuntimeError('Writing h5 patch labels requires cv2 and numpy') from exc
+        raise RuntimeError('Reading h5 coordinates requires h5py and numpy') from exc
+
+    with h5py.File(h5_path, 'r') as f:
+        if 'coordinates' not in f:
+            raise KeyError(f'{h5_path} must contain h5 key: coordinates')
+        coords = np.asarray(f['coordinates'])
+        if 'features' in f and f['features'].shape[0] != coords.shape[0]:
+            raise ValueError(
+                f'{h5_path}: features and coordinates must have the same first dimension, '
+                f'got {f["features"].shape[0]} and {coords.shape[0]}'
+            )
+
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
+    return coords
+
+
+def infer_h5_metadata(h5_files, explicit_patch_scale):
+    metadata = {}
+    inferred_patch_scales = {}
+    for slide_name, h5_path in sorted(h5_files.items()):
+        coords = read_h5_coordinates(h5_path)
+        inferred_patch_scale = infer_patch_scale_from_coordinates(coords)
+        if explicit_patch_scale > 0:
+            patch_scale = explicit_patch_scale
+        elif inferred_patch_scale is not None:
+            patch_scale = inferred_patch_scale
+        else:
+            patch_scale = 512
+            print(
+                f'[warning] Could not infer patch scale from {h5_path}; '
+                f'falling back to {patch_scale}. Pass --patch-scale to override.'
+            )
+
+        width = int(math.ceil(float(coords[:, 0].max()) + patch_scale))
+        height = int(math.ceil(float(coords[:, 1].max()) + patch_scale))
+        metadata[slide_name] = {
+            'path': h5_path,
+            'coordinates': coords,
+            'patch_scale': int(patch_scale),
+            'width': width,
+            'height': height,
+            'inferred_patch_scale': inferred_patch_scale,
+        }
+        if inferred_patch_scale is not None:
+            inferred_patch_scales[int(inferred_patch_scale)] = inferred_patch_scales.get(int(inferred_patch_scale), 0) + 1
+
+    return metadata, inferred_patch_scales
+
+
+def choose_patch_scale(args, h5_metadata, inferred_patch_scales):
+    if args.patch_scale > 0:
+        if inferred_patch_scales:
+            inferred = max(inferred_patch_scales, key=inferred_patch_scales.get)
+            if inferred != args.patch_scale:
+                print(
+                    f'[warning] Explicit --patch-scale={args.patch_scale}, but the most common '
+                    f'h5 coordinate step is {inferred}. Using the explicit value.'
+                )
+        return args.patch_scale
+
+    if inferred_patch_scales:
+        patch_scale = max(inferred_patch_scales, key=inferred_patch_scales.get)
+        print(f'[info] Inferred patch scale from h5 coordinates: {patch_scale}')
+        return patch_scale
+
+    if h5_metadata:
+        patch_scale = next(iter(h5_metadata.values()))['patch_scale']
+        print(f'[info] Using fallback patch scale from h5 metadata: {patch_scale}')
+        return patch_scale
+
+    print('[info] No --h5-dir metadata available; using default patch scale 512.')
+    return 512
+
+
+def h5_size_map_from_metadata(h5_metadata, patch_scale):
+    out = {}
+    for slide_name, info in h5_metadata.items():
+        width = int(math.ceil(float(info['coordinates'][:, 0].max()) + patch_scale))
+        height = int(math.ceil(float(info['coordinates'][:, 1].max()) + patch_scale))
+        out[slide_name] = (width, height)
+    return out
+
+
+def rasterize_mid_mask(regions, patch_scale):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None
 
     width, height = regions[0]['size']
     mid_scale = max(1, patch_scale // 32)
@@ -302,30 +426,50 @@ def rasterize_mid_mask(regions, patch_scale):
             dtype=np.int32,
         )
         if contour.shape[0] >= 3:
-            cv2.fillPoly(mid, [contour], 1)
+            if cv2 is not None:
+                cv2.fillPoly(mid, [contour], 1)
+            else:
+                fill_polygon_numpy(mid, contour)
     return mid, mid_scale
+
+
+def fill_polygon_numpy(mask, contour):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+
+    min_x = max(0, int(np.floor(contour[:, 0].min())))
+    max_x = min(mask.shape[1], int(np.ceil(contour[:, 0].max())) + 1)
+    min_y = max(0, int(np.floor(contour[:, 1].min())))
+    max_y = min(mask.shape[0], int(np.ceil(contour[:, 1].max())) + 1)
+    if max_x <= min_x or max_y <= min_y:
+        return
+
+    yy, xx = np.mgrid[min_y:max_y, min_x:max_x]
+    x = xx + 0.5
+    y = yy + 0.5
+    inside = np.zeros(x.shape, dtype=bool)
+
+    points = contour.astype(float)
+    xj, yj = points[-1]
+    for xi, yi in points:
+        crosses = ((yi > y) != (yj > y)) & (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-12) + xi
+        )
+        inside ^= crosses
+        xj, yj = xi, yi
+
+    mask[min_y:max_y, min_x:max_x][inside] = 1
 
 
 def labels_for_h5_coordinates(regions, h5_path, patch_scale):
     try:
-        import h5py
         import numpy as np
     except ImportError as exc:
-        raise RuntimeError('Writing h5 patch labels requires h5py and numpy') from exc
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
 
-    with h5py.File(h5_path, 'r') as f:
-        if 'coordinates' not in f:
-            raise KeyError(f'{h5_path} must contain h5 key: coordinates')
-        coords = np.asarray(f['coordinates'])
-        if 'features' in f and f['features'].shape[0] != coords.shape[0]:
-            raise ValueError(
-                f'{h5_path}: features and coordinates must have the same first dimension, '
-                f'got {f["features"].shape[0]} and {coords.shape[0]}'
-            )
-
-    if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
-
+    coords = read_h5_coordinates(h5_path)
     mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
     labels = np.zeros(coords.shape[0], dtype=np.uint8)
     mid_h, mid_w = mid.shape
@@ -441,8 +585,10 @@ def parse_args():
     parser.add_argument('--h5-label-out', default='',
         help='optional directory to write per-h5 patch label .npy arrays aligned to h5 feature order')
     parser.add_argument('--data-info-out', default='', help='optional data_info JSON for annotated slides')
-    parser.add_argument('--size-json', default='', help='optional slide size JSON for formats OpenSlide cannot read')
-    parser.add_argument('--patch-scale', type=int, default=512, help='level-0 pixels per PRET patch; usually 512')
+    parser.add_argument('--size-json', default='',
+        help='optional slide size JSON for formats OpenSlide cannot read; h5 coordinates can infer this when --h5-dir is set')
+    parser.add_argument('--patch-scale', type=int, default=0,
+        help='level-0 pixels per patch; 0 infers from h5 coordinates when --h5-dir is set, otherwise uses 512')
     parser.add_argument('--prompt-type', default='mask',
         choices=['mask', 'box', 'roughMask', 'label-id'],
         help='XML Annotation Id convention: mask=1, box=2, roughMask=3, label-id preserves the label map id')
@@ -455,7 +601,7 @@ def parse_args():
     parser.add_argument('--wsi-label-mode', default='binary', choices=['binary', 'single-label', 'max-label'],
         help='wsi_label policy when --data-info-out is used')
     parser.add_argument('--no-openslide', action='store_true',
-        help='do not try to read WSI dimensions with OpenSlide; require --size-json')
+        help='do not try to read WSI dimensions with OpenSlide; require --size-json or matching --h5-dir metadata')
     parser.add_argument('--no-clip', action='store_true',
         help='raise on normalized coordinates outside [0,1] instead of clipping')
     args = parser.parse_args()
@@ -463,8 +609,8 @@ def parse_args():
         parser.error('provide at least one of --xml-out, --mask-out, --h5-label-out, or --data-info-out')
     if args.h5_label_out and not args.h5_dir:
         parser.error('--h5-dir is required when --h5-label-out is set')
-    if args.patch_scale <= 0:
-        parser.error('--patch-scale must be positive')
+    if args.patch_scale < 0:
+        parser.error('--patch-scale must be >= 0')
     return args
 
 
@@ -472,7 +618,11 @@ def main():
     args = parse_args()
     label_map = load_label_map(args.label_map)
     size_map = load_size_map(args.size_json)
-    regions_by_slide, skipped = read_regions(args, label_map, size_map)
+    h5_files = find_h5_files(args.h5_dir)
+    h5_metadata, inferred_patch_scales = infer_h5_metadata(h5_files, args.patch_scale) if h5_files else ({}, {})
+    args.patch_scale = choose_patch_scale(args, h5_metadata, inferred_patch_scales)
+    h5_size_map = h5_size_map_from_metadata(h5_metadata, args.patch_scale)
+    regions_by_slide, skipped = read_regions(args, label_map, size_map, h5_size_map)
     if not regions_by_slide:
         raise SystemExit('No regions were converted. Check labels, label map, and --positive-labels.')
 

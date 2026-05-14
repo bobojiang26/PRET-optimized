@@ -161,7 +161,7 @@ For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labe
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
 * `coordinates`: a 2D array with shape `(num_patches, >=2)`.
 
-When `coordinates` are level-0 pixel coordinates for the top-left corner of each patch, set `H5_COORDINATE_MODE=pixel` and set `H5_PATCH_SIZE` to the patch side length in level-0 pixels. For example, use `H5_PATCH_SIZE=256` for `256 x 256` patches.
+When `coordinates` are level-0 pixel coordinates for the top-left corner of each patch, set `H5_COORDINATE_MODE=pixel`. If the patch size is unknown, leave `H5_PATCH_SIZE=0`; PRET will infer the patch size from the coordinate grid. If needed, override it explicitly, for example `H5_PATCH_SIZE=256`.
 
 The CSV annotation file must have three columns:
 
@@ -169,7 +169,7 @@ The CSV annotation file must have three columns:
 wsi_path,labels,coordinates
 ```
 
-`wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. Because `.sdpc` files are often not readable by OpenSlide, provide a slide-size JSON so normalized coordinates can be converted to level-0 pixels:
+`wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. You can still provide one to override the inferred sizes:
 
 ```json
 {
@@ -184,12 +184,10 @@ First generate h5-aligned patch labels and a PRET `data_info` file:
 python prepare/csv_to_pret_annotations.py \
   --csv /path/to/annotations.csv \
   --label-map /path/to/label_map.json \
-  --size-json /path/to/slide_sizes.json \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
-  --mask-out data/MY_H5/patch/gt \
   --data-info-out data_info/MY_H5_mask.json \
-  --patch-scale 256 \
+  --patch-scale 0 \
   --prompt-type mask \
   --no-openslide
 ```
@@ -197,8 +195,9 @@ python prepare/csv_to_pret_annotations.py \
 This writes:
 
 * `data/MY_H5/patch/h5_labels/{slide}.npy`: one label array per slide, strictly aligned to the h5 `features` row order.
-* `data/MY_H5/patch/gt/{slide}.png`: optional patch-grid mask PNGs for inspection or non-h5 workflows.
-* `data_info/MY_H5_mask.json`: slide-level labels plus `h5_patch_labels`, `patch_labels`, and `pos_patch_num`.
+* `data_info/MY_H5_mask.json`: slide-level labels plus `h5_patch_labels` and `pos_patch_num`.
+
+Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`.
 
 By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for evaluation, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`.
 
@@ -212,7 +211,7 @@ DUMP_FEATURES=data/MY_H5/collected_features_mask \
 PROMPT_TYPE=mask \
 CLASS_NUM=1 \
 H5_COORDINATE_MODE=pixel \
-H5_PATCH_SIZE=256 \
+H5_PATCH_SIZE=0 \
 EXAMPLE_NUM=8 \
 VAL_NUM=100 \
 TEST_NUM=-1 \
