@@ -30,6 +30,8 @@ DEFAULT_WSI_EXTENSIONS = (
     '.bif',
 )
 DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
+DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
+DEFAULT_PATCH_SCALE = 512
 
 
 def load_label_map(path):
@@ -276,11 +278,11 @@ def lookup_slide_size(
         if key in size_map:
             return size_map[key]
     for key in candidates:
-        if key in h5_size_map:
-            return h5_size_map[key]
-    for key in candidates:
         if key in wsi_size_map:
             return wsi_size_map[key]
+    for key in candidates:
+        if key in h5_size_map:
+            return h5_size_map[key]
 
     if not slide_readers:
         raise ValueError(
@@ -564,6 +566,87 @@ def infer_patch_scale_from_coordinates(coords):
     return min(steps)
 
 
+def infer_h5_coordinate_mode(coords, requested_mode='auto', pixel_step_threshold=DEFAULT_H5_PIXEL_STEP_THRESHOLD):
+    if requested_mode != 'auto':
+        return requested_mode
+    inferred_step = infer_patch_scale_from_coordinates(coords)
+    if inferred_step is not None and inferred_step >= pixel_step_threshold:
+        return 'pixel'
+    return 'grid'
+
+
+def h5_grid_shape_from_coordinates(coords):
+    grid_w = int(math.floor(float(coords[:, 0].max()))) + 1
+    grid_h = int(math.floor(float(coords[:, 1].max()))) + 1
+    return max(grid_w, 1), max(grid_h, 1)
+
+
+def h5_slide_size_from_coordinates(coords, coordinate_mode, patch_scale):
+    if coordinate_mode == 'pixel':
+        width = int(math.ceil(float(coords[:, 0].max()) + patch_scale))
+        height = int(math.ceil(float(coords[:, 1].max()) + patch_scale))
+        return width, height
+
+    grid_w, grid_h = h5_grid_shape_from_coordinates(coords)
+    return int(grid_w * patch_scale), int(grid_h * patch_scale)
+
+
+def infer_grid_patch_scale_from_slide_size(coords, slide_size):
+    if not slide_size:
+        return None
+    width, height = slide_size
+    grid_w, grid_h = h5_grid_shape_from_coordinates(coords)
+    candidates = []
+    if grid_w > 0 and width > 0:
+        candidates.append(float(width) / grid_w)
+    if grid_h > 0 and height > 0:
+        candidates.append(float(height) / grid_h)
+    candidates = [value for value in candidates if value > 0]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        small = min(candidates)
+        large = max(candidates)
+        if small <= 0 or large / small > 1.25:
+            return None
+    return max(1, int(round(sum(candidates) / len(candidates))))
+
+
+def lookup_known_slide_size(slide_name, *size_maps):
+    candidates = [
+        slide_name,
+        decode_wsi_path(slide_name),
+        os.path.basename(slide_name),
+        os.path.splitext(os.path.basename(slide_name))[0],
+        os.path.splitext(os.path.basename(decode_wsi_path(slide_name)))[0],
+    ]
+    for size_map in size_maps:
+        if not size_map:
+            continue
+        for key in candidates:
+            if key in size_map:
+                value = size_map[key]
+                if isinstance(value, dict):
+                    width = value.get('width', value.get('w'))
+                    height = value.get('height', value.get('h'))
+                    return int(width), int(height)
+                return int(value[0]), int(value[1])
+    return None
+
+
+def h5_coords_to_pixel_coords(coords, coordinate_mode, patch_scale):
+    if coordinate_mode == 'pixel':
+        return coords
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+    pixel_coords = np.array(coords, copy=True)
+    pixel_coords[:, 0] = pixel_coords[:, 0].astype(float) * patch_scale
+    pixel_coords[:, 1] = pixel_coords[:, 1].astype(float) * patch_scale
+    return pixel_coords
+
+
 def read_h5_coordinates(h5_path):
     try:
         import h5py
@@ -586,53 +669,77 @@ def read_h5_coordinates(h5_path):
     return coords
 
 
-def infer_h5_metadata(h5_files, explicit_patch_scale):
+def infer_h5_metadata(h5_files, args, known_size_map=None):
     metadata = {}
-    inferred_patch_scales = {}
+    patch_scales = {}
+    coordinate_modes = defaultdict(int)
     for slide_name, h5_path in sorted(h5_files.items()):
         coords = read_h5_coordinates(h5_path)
-        inferred_patch_scale = infer_patch_scale_from_coordinates(coords)
-        if explicit_patch_scale > 0:
-            patch_scale = explicit_patch_scale
-        elif inferred_patch_scale is not None:
-            patch_scale = inferred_patch_scale
+        coordinate_step = infer_patch_scale_from_coordinates(coords)
+        coordinate_mode = infer_h5_coordinate_mode(
+            coords,
+            requested_mode=args.h5_coordinate_mode,
+            pixel_step_threshold=args.h5_pixel_step_threshold,
+        )
+        known_size = lookup_known_slide_size(slide_name, known_size_map)
+
+        if args.patch_scale > 0:
+            patch_scale = args.patch_scale
+        elif coordinate_mode == 'pixel' and coordinate_step is not None:
+            patch_scale = coordinate_step
+        elif coordinate_mode == 'grid':
+            patch_scale = infer_grid_patch_scale_from_slide_size(coords, known_size)
+            if patch_scale is None:
+                patch_scale = DEFAULT_PATCH_SCALE
+                print(
+                    f'[warning] {h5_path}: h5 coordinates look like patch-grid indices '
+                    f'(step={coordinate_step}); slide size is unavailable or does not match the grid. '
+                    f'Falling back to --patch-scale={patch_scale}. Pass --patch-scale or --size-json/--wsi-dir to override.'
+                )
         else:
-            patch_scale = 512
+            patch_scale = DEFAULT_PATCH_SCALE
             print(
-                f'[warning] Could not infer patch scale from {h5_path}; '
+                f'[warning] Could not infer h5 patch scale from {h5_path}; '
                 f'falling back to {patch_scale}. Pass --patch-scale to override.'
             )
 
-        width = int(math.ceil(float(coords[:, 0].max()) + patch_scale))
-        height = int(math.ceil(float(coords[:, 1].max()) + patch_scale))
+        if known_size is not None:
+            width, height = known_size
+        else:
+            width, height = h5_slide_size_from_coordinates(coords, coordinate_mode, patch_scale)
+
         metadata[slide_name] = {
             'path': h5_path,
             'coordinates': coords,
+            'coordinate_mode': coordinate_mode,
             'patch_scale': int(patch_scale),
             'width': width,
             'height': height,
-            'inferred_patch_scale': inferred_patch_scale,
+            'coordinate_step': coordinate_step,
         }
-        if inferred_patch_scale is not None:
-            inferred_patch_scales[int(inferred_patch_scale)] = inferred_patch_scales.get(int(inferred_patch_scale), 0) + 1
+        patch_scales[int(patch_scale)] = patch_scales.get(int(patch_scale), 0) + 1
+        coordinate_modes[coordinate_mode] += 1
 
-    return metadata, inferred_patch_scales
+    if coordinate_modes:
+        mode_text = ', '.join(f'{mode}:{count}' for mode, count in sorted(coordinate_modes.items()))
+        print(f'[info] h5 coordinate modes: {mode_text}')
+    return metadata, patch_scales
 
 
-def choose_patch_scale(args, h5_metadata, inferred_patch_scales):
+def choose_patch_scale(args, h5_metadata, patch_scales):
     if args.patch_scale > 0:
-        if inferred_patch_scales:
-            inferred = max(inferred_patch_scales, key=inferred_patch_scales.get)
+        if patch_scales:
+            inferred = max(patch_scales, key=patch_scales.get)
             if inferred != args.patch_scale:
                 print(
-                    f'[warning] Explicit --patch-scale={args.patch_scale}, but the most common '
-                    f'h5 coordinate step is {inferred}. Using the explicit value.'
+                    f'[warning] Explicit --patch-scale={args.patch_scale}, but the most common h5 '
+                    f'patch scale estimate is {inferred}. Using the explicit value.'
                 )
         return args.patch_scale
 
-    if inferred_patch_scales:
-        patch_scale = max(inferred_patch_scales, key=inferred_patch_scales.get)
-        print(f'[info] Inferred patch scale from h5 coordinates: {patch_scale}')
+    if patch_scales:
+        patch_scale = max(patch_scales, key=patch_scales.get)
+        print(f'[info] Using h5 patch scale: {patch_scale}')
         return patch_scale
 
     if h5_metadata:
@@ -640,16 +747,14 @@ def choose_patch_scale(args, h5_metadata, inferred_patch_scales):
         print(f'[info] Using fallback patch scale from h5 metadata: {patch_scale}')
         return patch_scale
 
-    print('[info] No --h5-dir metadata available; using default patch scale 512.')
-    return 512
+    print(f'[info] No --h5-dir metadata available; using default patch scale {DEFAULT_PATCH_SCALE}.')
+    return DEFAULT_PATCH_SCALE
 
 
-def h5_size_map_from_metadata(h5_metadata, patch_scale):
+def h5_size_map_from_metadata(h5_metadata):
     out = {}
     for slide_name, info in h5_metadata.items():
-        width = int(math.ceil(float(info['coordinates'][:, 0].max()) + patch_scale))
-        height = int(math.ceil(float(info['coordinates'][:, 1].max()) + patch_scale))
-        out[slide_name] = (width, height)
+        out[slide_name] = (int(info['width']), int(info['height']))
     return out
 
 
@@ -738,13 +843,24 @@ def labels_from_mid_mask(coords, mid, mid_scale, patch_scale):
     return labels
 
 
-def labels_for_h5_coordinates(regions, h5_path, patch_scale, multi_label=False, class_num=0, binary_labels=True):
+def labels_for_h5_coordinates(
+    regions,
+    h5_path,
+    patch_scale,
+    coordinate_mode='pixel',
+    multi_label=False,
+    class_num=0,
+    binary_labels=True,
+    coords=None,
+):
     try:
         import numpy as np
     except ImportError as exc:
         raise RuntimeError('Writing h5 patch labels requires numpy') from exc
 
-    coords = read_h5_coordinates(h5_path)
+    if coords is None:
+        coords = read_h5_coordinates(h5_path)
+    pixel_coords = h5_coords_to_pixel_coords(coords, coordinate_mode, patch_scale)
 
     if multi_label:
         if class_num <= 0:
@@ -755,18 +871,18 @@ def labels_for_h5_coordinates(regions, h5_path, patch_scale, multi_label=False, 
             if not cls_regions:
                 continue
             mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
-            labels[:, cls - 1] = labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+            labels[:, cls - 1] = labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
         return labels
 
     if binary_labels:
         mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
-        return labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+        return labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
 
     labels = np.zeros(coords.shape[0], dtype=np.uint16)
     for cls in sorted({int(r['label_id']) for r in regions}):
         cls_regions = [r for r in regions if int(r['label_id']) == cls]
         mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
-        cls_hits = labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+        cls_hits = labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
         labels[cls_hits == 1] = cls
     return labels
 
@@ -779,6 +895,7 @@ def write_h5_label_files(
     multi_label=False,
     class_num=0,
     binary_labels=True,
+    h5_metadata=None,
 ):
     if not h5_label_out:
         return {}, 0
@@ -797,13 +914,19 @@ def write_h5_label_files(
         if slide_name not in h5_files:
             missing.append(slide_name)
             continue
+        slide_h5_metadata = (h5_metadata or {}).get(slide_name, {})
+        slide_patch_scale = int(slide_h5_metadata.get('patch_scale', patch_scale))
+        slide_coordinate_mode = slide_h5_metadata.get('coordinate_mode', 'pixel')
+        slide_coords = slide_h5_metadata.get('coordinates')
         labels = labels_for_h5_coordinates(
             regions,
             h5_files[slide_name],
-            patch_scale,
+            slide_patch_scale,
+            coordinate_mode=slide_coordinate_mode,
             multi_label=multi_label,
             class_num=class_num,
             binary_labels=binary_labels,
+            coords=slide_coords,
         )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
@@ -905,8 +1028,12 @@ def parse_args():
         help='WSI file extensions to scan under --wsi-dir; default includes sdpc, svs, tif, tiff, mrxs, ndpi, scn')
     parser.add_argument('--slide-reader', default='auto', choices=['auto', 'openslide', 'opensdpc'],
         help='slide reader used for WSI sizes; auto tries OpenSlide first, then opensdpc for sdpc-like files')
+    parser.add_argument('--h5-coordinate-mode', default='auto', choices=['auto', 'pixel', 'grid'],
+        help='how to interpret h5 coordinates: pixel=level-0 top-left pixels, grid=patch indices, auto detects from coordinate step')
+    parser.add_argument('--h5-pixel-step-threshold', type=int, default=DEFAULT_H5_PIXEL_STEP_THRESHOLD,
+        help='auto mode treats h5 coordinate step >= this value as pixel coordinates; smaller steps are patch-grid coordinates')
     parser.add_argument('--patch-scale', type=int, default=0,
-        help='level-0 pixels per patch; 0 infers from h5 coordinates when --h5-dir is set, otherwise uses 512')
+        help='level-0 pixels per patch; 0 infers from h5 pixel coordinates or WSI size for h5 grid coordinates, otherwise uses 512')
     parser.add_argument('--prompt-type', default='mask',
         choices=['mask', 'box', 'roughMask', 'label-id'],
         help='XML Annotation Id convention: mask=1, box=2, roughMask=3, label-id preserves the label map id')
@@ -942,6 +1069,8 @@ def parse_args():
         parser.error('--h5-dir is required when --h5-label-out is set')
     if args.patch_scale < 0:
         parser.error('--patch-scale must be >= 0')
+    if args.h5_pixel_step_threshold <= 0:
+        parser.error('--h5-pixel-step-threshold must be positive')
     return args
 
 
@@ -969,14 +1098,17 @@ def main():
     label_map = load_label_map(args.label_map)
     size_map = load_size_map(args.size_json)
     h5_files = find_h5_files(args.h5_dir)
-    h5_metadata, inferred_patch_scales = infer_h5_metadata(h5_files, args.patch_scale) if h5_files else ({}, {})
-    args.patch_scale = choose_patch_scale(args, h5_metadata, inferred_patch_scales)
-    h5_size_map = h5_size_map_from_metadata(h5_metadata, args.patch_scale)
+    known_size_map = {}
+    known_size_map.update(wsi_size_map)
+    known_size_map.update(size_map)
+    h5_metadata, patch_scales = infer_h5_metadata(h5_files, args, known_size_map) if h5_files else ({}, {})
+    args.patch_scale = choose_patch_scale(args, h5_metadata, patch_scales)
+    h5_size_map = h5_size_map_from_metadata(h5_metadata)
     if args.size_json_out:
         combined_size_json = {}
-        combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in size_map.items()})
         combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in h5_size_map.items()})
         combined_size_json.update(wsi_size_json)
+        combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in size_map.items()})
         write_size_json(combined_size_json, args.size_json_out)
 
     regions_by_slide, skipped = read_regions(
@@ -1004,6 +1136,7 @@ def main():
         multi_label=h5_multi_label,
         class_num=class_num,
         binary_labels=h5_binary_labels,
+        h5_metadata=h5_metadata,
     )
     write_data_info(
         regions_by_slide,

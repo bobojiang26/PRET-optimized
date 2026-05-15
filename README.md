@@ -85,7 +85,7 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain a `features` key. A `coordinates` key is optional:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns are interpreted as patch grid coordinates `(x, y)`. If this key is missing, PRET generates deterministic row-major synthetic coordinates so slide-level h5 evaluation can continue.
+* `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. `H5_COORDINATE_MODE=auto` detects this from the coordinate step; step values below `H5_PIXEL_STEP_THRESHOLD` are treated as patch-grid coordinates, and larger steps are treated as pixel coordinates. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
 
 Put all h5 files in one folder, for example:
 
@@ -161,7 +161,7 @@ For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labe
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
 * `coordinates`: a 2D array with shape `(num_patches, >=2)`.
 
-When `coordinates` are level-0 pixel coordinates for the top-left corner of each patch, set `H5_COORDINATE_MODE=pixel`. If the patch size is unknown, leave `H5_PATCH_SIZE=0`; PRET will infer the patch size from the coordinate grid. If needed, override it explicitly, for example `H5_PATCH_SIZE=256`.
+H5 `coordinates` can be stored in two formats. If they are level-0 pixel top-left coordinates, use `--h5-coordinate-mode pixel`, or leave `auto` when the coordinate step is large, for example `256` or `512`. If they are patch-grid coordinates, for example step `1`, use `--h5-coordinate-mode grid`, or leave `auto` and the converter will detect grid mode. In grid mode, `--patch-scale` means the level-0 pixel size of one patch; when `--patch-scale 0`, the converter tries to infer it from `--size-json` or `--wsi-dir`, then falls back to `512`. If the h5 only keeps a tissue subset instead of the full slide grid, pass the real patch size explicitly with `--patch-scale 256` or `--patch-scale 512`.
 
 The CSV annotation file must have three columns:
 
@@ -171,7 +171,7 @@ wsi_path,labels,coordinates
 
 `wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. URL-escaped slide names are decoded before matching h5 files. For example, `2026-004317%238%231.sdpc` is converted to `2026-004317#8#1` and then matched with `2026-004317#8#1.h5`; if the CSV already contains `#`, the name is kept unchanged. The `labels` field may be a plain label or a JSON/Python-style list such as `["fibroadenoma"]`.
 
-Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. If real execution still needs an explicit size JSON, generate it from the WSI folder or let the converter read the WSI folder directly. You can still provide a size JSON to override inferred sizes:
+Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided and its coordinates are pixel coordinates, the converter can infer each slide size as `max_coordinate + inferred_patch_size`. If h5 coordinates are patch-grid coordinates, pass `--size-json`, `--wsi-dir`, or explicit `--patch-scale` so normalized CSV annotations can be mapped back to level-0 pixels correctly. You can still provide a size JSON to override inferred sizes:
 
 ```json
 {
@@ -226,6 +226,7 @@ python prepare/csv_to_pret_annotations.py \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
+  --h5-coordinate-mode auto \
   --patch-scale 0 \
   --prompt-type mask \
   --wsi-label-mode multi-label \
@@ -253,7 +254,8 @@ DUMP_FEATURES=data/MY_H5/collected_features_mask \
 PROMPT_TYPE=mask \
 MULTILABEL=1 \
 CLASS_NUM=6 \
-H5_COORDINATE_MODE=pixel \
+H5_COORDINATE_MODE=auto \
+H5_PIXEL_STEP_THRESHOLD=16 \
 H5_PATCH_SIZE=0 \
 EXAMPLE_NUM=8 \
 VAL_NUM=100 \

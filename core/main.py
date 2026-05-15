@@ -47,6 +47,8 @@ try:
 except ImportError:
     resource = None
 
+DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
+
 if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
     nn.Module.cuda = lambda self, *args, **kwargs: self
@@ -694,10 +696,23 @@ def infer_h5_patch_size(coords):
     return min(steps)
 
 
-def get_h5_patch_size(args, coords=None, context='h5 input'):
+def infer_h5_coordinate_mode(coords, args, context='h5 input'):
+    if args.h5_coordinate_mode != 'auto':
+        return args.h5_coordinate_mode
+    inferred_step = infer_h5_patch_size(coords)
+    if inferred_step is not None and inferred_step >= args.h5_pixel_step_threshold:
+        mode = 'pixel'
+    else:
+        mode = 'grid'
+    print(f'[info] {context}: inferred h5 coordinate mode {mode} from coordinate step {inferred_step}.')
+    return mode
+
+
+def get_h5_patch_size(args, coords=None, context='h5 input', coordinate_mode=None):
     if args.h5_patch_size > 0:
         return args.h5_patch_size
-    if args.h5_coordinate_mode == 'pixel' and coords is not None:
+    coordinate_mode = coordinate_mode or args.h5_coordinate_mode
+    if coordinate_mode == 'pixel' and coords is not None:
         inferred = infer_h5_patch_size(coords)
         if inferred is not None:
             print(f'[info] {context}: inferred h5 patch size {inferred} from coordinates.')
@@ -705,15 +720,16 @@ def get_h5_patch_size(args, coords=None, context='h5 input'):
     return args.patch_scale
 
 
-def h5_coord_to_patch_xy(coord, args, patch_size=None):
-    if args.h5_coordinate_mode == 'pixel':
+def h5_coord_to_patch_xy(coord, args, patch_size=None, coordinate_mode=None):
+    coordinate_mode = coordinate_mode or args.h5_coordinate_mode
+    if coordinate_mode == 'pixel':
         patch_size = patch_size if patch_size is not None else get_h5_patch_size(args)
         return int(float(coord[0]) // patch_size), int(float(coord[1]) // patch_size)
     return int(coord[0]), int(coord[1])
 
 
-def infer_h5_grid_size(coords, args, patch_size=None):
-    patch_xy = [h5_coord_to_patch_xy(coord, args, patch_size) for coord in coords]
+def infer_h5_grid_size(coords, args, patch_size=None, coordinate_mode=None):
+    patch_xy = [h5_coord_to_patch_xy(coord, args, patch_size, coordinate_mode) for coord in coords]
     if not patch_xy:
         return None
     max_x = max(x for x, _ in patch_xy)
@@ -721,7 +737,7 @@ def infer_h5_grid_size(coords, args, patch_size=None):
     return (int(max_y) + 1, int(max_x) + 1)
 
 
-def load_h5_patch_labels(info, coords, args, patch_size=None):
+def load_h5_patch_labels(info, coords, args, patch_size=None, coordinate_mode=None):
     if 'h5_patch_labels' in info:
         labels = np.load(info['h5_patch_labels']).astype(np.uint8, copy=False)
         if labels.shape[0] != coords.shape[0]:
@@ -740,7 +756,7 @@ def load_h5_patch_labels(info, coords, args, patch_size=None):
 
     labels = []
     for coord in coords:
-        x, y = h5_coord_to_patch_xy(coord, args, patch_size)
+        x, y = h5_coord_to_patch_xy(coord, args, patch_size, coordinate_mode)
         if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:
             labels.append(mask[y, x])
         else:
@@ -786,12 +802,13 @@ def feature_processor(args):
 
         if k in h5_map:
             feats, coords = load_h5_feature_file(h5_map[k])
-            h5_patch_size = get_h5_patch_size(args, coords, context=h5_map[k])
-            patch_label = load_h5_patch_labels(v, coords, args, h5_patch_size)
-            h5_grid_size = infer_h5_grid_size(coords, args, h5_patch_size)
+            h5_coordinate_mode = infer_h5_coordinate_mode(coords, args, context=h5_map[k])
+            h5_patch_size = get_h5_patch_size(args, coords, context=h5_map[k], coordinate_mode=h5_coordinate_mode)
+            patch_label = load_h5_patch_labels(v, coords, args, h5_patch_size, h5_coordinate_mode)
+            h5_grid_size = infer_h5_grid_size(coords, args, h5_patch_size, h5_coordinate_mode)
             names = []
             for i in range(coords.shape[0]):
-                x, y = h5_coord_to_patch_xy(coords[i], args, h5_patch_size)
+                x, y = h5_coord_to_patch_xy(coords[i], args, h5_patch_size, h5_coordinate_mode)
                 names.append(os.path.join('h5_features', k, f'{x}_{y}.jpeg'))
             info = {'features': feats, 'patch_names': names, 'patch_labels': np.array(patch_label)}
             if 'wsi_label' in v:
@@ -800,6 +817,8 @@ def feature_processor(args):
                 info['wsi_labels'] = v['wsi_labels']
             if h5_grid_size is not None:
                 info['h5_grid_size'] = h5_grid_size
+            info['h5_coordinate_mode'] = h5_coordinate_mode
+            info['h5_patch_size'] = h5_patch_size
             np.save(os.path.join(args.dump_features, k + '.npy'), info)
             continue
         
@@ -2087,8 +2106,10 @@ if __name__ == '__main__':
     parser.add_argument('--vis_path', default='', help='Path where to save heatmap')
     parser.add_argument('--dataset_info', default='/path/to/data_list_gt_and_split', type=str, help='json file recording dataset info')
     parser.add_argument('--patch_scale', default=512, type=int, help='patch size in 40x for anno loading')
-    parser.add_argument('--h5_coordinate_mode', default='grid', choices=['grid', 'pixel'],
-        help='interpret h5 coordinates as patch-grid indices or level-0 pixel top-left coordinates')
+    parser.add_argument('--h5_coordinate_mode', default='auto', choices=['auto', 'grid', 'pixel'],
+        help='interpret h5 coordinates as patch-grid indices, level-0 pixel top-left coordinates, or auto-detect from coordinate step')
+    parser.add_argument('--h5_pixel_step_threshold', default=DEFAULT_H5_PIXEL_STEP_THRESHOLD, type=int,
+        help='auto mode treats h5 coordinate step >= this value as pixel coordinates; smaller steps are patch-grid coordinates')
     parser.add_argument('--h5_patch_size', default=0, type=int,
         help='level-0 patch size for h5 pixel coordinates; 0 infers from h5 coordinates when possible')
     parser.add_argument('--file_min_size', default=5000, type=int, help='skip background and patches with a few content')
@@ -2116,6 +2137,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',
         help='also seed torch random sampling; default off to preserve original PRET subtyping sampler behavior')
     args = parser.parse_args()
+    if args.h5_pixel_step_threshold <= 0:
+        parser.error('--h5_pixel_step_threshold must be positive')
 
     random.seed(args.seed)
     if args.seed_torch_sampling:
