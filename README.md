@@ -171,7 +171,7 @@ wsi_path,labels,coordinates
 
 `wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. URL-escaped slide names are decoded before matching h5 files. For example, `2026-004317%238%231.sdpc` is converted to `2026-004317#8#1` and then matched with `2026-004317#8#1.h5`; if the CSV already contains `#`, the name is kept unchanged. The `labels` field may be a plain label or a JSON/Python-style list such as `["fibroadenoma"]`.
 
-Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. You can still provide one to override the inferred sizes:
+Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. If real execution still needs an explicit size JSON, generate it from the WSI folder or let the converter read the WSI folder directly. You can still provide a size JSON to override inferred sizes:
 
 ```json
 {
@@ -179,6 +179,33 @@ Two points are interpreted as opposite rectangle corners. More than two points a
     "slide_002": {"width": 100000, "height": 90000}
 }
 ```
+
+For SDPC slides, the converter tries OpenSlide first and then the optional `opensdpc` reader when `--slide-reader auto` is used. If OpenSlide cannot read your `.sdpc` files, install the SDPC reader in the same Python environment used for conversion:
+
+```
+pip install opensdpc
+```
+
+To create only the `size_json` file from a folder of `.sdpc` slides:
+
+```
+python prepare/wsi_dir_to_size_json.py \
+  --wsi-dir /path/to/sdpc_folder \
+  --out data_info/MY_H5_size.json \
+  --slide-reader opensdpc
+```
+
+The same operation is also available from the main converter:
+
+```
+python prepare/csv_to_pret_annotations.py \
+  --wsi-dir /path/to/sdpc_folder \
+  --size-json-out data_info/MY_H5_size.json \
+  --write-size-json-only \
+  --slide-reader opensdpc
+```
+
+The JSON keys are URL-decoded slide stems by default, so `2026-004317%238%231.sdpc` becomes `2026-004317#8#1`. If your SDPC files are nested in subfolders, add `--recursive` for `wsi_dir_to_size_json.py` or `--wsi-recursive` for `csv_to_pret_annotations.py`.
 
 Label conversion rules:
 
@@ -194,13 +221,15 @@ python prepare/csv_to_pret_annotations.py \
   --csv /path/to/annotations.csv \
   --auto-label-map \
   --label-map-out data_info/MY_H5_label_map.json \
+  --wsi-dir /path/to/sdpc_folder \
+  --size-json-out data_info/MY_H5_size.json \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
   --patch-scale 0 \
   --prompt-type mask \
   --wsi-label-mode multi-label \
-  --no-openslide
+  --slide-reader auto
 ```
 
 This writes:
@@ -208,6 +237,7 @@ This writes:
 * `data/MY_H5/patch/h5_labels/{slide}.npy`: one label array per slide, strictly aligned to the h5 `features` row order.
 * `data_info/MY_H5_mask.json`: slide-level `wsi_labels`, `h5_patch_labels`, and `pos_patch_num`.
 * `data_info/MY_H5_label_map.json`: label names assigned in first-seen CSV order as `1, 2, 3, ...`.
+* `data_info/MY_H5_size.json`: slide level-0 sizes read from the SDPC folder and/or inferred from h5 coordinates.
 
 Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`.
 

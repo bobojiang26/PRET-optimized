@@ -17,6 +17,19 @@ PRET_XML_IDS = {
     'box': 2,
     'roughMask': 3,
 }
+DEFAULT_WSI_EXTENSIONS = (
+    '.sdpc',
+    '.svs',
+    '.tif',
+    '.tiff',
+    '.mrxs',
+    '.ndpi',
+    '.scn',
+    '.vms',
+    '.vmu',
+    '.bif',
+)
+DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
 
 
 def load_label_map(path):
@@ -38,6 +51,24 @@ def write_label_map(label_map, path):
         os.makedirs(out_dir, exist_ok=True)
     with open(path, 'w', encoding='utf8') as f:
         json.dump(label_map, f, ensure_ascii=False, indent=4)
+
+
+def write_size_json(size_map, path):
+    if not path:
+        return
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    serializable = {}
+    for key, value in sorted(size_map.items()):
+        if isinstance(value, dict):
+            width = value.get('width', value.get('w'))
+            height = value.get('height', value.get('h'))
+        else:
+            width, height = value[:2]
+        serializable[str(key)] = {'width': int(width), 'height': int(height)}
+    with open(path, 'w', encoding='utf8') as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=4)
 
 
 def load_size_map(path):
@@ -79,8 +110,158 @@ def resolve_wsi_path(raw_path, csv_path):
     return os.path.abspath(os.path.join(os.path.dirname(csv_path), raw_path))
 
 
-def lookup_slide_size(wsi_path, slide_name, size_map, h5_size_map=None, use_openslide=True):
+def normalize_extensions(extensions):
+    if not extensions:
+        return DEFAULT_WSI_EXTENSIONS
+    out = []
+    for ext in extensions:
+        ext = str(ext).strip().lower()
+        if not ext:
+            continue
+        out.append(ext if ext.startswith('.') else f'.{ext}')
+    return tuple(out) if out else DEFAULT_WSI_EXTENSIONS
+
+
+def iter_wsi_paths(path, extensions=None, recursive=False):
+    if not path:
+        return []
+    root = Path(path)
+    extensions = normalize_extensions(extensions)
+    if root.is_file():
+        return [root] if root.suffix.lower() in extensions else []
+    if not root.exists():
+        raise FileNotFoundError(f'WSI directory does not exist: {path}')
+    iterator = root.rglob('*') if recursive else root.iterdir()
+    return sorted(p for p in iterator if p.is_file() and p.suffix.lower() in extensions)
+
+
+def wsi_lookup_keys(path):
+    decoded_path = decode_wsi_path(str(path))
+    basename = os.path.basename(str(path))
+    decoded_basename = os.path.basename(decoded_path)
+    stem = os.path.splitext(basename)[0]
+    decoded_stem = os.path.splitext(decoded_basename)[0]
+    keys = {
+        str(path),
+        decoded_path,
+        os.path.abspath(str(path)),
+        os.path.abspath(decoded_path),
+        basename,
+        decoded_basename,
+        stem,
+        decoded_stem,
+    }
+    return {key for key in keys if key}
+
+
+def find_wsi_files(path, extensions=None, recursive=False):
+    wsi_files = {}
+    for wsi_path in iter_wsi_paths(path, extensions=extensions, recursive=recursive):
+        for key in wsi_lookup_keys(wsi_path):
+            wsi_files[key] = str(wsi_path)
+    return wsi_files
+
+
+def close_slide(slide):
+    close_fn = getattr(slide, 'close', None)
+    if callable(close_fn):
+        close_fn()
+
+
+def size_from_slide_object(slide, slide_path):
+    if hasattr(slide, 'level_dimensions'):
+        width, height = slide.level_dimensions[0]
+        return int(width), int(height)
+    if hasattr(slide, 'dimensions'):
+        width, height = slide.dimensions
+        return int(width), int(height)
+    get_level_dimensions = getattr(slide, 'get_level_dimensions', None)
+    if callable(get_level_dimensions):
+        width, height = get_level_dimensions(0)
+        return int(width), int(height)
+    width = getattr(slide, 'width', None)
+    height = getattr(slide, 'height', None)
+    if width is not None and height is not None:
+        return int(width), int(height)
+    raise AttributeError(f'{slide_path}: slide object does not expose level-0 dimensions')
+
+
+def read_size_with_openslide(slide_path):
+    import openslide
+    slide = openslide.OpenSlide(slide_path)
+    try:
+        return size_from_slide_object(slide, slide_path)
+    finally:
+        close_slide(slide)
+
+
+def read_size_with_opensdpc(slide_path):
+    import opensdpc
+
+    opener = (
+        getattr(opensdpc, 'OpenSdpc', None)
+        or getattr(opensdpc, 'OpenSDPC', None)
+        or getattr(opensdpc, 'OpenSlide', None)
+    )
+    if opener is None:
+        raise AttributeError('opensdpc does not expose OpenSdpc/OpenSDPC/OpenSlide')
+
+    slide = opener(slide_path)
+    try:
+        return size_from_slide_object(slide, slide_path)
+    finally:
+        close_slide(slide)
+
+
+def read_slide_size(slide_path, readers=DEFAULT_SLIDE_READERS):
+    readers = tuple(readers or [])
+    errors = []
+    for reader in readers:
+        try:
+            if reader == 'openslide':
+                return read_size_with_openslide(slide_path)
+            if reader == 'opensdpc':
+                return read_size_with_opensdpc(slide_path)
+            raise ValueError(f'unknown slide reader: {reader}')
+        except Exception as exc:
+            errors.append(f'{reader}: {exc}')
+    if not readers:
+        errors.append('no slide readers enabled')
+    raise ValueError(f'Cannot read WSI size for {slide_path}. Tried {", ".join(errors)}')
+
+
+def build_wsi_size_maps(wsi_dir, extensions=None, recursive=False, readers=DEFAULT_SLIDE_READERS, name_mode='stem'):
+    lookup_map = {}
+    json_map = {}
+    for wsi_path in iter_wsi_paths(wsi_dir, extensions=extensions, recursive=recursive):
+        width, height = read_slide_size(str(wsi_path), readers=readers)
+        slide_name = slide_name_from_path(str(wsi_path), name_mode)
+        json_map[slide_name] = {'width': width, 'height': height}
+        for key in wsi_lookup_keys(wsi_path):
+            lookup_map[key] = (width, height)
+    return lookup_map, json_map
+
+
+def requested_slide_readers(args):
+    if args.slide_reader == 'auto':
+        readers = list(DEFAULT_SLIDE_READERS)
+    else:
+        readers = [args.slide_reader]
+    if args.no_openslide:
+        readers = [reader for reader in readers if reader != 'openslide']
+    return readers
+
+
+def lookup_slide_size(
+    wsi_path,
+    slide_name,
+    size_map,
+    h5_size_map=None,
+    wsi_size_map=None,
+    slide_readers=DEFAULT_SLIDE_READERS,
+):
     h5_size_map = h5_size_map or {}
+    wsi_size_map = wsi_size_map or {}
     decoded_wsi_path = decode_wsi_path(wsi_path)
     candidates = [
         wsi_path,
@@ -97,23 +278,22 @@ def lookup_slide_size(wsi_path, slide_name, size_map, h5_size_map=None, use_open
     for key in candidates:
         if key in h5_size_map:
             return h5_size_map[key]
+    for key in candidates:
+        if key in wsi_size_map:
+            return wsi_size_map[key]
 
-    if not use_openslide:
+    if not slide_readers:
         raise ValueError(
             f'No size entry found for {wsi_path}. Add it to --size-json, '
-            'provide a matching h5 file via --h5-dir, or allow OpenSlide.'
+            'provide a matching h5 file via --h5-dir, pass --wsi-dir, or enable a slide reader.'
         )
 
     try:
-        import openslide
-        slide = openslide.OpenSlide(wsi_path)
-        width, height = slide.level_dimensions[0]
-        slide.close()
-        return int(width), int(height)
+        return read_slide_size(wsi_path, readers=slide_readers)
     except Exception as exc:
         raise ValueError(
             f'Cannot read WSI size for {wsi_path}: {exc}. '
-            'For sdpc files not supported by OpenSlide, pass --size-json with '
+            'For sdpc files, install/use opensdpc, pass --wsi-dir, or pass --size-json with '
             '{"slide_name": {"width": W, "height": H}}.'
         )
 
@@ -205,7 +385,7 @@ def pret_annotation_id(label_id, prompt_type):
     return PRET_XML_IDS[prompt_type]
 
 
-def read_regions(args, label_map, size_map, h5_size_map=None):
+def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None, slide_readers=None):
     regions_by_slide = defaultdict(list)
     skipped = defaultdict(int)
     csv_path = os.path.abspath(args.csv)
@@ -227,7 +407,12 @@ def read_regions(args, label_map, size_map, h5_size_map=None):
             wsi_path = resolve_wsi_path(raw_wsi_path, csv_path)
             slide_name = slide_name_from_path(wsi_path, args.name_mode)
             width, height = lookup_slide_size(
-                wsi_path, slide_name, size_map, h5_size_map, use_openslide=not args.no_openslide
+                wsi_path,
+                slide_name,
+                size_map,
+                h5_size_map,
+                wsi_size_map,
+                slide_readers=slide_readers,
             )
             points = parse_points(coords, width, height, clip=not args.no_clip)
 
@@ -694,7 +879,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Convert normalized CSV annotations to PRET-compatible XML and optional patch-mask PNGs.'
     )
-    parser.add_argument('--csv', required=True, help='CSV with wsi_path, labels, coordinates columns')
+    parser.add_argument('--csv', default='', help='CSV with wsi_path, labels, coordinates columns')
     parser.add_argument('--label-map', default='', help='optional JSON mapping label names to integer ids')
     parser.add_argument('--auto-label-map', action='store_true',
         help='assign missing labels ids in first-seen CSV order, starting at max(existing ids)+1')
@@ -708,6 +893,18 @@ def parse_args():
     parser.add_argument('--data-info-out', default='', help='optional data_info JSON for annotated slides')
     parser.add_argument('--size-json', default='',
         help='optional slide size JSON for formats OpenSlide cannot read; h5 coordinates can infer this when --h5-dir is set')
+    parser.add_argument('--size-json-out', default='',
+        help='optional path to write slide sizes read from --wsi-dir and/or inferred from --h5-dir')
+    parser.add_argument('--write-size-json-only', action='store_true',
+        help='only scan --wsi-dir and write --size-json-out; no CSV conversion is performed')
+    parser.add_argument('--wsi-dir', default='',
+        help='optional directory containing WSI files, including .sdpc, used to read slide sizes')
+    parser.add_argument('--wsi-recursive', action='store_true',
+        help='search --wsi-dir recursively')
+    parser.add_argument('--wsi-extensions', nargs='*', default=list(DEFAULT_WSI_EXTENSIONS),
+        help='WSI file extensions to scan under --wsi-dir; default includes sdpc, svs, tif, tiff, mrxs, ndpi, scn')
+    parser.add_argument('--slide-reader', default='auto', choices=['auto', 'openslide', 'opensdpc'],
+        help='slide reader used for WSI sizes; auto tries OpenSlide first, then opensdpc for sdpc-like files')
     parser.add_argument('--patch-scale', type=int, default=0,
         help='level-0 pixels per patch; 0 infers from h5 coordinates when --h5-dir is set, otherwise uses 512')
     parser.add_argument('--prompt-type', default='mask',
@@ -722,12 +919,23 @@ def parse_args():
     parser.add_argument('--wsi-label-mode', default='binary', choices=['binary', 'single-label', 'max-label', 'multi-label'],
         help='wsi_label policy when --data-info-out is used')
     parser.add_argument('--no-openslide', action='store_true',
-        help='do not try to read WSI dimensions with OpenSlide; require --size-json or matching --h5-dir metadata')
+        help='do not try OpenSlide; if --slide-reader=auto, opensdpc may still be used for .sdpc files')
     parser.add_argument('--no-clip', action='store_true',
         help='raise on normalized coordinates outside [0,1] instead of clipping')
     args = parser.parse_args()
-    if not args.xml_out and not args.mask_out and not args.h5_label_out and not args.data_info_out:
-        parser.error('provide at least one of --xml-out, --mask-out, --h5-label-out, or --data-info-out')
+    if args.write_size_json_only:
+        if not args.wsi_dir:
+            parser.error('--write-size-json-only requires --wsi-dir')
+        if not args.size_json_out:
+            parser.error('--write-size-json-only requires --size-json-out')
+        return args
+    if not args.csv:
+        parser.error('--csv is required unless --write-size-json-only is used')
+    if not args.xml_out and not args.mask_out and not args.h5_label_out and not args.data_info_out and not args.size_json_out:
+        parser.error(
+            'provide at least one of --xml-out, --mask-out, --h5-label-out, '
+            '--data-info-out, or --size-json-out'
+        )
     if not args.label_map and not args.auto_label_map:
         parser.error('provide --label-map, or use --auto-label-map to create one from CSV labels')
     if args.h5_label_out and not args.h5_dir:
@@ -739,13 +947,46 @@ def parse_args():
 
 def main():
     args = parse_args()
+    slide_readers = requested_slide_readers(args)
+
+    wsi_size_map = {}
+    wsi_size_json = {}
+    if args.wsi_dir:
+        wsi_size_map, wsi_size_json = build_wsi_size_maps(
+            args.wsi_dir,
+            extensions=args.wsi_extensions,
+            recursive=args.wsi_recursive,
+            readers=slide_readers,
+            name_mode=args.name_mode,
+        )
+
+    if args.write_size_json_only:
+        write_size_json(wsi_size_json, args.size_json_out)
+        print(f'wsi files scanned: {len(wsi_size_json)}')
+        print(f'size_json written: {args.size_json_out}')
+        return
+
     label_map = load_label_map(args.label_map)
     size_map = load_size_map(args.size_json)
     h5_files = find_h5_files(args.h5_dir)
     h5_metadata, inferred_patch_scales = infer_h5_metadata(h5_files, args.patch_scale) if h5_files else ({}, {})
     args.patch_scale = choose_patch_scale(args, h5_metadata, inferred_patch_scales)
     h5_size_map = h5_size_map_from_metadata(h5_metadata, args.patch_scale)
-    regions_by_slide, skipped = read_regions(args, label_map, size_map, h5_size_map)
+    if args.size_json_out:
+        combined_size_json = {}
+        combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in size_map.items()})
+        combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in h5_size_map.items()})
+        combined_size_json.update(wsi_size_json)
+        write_size_json(combined_size_json, args.size_json_out)
+
+    regions_by_slide, skipped = read_regions(
+        args,
+        label_map,
+        size_map,
+        h5_size_map,
+        wsi_size_map,
+        slide_readers=slide_readers,
+    )
     if not regions_by_slide:
         raise SystemExit('No regions were converted. Check labels, label map, and --positive-labels.')
     write_label_map(label_map, args.label_map_out)
@@ -785,6 +1026,8 @@ def main():
         print(f'h5 patch label arrays written: {h5_label_count} -> {args.h5_label_out}')
     if args.label_map_out:
         print(f'label_map written: {args.label_map_out}')
+    if args.size_json_out:
+        print(f'size_json written: {args.size_json_out}')
     if args.data_info_out:
         print(f'data_info written: {args.data_info_out}')
     if skipped:
