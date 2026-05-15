@@ -18,6 +18,8 @@ DUMP_RECORDS="${DUMP_RECORDS:-records/${DATASET_NAME}_${PROMPT_TYPE}_eval.npy}"
 CLASS_NUM="${CLASS_NUM:-1}"
 H5_COORDINATE_MODE="${H5_COORDINATE_MODE:-grid}"
 H5_PATCH_SIZE="${H5_PATCH_SIZE:-0}"
+SEG="${SEG:-0}"
+MULTILABEL="${MULTILABEL:-0}"
 EXAMPLE_NUM="${EXAMPLE_NUM:-1}"
 RUNS="${RUNS:-1}"
 VAL_NUM="${VAL_NUM:-6}"
@@ -90,6 +92,14 @@ if [[ -n "${CONFORMAL_ALPHA}" ]]; then
   RESEARCH_ARGS+=(--conformal_alpha "${CONFORMAL_ALPHA}")
 fi
 
+SEG_ARGS=()
+if [[ "${SEG}" == "1" || "${SEG}" == "true" || "${SEG}" == "TRUE" ]]; then
+  SEG_ARGS+=(--seg)
+fi
+if [[ "${MULTILABEL}" == "1" || "${MULTILABEL}" == "true" || "${MULTILABEL}" == "TRUE" ]]; then
+  SEG_ARGS+=(--multilabel)
+fi
+
 EXTRA_ARGS=("$@")
 
 "${PYTHON_BIN}" core/main.py \
@@ -116,6 +126,7 @@ EXTRA_ARGS=("$@")
   --h5_patch_size "${H5_PATCH_SIZE}" \
   --runs "${RUNS}" \
   --dump_records "${DUMP_RECORDS}" \
+  ${SEG_ARGS[@]+"${SEG_ARGS[@]}"} \
   ${SPARSE_ARGS[@]+"${SPARSE_ARGS[@]}"} \
   ${RESEARCH_ARGS[@]+"${RESEARCH_ARGS[@]}"} \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

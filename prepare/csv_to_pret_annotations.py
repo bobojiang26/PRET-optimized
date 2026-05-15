@@ -1,4 +1,5 @@
 import argparse
+import ast
 import csv
 import json
 import math
@@ -6,6 +7,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import unquote
 from xml.sax.saxutils import escape
 
 
@@ -18,12 +20,24 @@ PRET_XML_IDS = {
 
 
 def load_label_map(path):
+    if not path:
+        return {}
     with open(path, 'r', encoding='utf8') as f:
         raw = json.load(f)
     out = {}
     for label, value in raw.items():
         out[str(label)] = int(value)
     return out
+
+
+def write_label_map(label_map, path):
+    if not path:
+        return
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, 'w', encoding='utf8') as f:
+        json.dump(label_map, f, ensure_ascii=False, indent=4)
 
 
 def load_size_map(path):
@@ -46,15 +60,20 @@ def normalize_header(name):
     return name.strip().strip('"').strip("'").lower()
 
 
+def decode_wsi_path(path):
+    path = str(path).strip()
+    return unquote(path) if '%' in path else path
+
+
 def slide_name_from_path(wsi_path, name_mode):
-    base = os.path.basename(wsi_path)
+    base = os.path.basename(decode_wsi_path(wsi_path))
     if name_mode == 'basename':
         return base
     return os.path.splitext(base)[0]
 
 
 def resolve_wsi_path(raw_path, csv_path):
-    raw_path = raw_path.strip()
+    raw_path = decode_wsi_path(raw_path)
     if os.path.isabs(raw_path):
         return raw_path
     return os.path.abspath(os.path.join(os.path.dirname(csv_path), raw_path))
@@ -62,10 +81,14 @@ def resolve_wsi_path(raw_path, csv_path):
 
 def lookup_slide_size(wsi_path, slide_name, size_map, h5_size_map=None, use_openslide=True):
     h5_size_map = h5_size_map or {}
+    decoded_wsi_path = decode_wsi_path(wsi_path)
     candidates = [
         wsi_path,
+        decoded_wsi_path,
         os.path.abspath(wsi_path),
+        os.path.abspath(decoded_wsi_path),
         os.path.basename(wsi_path),
+        os.path.basename(decoded_wsi_path),
         slide_name,
     ]
     for key in candidates:
@@ -123,10 +146,45 @@ def parse_points(coord_text, width, height, clip=True):
     return points
 
 
-def label_to_id(label, label_map):
+def normalize_label_value(value):
+    label = str(value).strip()
+    while len(label) >= 2 and label[0] == label[-1] and label[0] in ['"', "'"]:
+        label = label[1:-1].strip()
+    return label
+
+
+def flatten_label_values(value):
+    if isinstance(value, (list, tuple, set)):
+        labels = []
+        for item in value:
+            labels.extend(flatten_label_values(item))
+        return labels
+    label = normalize_label_value(value)
+    return [label] if label else []
+
+
+def parse_label_values(label_text):
+    raw = str(label_text).strip()
+    if not raw:
+        return []
+
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return flatten_label_values(loader(raw))
+        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+            pass
+
+    return flatten_label_values(raw)
+
+
+def label_to_id(label, label_map, auto=False):
     label = str(label).strip()
     if label in label_map:
         return label_map[label]
+    if auto:
+        next_id = max(label_map.values(), default=0) + 1
+        label_map[label] = next_id
+        return next_id
     try:
         return int(label)
     except ValueError as exc:
@@ -164,28 +222,34 @@ def read_regions(args, label_map, size_map, h5_size_map=None):
 
         for row_idx, row in enumerate(reader, start=2):
             raw_wsi_path = row[field_lookup['wsi_path']]
-            label = str(row[field_lookup['labels']]).strip()
+            labels = parse_label_values(row[field_lookup['labels']])
             coords = row[field_lookup['coordinates']]
-            label_id = label_to_id(label, label_map)
-            if not should_keep_label(label, label_id, positive_labels, args.include_zero_labels):
-                skipped[label] += 1
-                continue
-
             wsi_path = resolve_wsi_path(raw_wsi_path, csv_path)
             slide_name = slide_name_from_path(wsi_path, args.name_mode)
             width, height = lookup_slide_size(
                 wsi_path, slide_name, size_map, h5_size_map, use_openslide=not args.no_openslide
             )
             points = parse_points(coords, width, height, clip=not args.no_clip)
-            regions_by_slide[slide_name].append({
-                'row': row_idx,
-                'wsi_path': wsi_path,
-                'label': label,
-                'label_id': label_id,
-                'annotation_id': pret_annotation_id(label_id, args.prompt_type),
-                'points': points,
-                'size': (width, height),
-            })
+
+            if not labels:
+                skipped['<empty>'] += 1
+                continue
+
+            for label in labels:
+                label_id = label_to_id(label, label_map, auto=args.auto_label_map)
+                if not should_keep_label(label, label_id, positive_labels, args.include_zero_labels):
+                    skipped[label] += 1
+                    continue
+
+                regions_by_slide[slide_name].append({
+                    'row': row_idx,
+                    'wsi_path': wsi_path,
+                    'label': label,
+                    'label_id': label_id,
+                    'annotation_id': pret_annotation_id(label_id, args.prompt_type),
+                    'points': points,
+                    'size': (width, height),
+                })
     return regions_by_slide, skipped
 
 
@@ -282,7 +346,10 @@ def find_h5_files(path):
     h5_files = {}
     for name in sorted(os.listdir(path)):
         if name.lower().endswith(('.h5', '.hdf5')):
-            h5_files[os.path.splitext(name)[0]] = os.path.join(path, name)
+            stem = os.path.splitext(name)[0]
+            h5_path = os.path.join(path, name)
+            h5_files[stem] = h5_path
+            h5_files[decode_wsi_path(stem)] = h5_path
     return h5_files
 
 
@@ -463,17 +530,14 @@ def fill_polygon_numpy(mask, contour):
     mask[min_y:max_y, min_x:max_x][inside] = 1
 
 
-def labels_for_h5_coordinates(regions, h5_path, patch_scale):
+def labels_from_mid_mask(coords, mid, mid_scale, patch_scale):
     try:
         import numpy as np
     except ImportError as exc:
         raise RuntimeError('Writing h5 patch labels requires numpy') from exc
 
-    coords = read_h5_coordinates(h5_path)
-    mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
     labels = np.zeros(coords.shape[0], dtype=np.uint8)
     mid_h, mid_w = mid.shape
-
     for idx, coord in enumerate(coords):
         x0 = float(coord[0])
         y0 = float(coord[1])
@@ -489,7 +553,48 @@ def labels_for_h5_coordinates(regions, h5_path, patch_scale):
     return labels
 
 
-def write_h5_label_files(regions_by_slide, h5_dir, h5_label_out, patch_scale):
+def labels_for_h5_coordinates(regions, h5_path, patch_scale, multi_label=False, class_num=0, binary_labels=True):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+
+    coords = read_h5_coordinates(h5_path)
+
+    if multi_label:
+        if class_num <= 0:
+            raise ValueError('--multi-label h5 label writing requires at least one class')
+        labels = np.zeros((coords.shape[0], class_num), dtype=np.uint8)
+        for cls in range(1, class_num + 1):
+            cls_regions = [r for r in regions if int(r['label_id']) == cls]
+            if not cls_regions:
+                continue
+            mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
+            labels[:, cls - 1] = labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+        return labels
+
+    if binary_labels:
+        mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
+        return labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+
+    labels = np.zeros(coords.shape[0], dtype=np.uint16)
+    for cls in sorted({int(r['label_id']) for r in regions}):
+        cls_regions = [r for r in regions if int(r['label_id']) == cls]
+        mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
+        cls_hits = labels_from_mid_mask(coords, mid, mid_scale, patch_scale)
+        labels[cls_hits == 1] = cls
+    return labels
+
+
+def write_h5_label_files(
+    regions_by_slide,
+    h5_dir,
+    h5_label_out,
+    patch_scale,
+    multi_label=False,
+    class_num=0,
+    binary_labels=True,
+):
     if not h5_label_out:
         return {}, 0
     if not h5_dir:
@@ -507,7 +612,14 @@ def write_h5_label_files(regions_by_slide, h5_dir, h5_label_out, patch_scale):
         if slide_name not in h5_files:
             missing.append(slide_name)
             continue
-        labels = labels_for_h5_coordinates(regions, h5_files[slide_name], patch_scale)
+        labels = labels_for_h5_coordinates(
+            regions,
+            h5_files[slide_name],
+            patch_scale,
+            multi_label=multi_label,
+            class_num=class_num,
+            binary_labels=binary_labels,
+        )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
         pos_counts[slide_name] = int((labels == 1).sum())
@@ -551,13 +663,18 @@ def write_data_info(
             if len(label_ids) != 1:
                 raise ValueError(f'{slide_name} has multiple labels {label_ids}; cannot use single-label mode')
             wsi_label = label_ids[0]
+        elif wsi_label_mode == 'multi-label':
+            wsi_label = None
         else:
             wsi_label = max(label_ids)
 
         item = {
-            'wsi_label': int(wsi_label),
             'fixed_test_set': False,
         }
+        if wsi_label_mode == 'multi-label':
+            item['wsi_labels'] = [int(_) for _ in label_ids]
+        else:
+            item['wsi_label'] = int(wsi_label)
         if mask_out:
             item['patch_labels'] = os.path.join(mask_out, slide_name + '.png')
         if h5_label_out:
@@ -578,7 +695,11 @@ def parse_args():
         description='Convert normalized CSV annotations to PRET-compatible XML and optional patch-mask PNGs.'
     )
     parser.add_argument('--csv', required=True, help='CSV with wsi_path, labels, coordinates columns')
-    parser.add_argument('--label-map', required=True, help='JSON mapping label names to integer ids')
+    parser.add_argument('--label-map', default='', help='optional JSON mapping label names to integer ids')
+    parser.add_argument('--auto-label-map', action='store_true',
+        help='assign missing labels ids in first-seen CSV order, starting at max(existing ids)+1')
+    parser.add_argument('--label-map-out', default='',
+        help='optional path to write the final label map, useful with --auto-label-map')
     parser.add_argument('--xml-out', default='', help='directory to write PRET-compatible XML files')
     parser.add_argument('--mask-out', default='', help='optional directory to write PRET patch-grid PNG masks')
     parser.add_argument('--h5-dir', default='', help='optional directory containing per-slide h5 feature files')
@@ -598,7 +719,7 @@ def parse_args():
         help='keep rows whose mapped label id is 0')
     parser.add_argument('--name-mode', default='stem', choices=['stem', 'basename'],
         help='output XML/PNG slide key from WSI stem or full basename')
-    parser.add_argument('--wsi-label-mode', default='binary', choices=['binary', 'single-label', 'max-label'],
+    parser.add_argument('--wsi-label-mode', default='binary', choices=['binary', 'single-label', 'max-label', 'multi-label'],
         help='wsi_label policy when --data-info-out is used')
     parser.add_argument('--no-openslide', action='store_true',
         help='do not try to read WSI dimensions with OpenSlide; require --size-json or matching --h5-dir metadata')
@@ -607,6 +728,8 @@ def parse_args():
     args = parser.parse_args()
     if not args.xml_out and not args.mask_out and not args.h5_label_out and not args.data_info_out:
         parser.error('provide at least one of --xml-out, --mask-out, --h5-label-out, or --data-info-out')
+    if not args.label_map and not args.auto_label_map:
+        parser.error('provide --label-map, or use --auto-label-map to create one from CSV labels')
     if args.h5_label_out and not args.h5_dir:
         parser.error('--h5-dir is required when --h5-label-out is set')
     if args.patch_scale < 0:
@@ -625,11 +748,21 @@ def main():
     regions_by_slide, skipped = read_regions(args, label_map, size_map, h5_size_map)
     if not regions_by_slide:
         raise SystemExit('No regions were converted. Check labels, label map, and --positive-labels.')
+    write_label_map(label_map, args.label_map_out)
 
     xml_count = write_xml_files(regions_by_slide, args.xml_out)
     pos_counts, mask_count = write_mask_files(regions_by_slide, args.mask_out, args.patch_scale)
+    h5_multi_label = args.wsi_label_mode == 'multi-label'
+    h5_binary_labels = args.wsi_label_mode == 'binary'
+    class_num = max(label_map.values(), default=0)
     h5_pos_counts, h5_label_count = write_h5_label_files(
-        regions_by_slide, args.h5_dir, args.h5_label_out, args.patch_scale
+        regions_by_slide,
+        args.h5_dir,
+        args.h5_label_out,
+        args.patch_scale,
+        multi_label=h5_multi_label,
+        class_num=class_num,
+        binary_labels=h5_binary_labels,
     )
     write_data_info(
         regions_by_slide,
@@ -650,6 +783,8 @@ def main():
         print(f'mask png files written: {mask_count} -> {args.mask_out}')
     if h5_label_count:
         print(f'h5 patch label arrays written: {h5_label_count} -> {args.h5_label_out}')
+    if args.label_map_out:
+        print(f'label_map written: {args.label_map_out}')
     if args.data_info_out:
         print(f'data_info written: {args.data_info_out}')
     if skipped:

@@ -169,7 +169,9 @@ The CSV annotation file must have three columns:
 wsi_path,labels,coordinates
 ```
 
-`wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. You can still provide one to override the inferred sizes:
+`wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. URL-escaped slide names are decoded before matching h5 files. For example, `2026-004317%238%231.sdpc` is converted to `2026-004317#8#1` and then matched with `2026-004317#8#1.h5`; if the CSV already contains `#`, the name is kept unchanged. The `labels` field may be a plain label or a JSON/Python-style list such as `["fibroadenoma"]`.
+
+Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided, the converter can infer each slide size from the h5 `coordinates` as `max_coordinate + inferred_patch_size`, so a `--size-json` file is optional. You can still provide one to override the inferred sizes:
 
 ```json
 {
@@ -178,30 +180,40 @@ wsi_path,labels,coordinates
 }
 ```
 
+Label conversion rules:
+
+* `--auto-label-map` assigns IDs by first appearance in the CSV: the first new tumor name becomes `1`, the next new tumor name becomes `2`, and so on. Use `--label-map-out` to save this mapping. If you already have a stable mapping, pass it with `--label-map` instead.
+* For binary or ordinary single-label multiclass tasks, use `--wsi-label-mode binary`, `single-label`, or `max-label`. The generated `data_info` writes only `wsi_label`.
+* For multi-label tasks, use `--wsi-label-mode multi-label`. The generated `data_info` writes only `wsi_labels`, for example `"wsi_labels": [1, 3, 5]`; it does not write `wsi_label`.
+* With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)` and is multi-hot by class. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array.
+
 First generate h5-aligned patch labels and a PRET `data_info` file:
 
 ```
 python prepare/csv_to_pret_annotations.py \
   --csv /path/to/annotations.csv \
-  --label-map /path/to/label_map.json \
+  --auto-label-map \
+  --label-map-out data_info/MY_H5_label_map.json \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
   --patch-scale 0 \
   --prompt-type mask \
+  --wsi-label-mode multi-label \
   --no-openslide
 ```
 
 This writes:
 
 * `data/MY_H5/patch/h5_labels/{slide}.npy`: one label array per slide, strictly aligned to the h5 `features` row order.
-* `data_info/MY_H5_mask.json`: slide-level labels plus `h5_patch_labels` and `pos_patch_num`.
+* `data_info/MY_H5_mask.json`: slide-level `wsi_labels`, `h5_patch_labels`, and `pos_patch_num`.
+* `data_info/MY_H5_label_map.json`: label names assigned in first-seen CSV order as `1, 2, 3, ...`.
 
 Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`.
 
-By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for evaluation, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`.
+By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for a binary or single-label task, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`. For multi-label tasks, a negative slide should use `wsi_labels: []`.
 
-Then run h5 `mask` evaluation:
+Then run h5 WSI-level multi-label evaluation. PRET fits one threshold per class on the validation split, combines the per-class decisions back into a multi-hot WSI prediction such as `[1, 0, 0, 0, 1, 0]`, and reports multi-label metrics:
 
 ```
 DATASET_NAME=MY_H5 \
@@ -209,7 +221,8 @@ H5_DIR=data/MY_H5/h5 \
 DATASET_INFO=data_info/MY_H5_mask.json \
 DUMP_FEATURES=data/MY_H5/collected_features_mask \
 PROMPT_TYPE=mask \
-CLASS_NUM=1 \
+MULTILABEL=1 \
+CLASS_NUM=6 \
 H5_COORDINATE_MODE=pixel \
 H5_PATCH_SIZE=0 \
 EXAMPLE_NUM=8 \
@@ -218,6 +231,8 @@ TEST_NUM=-1 \
 RUNS=5 \
 bash scripts/run_h5_eval.sh
 ```
+
+Set `CLASS_NUM` to the number of entries in the generated label map. Add `SEG=1` only when you want patch-level segmentation metrics instead of WSI-level multi-label classification metrics.
 
 Use a fresh `DUMP_FEATURES` directory for mask runs, because PRET skips feature collection when a cached `dump_features/{slide}.npy` file already exists.
 

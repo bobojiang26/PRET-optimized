@@ -19,7 +19,9 @@ import argparse
 import random
 import json
 import time
+import math
 from contextlib import contextmanager
+from urllib.parse import unquote
 
 import h5py
 import torch
@@ -30,7 +32,7 @@ import torchmetrics
 import numpy as np
 import cv2
 import openslide
-from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss, precision_recall_curve, roc_auc_score
 
 from modules import inference, load_weak_prompts, execute_tagger, \
         execute_subtyping_tagger, execute_miner
@@ -512,10 +514,71 @@ def find_h5_files(path):
     return sorted(files)
 
 
+def decode_slide_key(name):
+    name = str(name).strip()
+    return unquote(name) if '%' in name else name
+
+
+def h5_slide_stem(h5_path):
+    return os.path.splitext(os.path.basename(h5_path))[0]
+
+
+def h5_slide_key(h5_path):
+    return decode_slide_key(h5_slide_stem(h5_path))
+
+
+def h5_file_map(h5_files):
+    out = {}
+    for h5_path in h5_files:
+        stem = h5_slide_stem(h5_path)
+        out[stem] = h5_path
+        out[decode_slide_key(stem)] = h5_path
+    return out
+
+
+def get_dataset_slide_entry(dataset_info, slide_name, raw_slide_name=None):
+    if slide_name in dataset_info:
+        return slide_name
+    if raw_slide_name is not None and raw_slide_name in dataset_info:
+        dataset_info[slide_name] = dataset_info.pop(raw_slide_name)
+        return slide_name
+    dataset_info[slide_name] = {}
+    return slide_name
+
+
 def get_pseudo_label(idx, cls_num):
     if cls_num <= 1:
         return idx % 2
     return idx % cls_num + 1
+
+
+def get_wsi_label_ids(info):
+    if 'wsi_labels' in info:
+        labels = info['wsi_labels']
+        if isinstance(labels, (list, tuple, set)):
+            return sorted({int(_) for _ in labels})
+        return [int(labels)]
+    label = int(info.get('wsi_label', 0))
+    return [label] if label > 0 else []
+
+
+def has_wsi_label(info, cls):
+    return int(cls) in set(get_wsi_label_ids(info))
+
+
+def dataset_is_multilabel(dataset_info, args=None):
+    if args is not None and getattr(args, 'multilabel', False):
+        return True
+    return any('wsi_labels' in info for info in dataset_info.values())
+
+
+def infer_dataset_class_num(dataset_info):
+    max_label = 0
+    for info in dataset_info.values():
+        labels = get_wsi_label_ids(info)
+        if labels:
+            max_label = max(max_label, max(labels))
+    return max_label
 
 
 def normalize_multiclass_wsi_labels(dataset_info, class_num):
@@ -548,13 +611,12 @@ def load_dataset_info(args):
         created_or_filled = False
         missing_label_slides = []
         for idx, h5_path in enumerate(h5_files):
-            slide_name = os.path.splitext(os.path.basename(h5_path))[0]
-            if slide_name not in dataset_info:
-                dataset_info[slide_name] = {}
+            raw_slide_name = h5_slide_stem(h5_path)
+            slide_name = get_dataset_slide_entry(dataset_info, h5_slide_key(h5_path), raw_slide_name)
             dataset_info[slide_name]['h5_input'] = True
             if 'fixed_test_set' not in dataset_info[slide_name]:
                 dataset_info[slide_name]['fixed_test_set'] = False
-            if 'wsi_label' not in dataset_info[slide_name]:
+            if 'wsi_label' not in dataset_info[slide_name] and 'wsi_labels' not in dataset_info[slide_name]:
                 dataset_info[slide_name]['wsi_label'] = get_pseudo_label(idx, args.c)
                 dataset_info[slide_name]['pseudo_label'] = True
                 created_or_filled = True
@@ -563,11 +625,20 @@ def load_dataset_info(args):
         if created_or_filled:
             print('[warning] Missing slide labels for h5 inputs. PRET assigned deterministic pseudo labels by file order; metrics are for pipeline smoke tests only.')
             preview = ', '.join(missing_label_slides[:20])
-            print(f'[warning] Missing wsi_label for {len(missing_label_slides)} h5 slide(s): {preview}')
+            print(f'[warning] Missing wsi_label/wsi_labels for {len(missing_label_slides)} h5 slide(s): {preview}')
             if len(missing_label_slides) > 20:
                 print(f'[warning] ... {len(missing_label_slides) - 20} more h5 slide(s) omitted.')
 
-    normalize_multiclass_wsi_labels(dataset_info, args.c)
+    if dataset_is_multilabel(dataset_info, args):
+        inferred_class_num = infer_dataset_class_num(dataset_info)
+        if args.c < inferred_class_num:
+            print(
+                f'[warning] Inferred {inferred_class_num} classes from wsi_labels; '
+                f'overriding --class_num={args.c}.'
+            )
+            args.c = inferred_class_num
+    else:
+        normalize_multiclass_wsi_labels(dataset_info, args.c)
     return dataset_info
 
 
@@ -641,6 +712,15 @@ def h5_coord_to_patch_xy(coord, args, patch_size=None):
     return int(coord[0]), int(coord[1])
 
 
+def infer_h5_grid_size(coords, args, patch_size=None):
+    patch_xy = [h5_coord_to_patch_xy(coord, args, patch_size) for coord in coords]
+    if not patch_xy:
+        return None
+    max_x = max(x for x, _ in patch_xy)
+    max_y = max(y for _, y in patch_xy)
+    return (int(max_y) + 1, int(max_x) + 1)
+
+
 def load_h5_patch_labels(info, coords, args, patch_size=None):
     if 'h5_patch_labels' in info:
         labels = np.load(info['h5_patch_labels']).astype(np.uint8, copy=False)
@@ -695,7 +775,7 @@ def feature_processor(args):
     print_memory_usage('feature_processor start')
     io_start = time.perf_counter()
     dataset_info = load_dataset_info(args)
-    h5_map = {os.path.splitext(os.path.basename(p))[0]: p for p in find_h5_files(args.raw_feature_path)}
+    h5_map = h5_file_map(find_h5_files(args.raw_feature_path))
     os.makedirs(args.dump_features, exist_ok=True)
 
     for k, v in dataset_info.items():
@@ -708,16 +788,22 @@ def feature_processor(args):
             feats, coords = load_h5_feature_file(h5_map[k])
             h5_patch_size = get_h5_patch_size(args, coords, context=h5_map[k])
             patch_label = load_h5_patch_labels(v, coords, args, h5_patch_size)
+            h5_grid_size = infer_h5_grid_size(coords, args, h5_patch_size)
             names = []
             for i in range(coords.shape[0]):
                 x, y = h5_coord_to_patch_xy(coords[i], args, h5_patch_size)
                 names.append(os.path.join('h5_features', k, f'{x}_{y}.jpeg'))
-            info = {'features': feats, 'patch_names': names, \
-                'patch_labels': np.array(patch_label), 'wsi_label': v['wsi_label']}
+            info = {'features': feats, 'patch_names': names, 'patch_labels': np.array(patch_label)}
+            if 'wsi_label' in v:
+                info['wsi_label'] = v['wsi_label']
+            if 'wsi_labels' in v:
+                info['wsi_labels'] = v['wsi_labels']
+            if h5_grid_size is not None:
+                info['h5_grid_size'] = h5_grid_size
             np.save(os.path.join(args.dump_features, k + '.npy'), info)
             continue
         
-        wsi_label = v['wsi_label']
+        wsi_label = v.get('wsi_label', 1 if get_wsi_label_ids(v) else 0)
 
         # patch label as segmentation gt, if any
         if 'patch_labels' in v:
@@ -754,6 +840,8 @@ def feature_processor(args):
         # save patch features, name, patch_labels and wsi_labels for eval
         info = {'features': np.stack(feats, 0), 'patch_names': names, \
             'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
+        if 'wsi_labels' in v:
+            info['wsi_labels'] = v['wsi_labels']
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
     
     print('finish feature processing and saving!')
@@ -774,10 +862,13 @@ def macro_value(l, n):
 def get_example_names_at_same_num(all_names, dataset_info, example_num, check_num=False, expected_labels=None):
     record = {}
     for n in all_names:
-        lb = dataset_info[n]['wsi_label']
-        if lb not in record:
-            record[lb] = []
-        record[lb].append(n)
+        labels = get_wsi_label_ids(dataset_info[n])
+        if not labels:
+            labels = [0]
+        for lb in labels:
+            if lb not in record:
+                record[lb] = []
+            record[lb].append(n)
 
     labels = list(expected_labels) if expected_labels is not None else list(record.keys())
     if check_num:
@@ -797,8 +888,12 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
             )
 
     names = []
+    seen = set()
     for k in labels:
-        names.extend(record.get(k, [])[:example_num])
+        for name in record.get(k, [])[:example_num]:
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
 
     return names
 
@@ -806,13 +901,110 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
 def label_counts(names, dataset_info):
     counts = {}
     for n in names:
-        label = dataset_info[n]['wsi_label']
-        counts[label] = counts.get(label, 0) + 1
+        labels = get_wsi_label_ids(dataset_info[n])
+        if not labels:
+            labels = [0]
+        for label in labels:
+            counts[label] = counts.get(label, 0) + 1
     return counts
 
 
 def format_label_counts(counts):
     return ', '.join(f'{k}:{counts[k]}' for k in sorted(counts))
+
+
+def patch_labels_for_class(patch_labels, cls, class_num, multilabel=False):
+    patch_labels = np.asarray(patch_labels)
+    if multilabel:
+        if patch_labels.ndim == 2:
+            out = np.zeros(patch_labels.shape[0], dtype=np.int64)
+            col = int(cls) - 1
+            if 0 <= col < patch_labels.shape[1]:
+                out[patch_labels[:, col] > 0] = 1
+            return out
+        return (patch_labels == int(cls)).astype(np.int64)
+
+    if class_num > 1:
+        out = np.full(patch_labels.shape[0], 255, dtype=np.int64)
+        out[patch_labels == int(cls)] = 1
+        out[(patch_labels > 0) & (patch_labels != int(cls))] = 0
+        if np.any(patch_labels == 1) and not np.any(patch_labels == int(cls)):
+            out[patch_labels == 1] = 0
+        return out
+
+    return patch_labels.astype(np.int64, copy=True)
+
+
+def safe_binary_auc(labels, scores):
+    labels = np.asarray(labels).astype(int)
+    scores = np.asarray(scores, dtype=float)
+    if labels.size == 0 or len(np.unique(labels)) < 2:
+        return float('nan')
+    return float(roc_auc_score(labels, scores))
+
+
+def select_binary_threshold(val_labels, val_preds, prefer_f1=False):
+    labels = np.asarray(val_labels).astype(int)
+    preds = np.asarray(val_preds, dtype=float)
+    if labels.size == 0:
+        return 0.0, float('nan'), float('nan')
+    unique = np.unique(labels)
+    if unique.size < 2:
+        if unique[0] == 1:
+            thresh = float(preds.min() - 1e-6)
+        else:
+            thresh = float(preds.max() + 1e-6)
+        acc = float(((preds > thresh).astype(int) == labels).mean())
+        f1 = float(f1_score(labels, (preds > thresh).astype(int), zero_division=0))
+        return thresh, acc, f1
+
+    precisions, recalls, thresholds = precision_recall_curve(labels, preds)
+    if thresholds.size == 0:
+        thresh = float(np.median(preds))
+        pred_labels = (preds > thresh).astype(int)
+        return thresh, float((pred_labels == labels).mean()), float(f1_score(labels, pred_labels, zero_division=0))
+
+    accs = np.array([((preds > _).astype(int) == labels).mean() for _ in thresholds])
+    if prefer_f1:
+        f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-8)
+        idx = int(np.nanargmax(f1_scores))
+    else:
+        idx = int(np.nanargmax(accs))
+    thresh = float(thresholds[idx])
+    pred_labels = (preds > thresh).astype(int)
+    return thresh, float(accs[idx]), float(f1_score(labels, pred_labels, zero_division=0))
+
+
+def multilabel_metrics(y_true, y_score, y_pred):
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score, dtype=float)
+    y_pred = np.asarray(y_pred).astype(int)
+    per_class_auc = []
+    for cls_idx in range(y_true.shape[1]):
+        per_class_auc.append(safe_binary_auc(y_true[:, cls_idx], y_score[:, cls_idx]))
+    valid_auc = [v for v in per_class_auc if np.isfinite(v)]
+    flat_auc = safe_binary_auc(y_true.reshape(-1), y_score.reshape(-1))
+    return {
+        'acc_exact_match': float(accuracy_score(y_true, y_pred)),
+        'acc_hamming': float(1.0 - hamming_loss(y_true, y_pred)),
+        'auc_micro': flat_auc,
+        'auc_macro': float(np.mean(valid_auc)) if valid_auc else float('nan'),
+        'auc_per_class': [float(v) if np.isfinite(v) else None for v in per_class_auc],
+        'f1_micro': float(f1_score(y_true, y_pred, average='micro', zero_division=0)),
+        'f1_macro': float(f1_score(y_true, y_pred, average='macro', zero_division=0)),
+        'f1_samples': float(f1_score(y_true, y_pred, average='samples', zero_division=0)),
+    }
+
+
+def format_metric_value(value):
+    if value is None:
+        return 'nan'
+    try:
+        if not np.isfinite(value):
+            return 'nan'
+    except TypeError:
+        pass
+    return str(round(float(value), 4))
 
 
 def select_validation_names(rest_names, dataset_info, val_num, balanced=False):
@@ -825,7 +1017,8 @@ def select_validation_names(rest_names, dataset_info, val_num, balanced=False):
 
     grouped = {}
     for n in rest_names:
-        label = dataset_info[n]['wsi_label']
+        labels = get_wsi_label_ids(dataset_info[n])
+        label = tuple(labels) if len(labels) > 1 else (labels[0] if labels else 0)
         grouped.setdefault(label, []).append(n)
 
     if len(grouped) <= 1:
@@ -895,9 +1088,10 @@ class GaussianBlur(nn.Module):
 
 def evaluate(args, val_only=False):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
-    aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
     dataset_info = load_dataset_info(args)
-    all_names = dataset_info.keys()
+    multilabel = dataset_is_multilabel(dataset_info, args)
+    all_names = list(dataset_info.keys())
+    multilabel_repeat_metrics = []
 
     records = {}
     txt_rec = []
@@ -945,7 +1139,7 @@ def evaluate(args, val_only=False):
                         labeled_names.append(n)
                 
                 # record neg names to exclude from seg val /test
-                if dataset_info[n]['wsi_label'] == 0:
+                if len(get_wsi_label_ids(dataset_info[n])) == 0:
                     neg_names.append(n)
 
         # shuffle example till each run is different
@@ -1020,6 +1214,7 @@ def evaluate(args, val_only=False):
         # ====================== run for each class ======================
 
         # for subtyping, use different example for each cls and apply marco metics, other tasks have one class
+        multilabel_repeat = {}
         for cls in range(1, args.c + 1):
 
             # ====================== process example and prompts ======================
@@ -1031,22 +1226,33 @@ def evaluate(args, val_only=False):
             io_start = time.perf_counter()
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
-                example_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else example_n['wsi_label']
+                if multilabel and n in dataset_info:
+                    example_wsi_label = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                else:
+                    example_wsi_label = dataset_info[n].get('wsi_label', example_n.get('wsi_label', 0)) if n in dataset_info else example_n.get('wsi_label', 0)
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
                 example_feature_names.append(n)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    raw_pl = np.asarray(example_n['patch_labels'])
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
-                        pl[pl == 0] = 255
-                        if example_wsi_label != cls:
-                            pl[pl == 1] = 0
+                        if multilabel:
+                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=True)
+                        elif raw_pl.ndim == 1 and set(np.unique(raw_pl).tolist()).issubset({0, 1}):
+                            pl = raw_pl.astype(np.int64, copy=True)
+                            pl[pl == 0] = 255
+                            if example_wsi_label != cls:
+                                pl[pl == 1] = 0
+                            else:
+                                pl[pl == 1] = 1
                         else:
-                            pl[pl == 1] = 1
+                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=False)
+                    else:
+                        pl = raw_pl.astype(np.int64, copy=True)
                     
                 else:
                     pl = np.zeros(example_n['features'].shape[0]) - 1
@@ -1054,7 +1260,9 @@ def evaluate(args, val_only=False):
                 # load weak prompts
                 # slideLabel + subtyping is uniqe in pseudo label generation
                 if args.prompt_type == "slideLabel" and args.c > 1:
-                    if example_wsi_label != cls:
+                    if multilabel:
+                        pl[:] = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                    elif example_wsi_label != cls:
                         pl[:] = 0
                     else:
                         pl[:] = 1
@@ -1067,7 +1275,10 @@ def evaluate(args, val_only=False):
                     #  record wsi label for each patch for later label convert
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        pl[pl == -1] = 1 if example_wsi_label == cls else 0
+                        if multilabel:
+                            pl[pl == -1] = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                        else:
+                            pl[pl == -1] = 1 if example_wsi_label == cls else 0
 
                 example_labels.append(pl)
             
@@ -1101,13 +1312,13 @@ def evaluate(args, val_only=False):
                     vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
 
             # assign in-context tags for subtyping from slideLabel (255 normal, 254 uncertain, 1 this class, 0 other classes)
-            if args.prompt_type == 'slideLabel' and args.c > 1:
+            if args.prompt_type == 'slideLabel' and args.c > 1 and not multilabel:
                 example_labels = execute_subtyping_tagger(example_feats, example_labels, example_patch_names, \
                     example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
             
             # subtyping + box / roughMask. Need to process "execute_tagger" twice. 
             # Once for shared bg and this class, another for shared bg and other classes
-            if args.prompt_type != 'slideLabel' and args.c > 1:
+            if args.prompt_type != 'slideLabel' and args.c > 1 and not multilabel:
                 
                 if args.prompt_type != 'mask':
                     example_labels_this = example_labels.clone()
@@ -1160,9 +1371,12 @@ def evaluate(args, val_only=False):
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.from_numpy(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
-                label = dataset_info[n]['wsi_label'] if n in dataset_info else query_n['wsi_label']
-                if args.c > 1:
-                    label = int(label == cls)
+                if multilabel and n in dataset_info:
+                    label = int(has_wsi_label(dataset_info[n], cls))
+                else:
+                    label = dataset_info[n].get('wsi_label', query_n.get('wsi_label', 0)) if n in dataset_info else query_n.get('wsi_label', 0)
+                    if args.c > 1:
+                        label = int(label == cls)
                 
                 class_timer.add('io.query', time.perf_counter() - io_start)
                 example_feats_for_query, query_feats = align_torch_feature_pair(
@@ -1175,7 +1389,7 @@ def evaluate(args, val_only=False):
 
                 # use fg patches for subtyping
                 #if args.c > 1 and not args.seg and args.vis_path == '': # vis wo fg
-                if args.c > 1 and not args.seg:
+                if args.c > 1 and not args.seg and not multilabel:
                     miner_start = time.perf_counter()
                     query_feats, query_patch_names = execute_miner(example_feats_for_query[example_labels == 255], \
                         query_feats, query_patch_names, uncertain=args.ignore_query)
@@ -1185,6 +1399,8 @@ def evaluate(args, val_only=False):
 
                 infer_start = time.perf_counter()
                 size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
+                if size is None and 'h5_grid_size' in query_n:
+                    size = tuple(int(v) for v in query_n['h5_grid_size'])
                 vis_info = None
                 
                 sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
@@ -1197,7 +1413,7 @@ def evaluate(args, val_only=False):
                     np.save(os.path.join(args.vis_path, n + '_' + str(cls) + '.npy'), patch_pred.cpu().numpy())
                 
                 if args.seg:
-                    pred = torch.tensor(patch_pred_list)
+                    pred = torch.as_tensor(patch_pred_list)
                     label = torch.tensor(query_n['patch_labels'])
                 else:
                     pred = torch.tensor([wsi_pred])
@@ -1219,22 +1435,14 @@ def evaluate(args, val_only=False):
             validation_start = time.perf_counter()
             val_preds = torch.cat(val_preds).cpu()
             val_labels = torch.cat(val_labels)
-            val_auc = aucroc(val_preds, val_labels).item()
+            val_auc = safe_binary_auc(val_labels.numpy(), val_preds.numpy())
             if not val_only:
                 test_preds = torch.cat(test_preds).cpu()
                 test_labels = torch.cat(test_labels)
             
-            precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
-            if args.seg:
-                f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
-                best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
-                best_acc_score = accs[best_f1_score_index]
-                thresh = thresholds[best_f1_score_index]
-            else:
-                best_acc_score = np.max(accs[np.isfinite(accs)])
-                best_acc_score_index = np.argmax(accs[np.isfinite(accs)])
-                thresh = thresholds[best_acc_score_index]
+            thresh, best_acc_score, _ = select_binary_threshold(
+                val_labels.numpy(), val_preds.numpy(), prefer_f1=args.seg
+            )
 
             if val_only:
                 preds = val_preds
@@ -1250,7 +1458,7 @@ def evaluate(args, val_only=False):
             pred_pos = thresh_preds.sum().clamp_min(1)
             rec = ((thresh_preds * labels).sum() / label_pos).cpu().item()
             pre = ((thresh_preds * labels).sum() / pred_pos).cpu().item()
-            auc = aucroc(preds, labels).item()
+            auc = safe_binary_auc(labels.numpy(), preds.numpy())
             if (rec + pre) != 0:
                 f1 = rec * pre * 2 / (rec + pre)
             else:
@@ -1278,14 +1486,80 @@ def evaluate(args, val_only=False):
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
                 if conformal is not None:
                     records['repeat_' + str(i)]['conformal_cls' + str(cls)] = conformal
+                if multilabel and not args.seg:
+                    multilabel_repeat[cls] = {
+                        'threshold': float(thresh),
+                        'names': list(val_names if val_only else test_names),
+                        'logits': preds.cpu().numpy().reshape(-1),
+                        'labels': labels.cpu().numpy().astype(int).reshape(-1),
+                        'preds': thresh_preds.cpu().numpy().astype(int).reshape(-1),
+                    }
 
             class_timer.add('validation', time.perf_counter() - validation_start)
             repeat_timer.merge(class_timer)
+        if multilabel and not args.seg and multilabel_repeat:
+            names = multilabel_repeat[1]['names']
+            y_score = np.stack([multilabel_repeat[cls]['logits'] for cls in range(1, args.c + 1)], axis=1)
+            y_true = np.stack([multilabel_repeat[cls]['labels'] for cls in range(1, args.c + 1)], axis=1)
+            thresholds = np.array([multilabel_repeat[cls]['threshold'] for cls in range(1, args.c + 1)])
+            y_pred = (y_score > thresholds.reshape(1, -1)).astype(int)
+            metrics = multilabel_metrics(y_true, y_score, y_pred)
+            multilabel_repeat_metrics.append(metrics)
+            preview = [
+                {'name': names[idx], 'pred': y_pred[idx].astype(int).tolist(), 'label': y_true[idx].astype(int).tolist()}
+                for idx in range(min(10, len(names)))
+            ]
+            records['repeat_' + str(i)]['multilabel'] = {
+                'class_thresholds': {str(cls): float(multilabel_repeat[cls]['threshold']) for cls in range(1, args.c + 1)},
+                'names': names,
+                'labels': y_true.astype(int).tolist(),
+                'logits': y_score.tolist(),
+                'preds': y_pred.astype(int).tolist(),
+                'metrics': metrics,
+                'preview': preview,
+            }
+            s = (
+                'multilabel test acc_exact_match: ' + format_metric_value(metrics['acc_exact_match']) +
+                ', acc_hamming: ' + format_metric_value(metrics['acc_hamming']) +
+                ', auc_micro: ' + format_metric_value(metrics['auc_micro']) +
+                ', auc_macro: ' + format_metric_value(metrics['auc_macro']) +
+                ', f1_micro: ' + format_metric_value(metrics['f1_micro']) +
+                ', f1_macro: ' + format_metric_value(metrics['f1_macro']) +
+                ', f1_samples: ' + format_metric_value(metrics['f1_samples'])
+            )
+            print(s)
+            txt_rec.append(s)
+            for item in preview:
+                p = f"multilabel preview {item['name']}: pred={item['pred']}, label={item['label']}"
+                print(p)
+                txt_rec.append(p)
         del example_feats
         torch.cuda.empty_cache()
         repeat_timer.report(total_elapsed=time.perf_counter() - repeat_start)
 
     # ====================== count and record results ======================
+
+    if multilabel and multilabel_repeat_metrics:
+        metric_keys = ['acc_exact_match', 'acc_hamming', 'auc_micro', 'auc_macro', 'f1_micro', 'f1_macro', 'f1_samples']
+        mean_metrics = {}
+        for key in metric_keys:
+            values = np.array([m[key] for m in multilabel_repeat_metrics], dtype=float)
+            mean_metrics[key + '_mean'] = float(np.nanmean(values))
+            mean_metrics[key + '_std'] = float(np.nanstd(values))
+        s = (
+            'multilabel mean acc_exact_match: ' + format_metric_value(mean_metrics['acc_exact_match_mean']) +
+            ', acc_hamming: ' + format_metric_value(mean_metrics['acc_hamming_mean']) +
+            ', auc_micro: ' + format_metric_value(mean_metrics['auc_micro_mean']) +
+            ', auc_macro: ' + format_metric_value(mean_metrics['auc_macro_mean']) +
+            ', f1_micro: ' + format_metric_value(mean_metrics['f1_micro_mean']) +
+            ', f1_macro: ' + format_metric_value(mean_metrics['f1_macro_mean']) +
+            ', f1_samples: ' + format_metric_value(mean_metrics['f1_samples_mean'])
+        )
+        print(s)
+        txt_rec.append(s)
+        records['mean'] = mean_metrics
+        records['text_records'] = txt_rec
+        return round(mean_metrics['auc_macro_mean'], 4), records
 
     auc_mean = np.array(auc_list).mean()
     macro_auc = macro_value(auc_list, args.c)
@@ -1316,6 +1590,7 @@ def evaluate_baseline(args, mode):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
     dataset_info = load_dataset_info(args)
+    multilabel = dataset_is_multilabel(dataset_info, args)
     all_names = dataset_info.keys()
 
     # skip invalid wsis
@@ -1371,7 +1646,7 @@ def evaluate_baseline(args, mode):
                         labeled_names.append(n)
 
                 # record neg names to exclude from seg val /test
-                if dataset_info[n]['wsi_label'] == 0:
+                if len(get_wsi_label_ids(dataset_info[n])) == 0:
                     neg_names.append(n)
 
         # shuffle example till each run is different
@@ -1458,19 +1733,30 @@ def evaluate_baseline(args, mode):
 
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
-                example_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else example_n['wsi_label']
+                if multilabel and n in dataset_info:
+                    example_wsi_label = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                else:
+                    example_wsi_label = dataset_info[n].get('wsi_label', example_n.get('wsi_label', 0)) if n in dataset_info else example_n.get('wsi_label', 0)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    raw_pl = np.asarray(example_n['patch_labels'])
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
-                        pl[pl == 0] = 255
-                        if example_wsi_label != cls:
-                            pl[pl == 1] = 0
+                        if multilabel:
+                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=True)
+                        elif raw_pl.ndim == 1 and set(np.unique(raw_pl).tolist()).issubset({0, 1}):
+                            pl = raw_pl.astype(np.int64, copy=True)
+                            pl[pl == 0] = 255
+                            if example_wsi_label != cls:
+                                pl[pl == 1] = 0
+                            else:
+                                pl[pl == 1] = 1
                         else:
-                            pl[pl == 1] = 1
+                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=False)
+                    else:
+                        pl = raw_pl.astype(np.int64, copy=True)
 
                 else:
                     pl = np.zeros(example_n['features'].shape[0]) - 1
@@ -1478,7 +1764,9 @@ def evaluate_baseline(args, mode):
                 # load sparse label
                 # slideLabel + subtyping is uniqe in pseudo label generation
                 if args.prompt_type == "slideLabel" and args.c > 1:
-                    if example_wsi_label != cls:
+                    if multilabel:
+                        pl[:] = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                    elif example_wsi_label != cls:
                         pl[:] = 0
                     else:
                         pl[:] = 1
@@ -1491,7 +1779,10 @@ def evaluate_baseline(args, mode):
                     #  record wsi label for each patch for later label convert
                     if args.c > 1:
                         pl[pl == 0] = 255
-                        pl[pl == -1] = 1 if example_wsi_label == cls else 0
+                        if multilabel:
+                            pl[pl == -1] = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                        else:
+                            pl[pl == -1] = 1 if example_wsi_label == cls else 0
                 
                 if 'prototype' in mode:
                     pos_feats.append(example_n['features'][(pl != 0) * (pl != 255)])
@@ -1566,11 +1857,14 @@ def evaluate_baseline(args, mode):
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.tensor(query_n['features'].astype(np.float32, copy=False)).cuda()
                 query_patch_names = query_n['patch_names']
-                query_wsi_label = dataset_info[n]['wsi_label'] if n in dataset_info else query_n['wsi_label']
-                if args.c > 1:
-                    label = query_wsi_label == cls
+                if multilabel and n in dataset_info:
+                    label = int(has_wsi_label(dataset_info[n], cls))
                 else:
-                    label = query_wsi_label
+                    query_wsi_label = dataset_info[n].get('wsi_label', query_n.get('wsi_label', 0)) if n in dataset_info else query_n.get('wsi_label', 0)
+                    if args.c > 1:
+                        label = query_wsi_label == cls
+                    else:
+                        label = query_wsi_label
 
                 example_feats_for_query, query_feats = align_torch_feature_pair(
                     example_feats, query_feats, f'baseline {mode} repeat={i} class={cls} query {n}'
@@ -1593,6 +1887,8 @@ def evaluate_baseline(args, mode):
                     if args.vis_path != '' or args.seg:
                         wsi_suffix = get_wsi_suffix(args.wsi_path)
                         size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
+                        if size is None and 'h5_grid_size' in query_n:
+                            size = tuple(int(v) for v in query_n['h5_grid_size'])
                         if size is None:
                             print('skip visualization or segmentation without WSI files')
                             patch_pred = None
@@ -1643,7 +1939,7 @@ def evaluate_baseline(args, mode):
                     print('false eval mode')
 
                 if args.seg:
-                    pred = torch.tensor(patch_pred_list)
+                    pred = torch.as_tensor(patch_pred_list)
                     label = torch.tensor(query_n['patch_labels'])
                 else:
                     pred = torch.tensor([wsi_pred])
@@ -1797,6 +2093,8 @@ if __name__ == '__main__':
         help='level-0 patch size for h5 pixel coordinates; 0 infers from h5 coordinates when possible')
     parser.add_argument('--file_min_size', default=5000, type=int, help='skip background and patches with a few content')
     parser.add_argument('--c', '--class_num', dest='c', default=1, type=int, help='number of classes; use 1 for binary screening and >1 for multi-class subtyping')
+    parser.add_argument('--multilabel', default=False, action='store_true',
+        help='evaluate WSI labels as multi-hot vectors; enabled automatically when dataset_info has wsi_labels')
     parser.add_argument('--seg', default=False, action='store_true', help='True to evaluate segmentation task (f1 = dice)')
 
     # for weak prompts
