@@ -48,6 +48,7 @@ except ImportError:
     resource = None
 
 DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
+H5_COORDINATE_KEYS = ('coords', 'coordinates')
 
 if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
@@ -657,15 +658,17 @@ def load_h5_feature_file(h5_path):
         if 'features' not in f:
             raise KeyError(f'{h5_path} must contain h5 key: features')
         feats = np.asarray(f['features'], dtype=np.float32)
-        coords = np.asarray(f['coordinates']) if 'coordinates' in f else None
+        coord_key = next((key for key in H5_COORDINATE_KEYS if key in f), None)
+        coords = np.asarray(f[coord_key]) if coord_key is not None else None
 
     if feats.ndim != 2:
         raise ValueError(f'{h5_path}: features must be a 2D array, got shape {feats.shape}')
     if coords is None:
         coords = make_synthetic_coordinates(feats.shape[0])
-        print(f'[warning] {h5_path} has no coordinates key. PRET generated synthetic row-major patch coordinates.')
+        keys = '/'.join(H5_COORDINATE_KEYS)
+        print(f'[warning] {h5_path} has no {keys} key. PRET generated synthetic row-major patch coordinates.')
     if coords.ndim != 2 or coords.shape[0] != feats.shape[0] or coords.shape[1] < 2:
-        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
+        raise ValueError(f'{h5_path}: h5 coordinates must have shape (N, >=2), got {coords.shape}')
 
     norms = np.linalg.norm(feats, ord=2, axis=1, keepdims=True)
     feats = feats / np.maximum(norms, 1e-8)

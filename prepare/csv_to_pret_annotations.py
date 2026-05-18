@@ -33,6 +33,7 @@ DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
 DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 DEFAULT_PATCH_SCALE = 512
 H5_EXTENSIONS = ('.h5', '.hdf5')
+H5_COORDINATE_KEYS = ('coords', 'coordinates')
 
 
 def load_label_map(path):
@@ -686,17 +687,19 @@ def read_h5_coordinates(h5_path):
         raise RuntimeError('Reading h5 coordinates requires h5py and numpy') from exc
 
     with h5py.File(h5_path, 'r') as f:
-        if 'coordinates' not in f:
-            raise KeyError(f'{h5_path} must contain h5 key: coordinates')
-        coords = np.asarray(f['coordinates'])
+        coord_key = next((key for key in H5_COORDINATE_KEYS if key in f), None)
+        if coord_key is None:
+            keys = ', '.join(H5_COORDINATE_KEYS)
+            raise KeyError(f'{h5_path} must contain one h5 coordinate key: {keys}')
+        coords = np.asarray(f[coord_key])
         if 'features' in f and f['features'].shape[0] != coords.shape[0]:
             raise ValueError(
-                f'{h5_path}: features and coordinates must have the same first dimension, '
+                f'{h5_path}: features and {coord_key} must have the same first dimension, '
                 f'got {f["features"].shape[0]} and {coords.shape[0]}'
             )
 
     if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError(f'{h5_path}: coordinates must have shape (N, >=2), got {coords.shape}')
+        raise ValueError(f'{h5_path}: h5 coordinates must have shape (N, >=2), got {coords.shape}')
     return coords
 
 

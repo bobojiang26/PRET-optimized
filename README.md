@@ -85,7 +85,7 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain a `features` key. A `coordinates` key is optional:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. `H5_COORDINATE_MODE=auto` detects this from the coordinate step; step values below `H5_PIXEL_STEP_THRESHOLD` are treated as patch-grid coordinates, and larger steps are treated as pixel coordinates. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
+* `coords` or `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. `H5_COORDINATE_MODE=auto` detects this from the coordinate step; step values below `H5_PIXEL_STEP_THRESHOLD` are treated as patch-grid coordinates, and larger steps are treated as pixel coordinates. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
 
 Put all h5 files in one folder, for example:
 
@@ -159,7 +159,7 @@ python core/main.py \
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coordinates`: a 2D array with shape `(num_patches, >=2)`.
+* `coords` or `coordinates`: a 2D array with shape `(num_patches, >=2)`.
 
 H5 `coordinates` can be stored in two formats. If they are level-0 pixel top-left coordinates, use `--h5-coordinate-mode pixel`, or leave `auto` when the coordinate step is large, for example `256` or `512`. If they are patch-grid coordinates, for example step `1`, use `--h5-coordinate-mode grid`, or leave `auto` and the converter will detect grid mode. In grid mode, `--patch-scale` means the level-0 pixel size of one patch; when `--patch-scale 0`, the converter tries to infer it from `--size-json` or `--wsi-dir`, then falls back to `512`. If the h5 only keeps a tissue subset instead of the full slide grid, pass the real patch size explicitly with `--patch-scale 256` or `--patch-scale 512`.
 
