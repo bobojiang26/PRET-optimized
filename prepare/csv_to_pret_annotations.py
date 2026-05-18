@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import time
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import unquote
@@ -949,7 +950,9 @@ def write_h5_label_files(
     pos_counts = {}
     written = 0
     missing = []
-    for slide_name, regions in sorted(regions_by_slide.items()):
+    slide_items = sorted(regions_by_slide.items())
+    total = len(slide_items)
+    for idx, (slide_name, regions) in enumerate(slide_items, start=1):
         h5_path = lookup_by_slide_keys(h5_files, slide_name)
         if h5_path is None:
             missing.append(slide_name)
@@ -958,6 +961,15 @@ def write_h5_label_files(
         slide_patch_scale = int(slide_h5_metadata.get('patch_scale', patch_scale))
         slide_coordinate_mode = slide_h5_metadata.get('coordinate_mode', 'pixel')
         slide_coords = slide_h5_metadata.get('coordinates')
+        patch_count = slide_coords.shape[0] if slide_coords is not None else 'unknown'
+        label_ids = sorted({int(r['label_id']) for r in regions})
+        print(
+            f'[info] writing h5 labels {idx}/{total}: {slide_name} '
+            f'mode={slide_coordinate_mode} patch_scale={slide_patch_scale} '
+            f'patches={patch_count} regions={len(regions)} labels={label_ids}',
+            flush=True,
+        )
+        start = time.perf_counter()
         labels = labels_for_h5_coordinates(
             regions,
             h5_path,
@@ -972,6 +984,12 @@ def write_h5_label_files(
         np_save(out_path, labels)
         pos_counts[slide_name] = int((labels == 1).sum())
         written += 1
+        elapsed = time.perf_counter() - start
+        print(
+            f'[info] wrote h5 labels {idx}/{total}: {slide_name} '
+            f'positive={pos_counts[slide_name]} elapsed={elapsed:.2f}s -> {out_path}',
+            flush=True,
+        )
 
     if missing:
         preview = ', '.join(missing[:10])
