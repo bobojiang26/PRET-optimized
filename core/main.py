@@ -1420,9 +1420,12 @@ def evaluate(args, val_only=False):
                 # ====================== inference, including classifier, aggregator, post processer ======================
 
                 infer_start = time.perf_counter()
-                size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
-                if size is None and 'h5_grid_size' in query_n:
-                    size = tuple(int(v) for v in query_n['h5_grid_size'])
+                need_patch_map = args.seg or (args.vis_path != '' and n in test_names)
+                size = None
+                if need_patch_map:
+                    size = get_wsi_size(args.wsi_path, n, wsi_suffix, args.patch_scale)
+                    if size is None and 'h5_grid_size' in query_n:
+                        size = tuple(int(v) for v in query_n['h5_grid_size'])
                 vis_info = None
                 
                 sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
