@@ -274,15 +274,34 @@ def read_slide_size(slide_path, readers=DEFAULT_SLIDE_READERS):
     raise ValueError(f'Cannot read WSI size for {slide_path}. Tried {", ".join(errors)}')
 
 
-def build_wsi_size_maps(wsi_dir, extensions=None, recursive=False, readers=DEFAULT_SLIDE_READERS, name_mode='stem'):
+def build_wsi_size_maps(
+    wsi_dir,
+    extensions=None,
+    recursive=False,
+    readers=DEFAULT_SLIDE_READERS,
+    name_mode='stem',
+    strict=True,
+):
     lookup_map = {}
     json_map = {}
+    failures = []
     for wsi_path in iter_wsi_paths(wsi_dir, extensions=extensions, recursive=recursive):
-        width, height = read_slide_size(str(wsi_path), readers=readers)
+        try:
+            width, height = read_slide_size(str(wsi_path), readers=readers)
+        except Exception as exc:
+            if strict:
+                raise
+            failures.append((str(wsi_path), str(exc)))
+            continue
         slide_name = slide_name_from_path(str(wsi_path), name_mode)
         json_map[slide_name] = {'width': width, 'height': height}
         for key in wsi_lookup_keys(wsi_path):
             lookup_map[key] = (width, height)
+    if failures:
+        preview = '; '.join(f'{os.path.basename(path)}: {err}' for path, err in failures[:5])
+        print(f'[warning] skipped {len(failures)} WSI file(s) whose sizes could not be read: {preview}')
+        if len(failures) > 5:
+            print(f'[warning] ... {len(failures) - 5} more unreadable WSI file(s) omitted.')
     return lookup_map, json_map
 
 
@@ -569,16 +588,22 @@ def write_mask_files(regions_by_slide, mask_out, patch_scale):
     return pos_counts, written
 
 
-def find_h5_files(path):
+def find_h5_files(path, recursive=True):
     if not path:
         return {}
     h5_files = {}
-    for name in sorted(os.listdir(path)):
-        if name.lower().endswith(H5_EXTENSIONS):
-            stem = os.path.splitext(name)[0]
-            h5_path = os.path.join(path, name)
-            for key in slide_lookup_keys(stem):
-                h5_files[key] = h5_path
+    root = Path(path)
+    if root.is_file():
+        candidates = [root] if root.suffix.lower() in H5_EXTENSIONS else []
+    elif root.exists():
+        iterator = root.rglob('*') if recursive else root.iterdir()
+        candidates = sorted(p for p in iterator if p.is_file() and p.suffix.lower() in H5_EXTENSIONS)
+    else:
+        candidates = []
+    for h5_path in candidates:
+        stem = h5_path.stem
+        for key in slide_lookup_keys(stem):
+            h5_files[key] = str(h5_path)
     return h5_files
 
 
@@ -795,6 +820,20 @@ def h5_size_map_from_metadata(h5_metadata):
         size = (int(info['width']), int(info['height']))
         for key in slide_lookup_keys(slide_name):
             out[key] = size
+    return out
+
+
+def h5_size_json_from_metadata(h5_metadata):
+    out = {}
+    for info in h5_metadata.values():
+        h5_path = info.get('path', '')
+        if not h5_path:
+            continue
+        slide_name = strip_known_slide_suffixes(os.path.basename(h5_path))
+        out[slide_name] = {
+            'width': int(info['width']),
+            'height': int(info['height']),
+        }
     return out
 
 
@@ -1069,6 +1108,10 @@ def parse_args():
     parser.add_argument('--xml-out', default='', help='directory to write PRET-compatible XML files')
     parser.add_argument('--mask-out', default='', help='optional directory to write PRET patch-grid PNG masks')
     parser.add_argument('--h5-dir', default='', help='optional directory containing per-slide h5 feature files')
+    parser.add_argument('--h5-recursive', dest='h5_recursive', action='store_true', default=True,
+        help='search --h5-dir recursively; enabled by default')
+    parser.add_argument('--no-h5-recursive', dest='h5_recursive', action='store_false',
+        help='only search h5 files directly under --h5-dir')
     parser.add_argument('--h5-label-out', default='',
         help='optional directory to write per-h5 patch label .npy arrays aligned to h5 feature order')
     parser.add_argument('--skip-missing-h5', dest='skip_missing_h5', action='store_true', default=None,
@@ -1086,6 +1129,8 @@ def parse_args():
         help='optional directory containing WSI files, including .sdpc, used to read slide sizes')
     parser.add_argument('--wsi-recursive', action='store_true',
         help='search --wsi-dir recursively')
+    parser.add_argument('--strict-wsi-size-errors', action='store_true',
+        help='raise if any --wsi-dir slide size cannot be read; by default unreadable WSI files are skipped during h5 label conversion')
     parser.add_argument('--wsi-extensions', nargs='*', default=list(DEFAULT_WSI_EXTENSIONS),
         help='WSI file extensions to scan under --wsi-dir; default includes sdpc, svs, tif, tiff, mrxs, ndpi, scn')
     parser.add_argument('--slide-reader', default='auto', choices=['auto', 'openslide', 'opensdpc'],
@@ -1151,6 +1196,7 @@ def main():
             recursive=args.wsi_recursive,
             readers=slide_readers,
             name_mode=args.name_mode,
+            strict=args.write_size_json_only or args.strict_wsi_size_errors,
         )
 
     if args.write_size_json_only:
@@ -1161,7 +1207,12 @@ def main():
 
     label_map = load_label_map(args.label_map)
     size_map = load_size_map(args.size_json)
-    h5_files = find_h5_files(args.h5_dir)
+    h5_files = find_h5_files(args.h5_dir, recursive=args.h5_recursive)
+    if args.h5_label_out and not h5_files:
+        raise SystemExit(
+            f'No .h5/.hdf5 files found in --h5-dir={args.h5_dir}. '
+            'Check the path, or use --h5-recursive for nested h5 files.'
+        )
     known_size_map = {}
     known_size_map.update(wsi_size_map)
     known_size_map.update(size_map)
@@ -1170,7 +1221,7 @@ def main():
     h5_size_map = h5_size_map_from_metadata(h5_metadata)
     if args.size_json_out:
         combined_size_json = {}
-        combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in h5_size_map.items()})
+        combined_size_json.update(h5_size_json_from_metadata(h5_metadata))
         combined_size_json.update(wsi_size_json)
         combined_size_json.update({key: {'width': value[0], 'height': value[1]} for key, value in size_map.items()})
         write_size_json(combined_size_json, args.size_json_out)
@@ -1181,7 +1232,7 @@ def main():
         size_map,
         h5_size_map,
         wsi_size_map,
-        slide_readers=slide_readers,
+        slide_readers=[] if args.h5_label_out else slide_readers,
         h5_files=h5_files,
     )
     if not regions_by_slide:

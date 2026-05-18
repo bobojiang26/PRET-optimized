@@ -214,6 +214,7 @@ Label conversion rules:
 * For multi-label tasks, use `--wsi-label-mode multi-label`. The generated `data_info` writes only `wsi_labels`, for example `"wsi_labels": [1, 3, 5]`; it does not write `wsi_label`.
 * With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)` and is multi-hot by class. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array.
 * When `--h5-label-out` is used, CSV rows whose slide name has no matching h5 file are skipped by default and reported as warnings. Add `--no-skip-missing-h5` if you prefer a hard failure. This avoids falling back to SDPC size readers for slides that cannot produce h5-aligned labels anyway.
+* During h5 label conversion, unreadable WSI files under `--wsi-dir` are skipped with a warning unless `--strict-wsi-size-errors` is set; h5 metadata and `--patch-scale` can still provide the slide size needed for normalized CSV coordinates.
 
 First generate h5-aligned patch labels and a PRET `data_info` file:
 
