@@ -32,6 +32,7 @@ DEFAULT_WSI_EXTENSIONS = (
 DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
 DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 DEFAULT_PATCH_SCALE = 512
+H5_EXTENSIONS = ('.h5', '.hdf5')
 
 
 def load_label_map(path):
@@ -124,6 +125,60 @@ def normalize_extensions(extensions):
     return tuple(out) if out else DEFAULT_WSI_EXTENSIONS
 
 
+def strip_known_slide_suffixes(value):
+    value = str(value).strip()
+    known_exts = set(DEFAULT_WSI_EXTENSIONS) | set(H5_EXTENSIONS)
+    changed = True
+    while changed:
+        changed = False
+        root, ext = os.path.splitext(value)
+        if ext.lower() in known_exts:
+            value = root
+            changed = True
+    return value
+
+
+def slide_lookup_keys(value):
+    raw = str(value).strip()
+    decoded = decode_wsi_path(raw)
+    variants = {
+        raw,
+        decoded,
+        os.path.basename(raw),
+        os.path.basename(decoded),
+        os.path.abspath(raw),
+        os.path.abspath(decoded),
+    }
+    expanded = set()
+    for key in variants:
+        if not key:
+            continue
+        decoded_key = decode_wsi_path(key)
+        base = os.path.basename(decoded_key)
+        expanded.update({
+            key,
+            decoded_key,
+            base,
+            os.path.splitext(key)[0],
+            os.path.splitext(decoded_key)[0],
+            os.path.splitext(base)[0],
+            strip_known_slide_suffixes(key),
+            strip_known_slide_suffixes(decoded_key),
+            strip_known_slide_suffixes(base),
+        })
+    return {key for key in expanded if key}
+
+
+def lookup_by_slide_keys(mapping, *values):
+    if not mapping:
+        return None
+    for value in values:
+        for key in slide_lookup_keys(value):
+            if key in mapping:
+                return mapping[key]
+    return None
+
+
 def iter_wsi_paths(path, extensions=None, recursive=False):
     if not path:
         return []
@@ -138,22 +193,7 @@ def iter_wsi_paths(path, extensions=None, recursive=False):
 
 
 def wsi_lookup_keys(path):
-    decoded_path = decode_wsi_path(str(path))
-    basename = os.path.basename(str(path))
-    decoded_basename = os.path.basename(decoded_path)
-    stem = os.path.splitext(basename)[0]
-    decoded_stem = os.path.splitext(decoded_basename)[0]
-    keys = {
-        str(path),
-        decoded_path,
-        os.path.abspath(str(path)),
-        os.path.abspath(decoded_path),
-        basename,
-        decoded_basename,
-        stem,
-        decoded_stem,
-    }
-    return {key for key in keys if key}
+    return slide_lookup_keys(path)
 
 
 def find_wsi_files(path, extensions=None, recursive=False):
@@ -264,25 +304,15 @@ def lookup_slide_size(
 ):
     h5_size_map = h5_size_map or {}
     wsi_size_map = wsi_size_map or {}
-    decoded_wsi_path = decode_wsi_path(wsi_path)
-    candidates = [
-        wsi_path,
-        decoded_wsi_path,
-        os.path.abspath(wsi_path),
-        os.path.abspath(decoded_wsi_path),
-        os.path.basename(wsi_path),
-        os.path.basename(decoded_wsi_path),
-        slide_name,
-    ]
-    for key in candidates:
-        if key in size_map:
-            return size_map[key]
-    for key in candidates:
-        if key in wsi_size_map:
-            return wsi_size_map[key]
-    for key in candidates:
-        if key in h5_size_map:
-            return h5_size_map[key]
+    matched = lookup_by_slide_keys(size_map, wsi_path, slide_name)
+    if matched is not None:
+        return matched
+    matched = lookup_by_slide_keys(wsi_size_map, wsi_path, slide_name)
+    if matched is not None:
+        return matched
+    matched = lookup_by_slide_keys(h5_size_map, wsi_path, slide_name)
+    if matched is not None:
+        return matched
 
     if not slide_readers:
         raise ValueError(
@@ -387,11 +417,13 @@ def pret_annotation_id(label_id, prompt_type):
     return PRET_XML_IDS[prompt_type]
 
 
-def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None, slide_readers=None):
+def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None, slide_readers=None, h5_files=None):
     regions_by_slide = defaultdict(list)
     skipped = defaultdict(int)
     csv_path = os.path.abspath(args.csv)
     positive_labels = set(args.positive_labels) if args.positive_labels else None
+    missing_h5 = defaultdict(int)
+    h5_files = h5_files or {}
 
     with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
         reader = csv.DictReader(f)
@@ -408,6 +440,9 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
             coords = row[field_lookup['coordinates']]
             wsi_path = resolve_wsi_path(raw_wsi_path, csv_path)
             slide_name = slide_name_from_path(wsi_path, args.name_mode)
+            if args.skip_missing_h5 and h5_files and lookup_by_slide_keys(h5_files, slide_name, wsi_path) is None:
+                missing_h5[slide_name] += 1
+                continue
             width, height = lookup_slide_size(
                 wsi_path,
                 slide_name,
@@ -437,6 +472,11 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
                     'points': points,
                     'size': (width, height),
                 })
+    if missing_h5:
+        preview = ', '.join(f'{name}:{count}' for name, count in list(sorted(missing_h5.items()))[:20])
+        print(f'[warning] skipped CSV rows for {len(missing_h5)} slide(s) without matching h5: {preview}')
+        if len(missing_h5) > 20:
+            print(f'[warning] ... {len(missing_h5) - 20} more missing-h5 slide(s) omitted.')
     return regions_by_slide, skipped
 
 
@@ -532,11 +572,11 @@ def find_h5_files(path):
         return {}
     h5_files = {}
     for name in sorted(os.listdir(path)):
-        if name.lower().endswith(('.h5', '.hdf5')):
+        if name.lower().endswith(H5_EXTENSIONS):
             stem = os.path.splitext(name)[0]
             h5_path = os.path.join(path, name)
-            h5_files[stem] = h5_path
-            h5_files[decode_wsi_path(stem)] = h5_path
+            for key in slide_lookup_keys(stem):
+                h5_files[key] = h5_path
     return h5_files
 
 
@@ -613,24 +653,15 @@ def infer_grid_patch_scale_from_slide_size(coords, slide_size):
 
 
 def lookup_known_slide_size(slide_name, *size_maps):
-    candidates = [
-        slide_name,
-        decode_wsi_path(slide_name),
-        os.path.basename(slide_name),
-        os.path.splitext(os.path.basename(slide_name))[0],
-        os.path.splitext(os.path.basename(decode_wsi_path(slide_name)))[0],
-    ]
     for size_map in size_maps:
-        if not size_map:
+        value = lookup_by_slide_keys(size_map, slide_name)
+        if value is None:
             continue
-        for key in candidates:
-            if key in size_map:
-                value = size_map[key]
-                if isinstance(value, dict):
-                    width = value.get('width', value.get('w'))
-                    height = value.get('height', value.get('h'))
-                    return int(width), int(height)
-                return int(value[0]), int(value[1])
+        if isinstance(value, dict):
+            width = value.get('width', value.get('w'))
+            height = value.get('height', value.get('h'))
+            return int(width), int(height)
+        return int(value[0]), int(value[1])
     return None
 
 
@@ -673,7 +704,8 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
     metadata = {}
     patch_scales = {}
     coordinate_modes = defaultdict(int)
-    for slide_name, h5_path in sorted(h5_files.items()):
+    for h5_path in sorted(set(h5_files.values())):
+        slide_name = os.path.splitext(os.path.basename(h5_path))[0]
         coords = read_h5_coordinates(h5_path)
         coordinate_step = infer_patch_scale_from_coordinates(coords)
         coordinate_mode = infer_h5_coordinate_mode(
@@ -708,7 +740,7 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
         else:
             width, height = h5_slide_size_from_coordinates(coords, coordinate_mode, patch_scale)
 
-        metadata[slide_name] = {
+        info = {
             'path': h5_path,
             'coordinates': coords,
             'coordinate_mode': coordinate_mode,
@@ -717,6 +749,8 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
             'height': height,
             'coordinate_step': coordinate_step,
         }
+        for key in slide_lookup_keys(slide_name):
+            metadata[key] = info
         patch_scales[int(patch_scale)] = patch_scales.get(int(patch_scale), 0) + 1
         coordinate_modes[coordinate_mode] += 1
 
@@ -754,7 +788,9 @@ def choose_patch_scale(args, h5_metadata, patch_scales):
 def h5_size_map_from_metadata(h5_metadata):
     out = {}
     for slide_name, info in h5_metadata.items():
-        out[slide_name] = (int(info['width']), int(info['height']))
+        size = (int(info['width']), int(info['height']))
+        for key in slide_lookup_keys(slide_name):
+            out[key] = size
     return out
 
 
@@ -911,16 +947,17 @@ def write_h5_label_files(
     written = 0
     missing = []
     for slide_name, regions in sorted(regions_by_slide.items()):
-        if slide_name not in h5_files:
+        h5_path = lookup_by_slide_keys(h5_files, slide_name)
+        if h5_path is None:
             missing.append(slide_name)
             continue
-        slide_h5_metadata = (h5_metadata or {}).get(slide_name, {})
+        slide_h5_metadata = lookup_by_slide_keys(h5_metadata or {}, slide_name) or {}
         slide_patch_scale = int(slide_h5_metadata.get('patch_scale', patch_scale))
         slide_coordinate_mode = slide_h5_metadata.get('coordinate_mode', 'pixel')
         slide_coords = slide_h5_metadata.get('coordinates')
         labels = labels_for_h5_coordinates(
             regions,
-            h5_files[slide_name],
+            h5_path,
             slide_patch_scale,
             coordinate_mode=slide_coordinate_mode,
             multi_label=multi_label,
@@ -1013,6 +1050,10 @@ def parse_args():
     parser.add_argument('--h5-dir', default='', help='optional directory containing per-slide h5 feature files')
     parser.add_argument('--h5-label-out', default='',
         help='optional directory to write per-h5 patch label .npy arrays aligned to h5 feature order')
+    parser.add_argument('--skip-missing-h5', dest='skip_missing_h5', action='store_true', default=None,
+        help='skip CSV rows whose slide has no matching h5 file; defaults to on when --h5-label-out is used')
+    parser.add_argument('--no-skip-missing-h5', dest='skip_missing_h5', action='store_false',
+        help='raise instead of skipping when annotated slides have no matching h5 file')
     parser.add_argument('--data-info-out', default='', help='optional data_info JSON for annotated slides')
     parser.add_argument('--size-json', default='',
         help='optional slide size JSON for formats OpenSlide cannot read; h5 coordinates can infer this when --h5-dir is set')
@@ -1067,6 +1108,8 @@ def parse_args():
         parser.error('provide --label-map, or use --auto-label-map to create one from CSV labels')
     if args.h5_label_out and not args.h5_dir:
         parser.error('--h5-dir is required when --h5-label-out is set')
+    if args.skip_missing_h5 is None:
+        args.skip_missing_h5 = bool(args.h5_label_out)
     if args.patch_scale < 0:
         parser.error('--patch-scale must be >= 0')
     if args.h5_pixel_step_threshold <= 0:
@@ -1118,6 +1161,7 @@ def main():
         h5_size_map,
         wsi_size_map,
         slide_readers=slide_readers,
+        h5_files=h5_files,
     )
     if not regions_by_slide:
         raise SystemExit('No regions were converted. Check labels, label map, and --positive-labels.')
