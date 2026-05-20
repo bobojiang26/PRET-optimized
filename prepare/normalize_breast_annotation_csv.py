@@ -141,6 +141,19 @@ def column_lookup(fieldnames, required):
     return {name: normalized[normalize_header(name)] for name in required}
 
 
+def path_basename(path):
+    return str(path).replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
+
+
+def normalize_wsi_path(raw_wsi_path, args):
+    wsi_path = str(raw_wsi_path).strip()
+    if args.decode_wsi_path:
+        wsi_path = unquote(wsi_path) if '%' in wsi_path else wsi_path
+    if args.wsi_dir:
+        wsi_path = os.path.join(args.wsi_dir, path_basename(wsi_path))
+    return wsi_path
+
+
 def convert_csv(args):
     _, alias_to_canonical = load_merge_map(args.merge_map)
 
@@ -168,12 +181,9 @@ def convert_csv(args):
 
         for row_idx, row in enumerate(reader, start=2):
             total += 1
-            wsi_path = str(row[lookup[args.wsi_path_column]]).strip()
+            wsi_path = normalize_wsi_path(row[lookup[args.wsi_path_column]], args)
             coordinates = str(row[lookup[args.coordinates_column]]).strip()
             labels = parse_label_values(row[lookup[args.labels_column]])
-
-            if args.decode_wsi_path:
-                wsi_path = unquote(wsi_path) if '%' in wsi_path else wsi_path
 
             if not wsi_path or not coordinates or not labels:
                 skipped += 1
@@ -241,6 +251,8 @@ def build_argparser():
         help='input column name for labels')
     parser.add_argument('--coordinates-column', default='coordinates',
         help='input column name for normalized coordinates')
+    parser.add_argument('--wsi-dir', default='',
+        help='actual directory containing all sdpc files; replaces each input wsi_path prefix with this directory')
     parser.add_argument('--decode-wsi-path', action=argparse.BooleanOptionalAction, default=True,
         help='URL-decode WSI path, e.g. %%23 to #')
     return parser
@@ -250,6 +262,8 @@ def main():
     args = build_argparser().parse_args()
     if args.label_id_start < 0:
         raise ValueError('--label-id-start must be non-negative')
+    if args.wsi_dir:
+        args.wsi_dir = os.path.abspath(os.path.expanduser(args.wsi_dir))
     convert_csv(args)
 
 
