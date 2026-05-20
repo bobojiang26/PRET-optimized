@@ -603,17 +603,46 @@ def rasterize_patch_mask(regions, patch_scale):
     resize_scale = patch_scale // mid_scale
     mid_h = pad_h // mid_scale
     mid_w = pad_w // mid_scale
-    mid = np.zeros((mid_h, mid_w), dtype=np.uint8)
 
-    for region in regions:
-        contour = np.array(
-            [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5)] for x, y in region['points']],
-            dtype=np.int32,
-        )
-        if contour.shape[0] >= 3:
-            cv2.fillPoly(mid, [contour], 1)
+    mask = np.zeros((grid_h, grid_w), dtype=np.uint8)
 
-    mask = mid.reshape(grid_h, resize_scale, grid_w, resize_scale).max(axis=(1, 3))
+    # Adaptive chunk height in mid-scale: target ~50 MB per chunk
+    target_chunk_bytes = 50 * 1024 * 1024
+    chunk_mid_h = max(resize_scale, min(mid_h, max(1, target_chunk_bytes // max(1, mid_w))))
+    chunk_mid_h = (chunk_mid_h // resize_scale) * resize_scale
+    if chunk_mid_h < resize_scale:
+        chunk_mid_h = resize_scale
+
+    for chunk_mid_y0 in range(0, mid_h, chunk_mid_h):
+        chunk_mid_y1 = min(mid_h, chunk_mid_y0 + chunk_mid_h)
+        chunk_h = chunk_mid_y1 - chunk_mid_y0
+        chunk_grid_h = chunk_h // resize_scale
+        effective_chunk_h = chunk_grid_h * resize_scale
+
+        chunk = np.zeros((effective_chunk_h, mid_w), dtype=np.uint8)
+
+        for region in regions:
+            pts = np.array(region['points'])
+            py_min = pts[:, 1].min()
+            py_max = pts[:, 1].max()
+            if int(math.ceil(py_max / mid_scale)) <= chunk_mid_y0 or int(py_min / mid_scale) >= chunk_mid_y1:
+                continue
+
+            contour = np.array(
+                [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5) - chunk_mid_y0]
+                 for x, y in pts],
+                dtype=np.int32,
+            )
+            if contour.shape[0] >= 3:
+                cv2.fillPoly(chunk, [contour], 1)
+
+        if chunk_grid_h > 0:
+            grid_y0 = chunk_mid_y0 // resize_scale
+            chunk_mask = chunk.reshape(
+                chunk_grid_h, resize_scale, grid_w, resize_scale
+            ).max(axis=(1, 3))
+            mask[grid_y0:grid_y0 + chunk_grid_h, :] = chunk_mask
+
     return mask.astype(np.uint8)
 
 
@@ -903,39 +932,71 @@ def h5_size_json_from_metadata(h5_metadata):
     return out
 
 
-def rasterize_mid_mask(regions, patch_scale):
+def _compute_patch_labels_chunked(pixel_coords, regions, patch_scale, mid_scale, full_mid_h, full_mid_w):
     try:
         import numpy as np
     except ImportError as exc:
         raise RuntimeError('Writing h5 patch labels requires numpy') from exc
-
     try:
         import cv2
     except ImportError:
         cv2 = None
 
-    width, height = regions[0]['size']
-    mid_scale = max(1, patch_scale // 32)
-    while patch_scale % mid_scale != 0:
-        mid_scale -= 1
-    mid_h = int(math.ceil(height / mid_scale))
-    mid_w = int(math.ceil(width / mid_scale))
-    mid = np.zeros((mid_h, mid_w), dtype=np.uint8)
+    n_patches = pixel_coords.shape[0]
+    labels = np.zeros(n_patches, dtype=np.uint8)
 
-    for region in regions:
-        contour = np.array(
-            [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5)] for x, y in region['points']],
-            dtype=np.int32,
-        )
-        if contour.shape[0] >= 3:
-            if cv2 is not None:
-                cv2.fillPoly(mid, [contour], 1)
-            else:
-                fill_polygon_numpy(mid, contour)
-    return mid, mid_scale
+    # Pre-compute mid-scale coordinates for all patches so we can filter per chunk
+    mx0 = np.floor(pixel_coords[:, 0] / mid_scale).astype(np.int32)
+    my0 = np.floor(pixel_coords[:, 1] / mid_scale).astype(np.int32)
+    mx1 = np.ceil((pixel_coords[:, 0] + patch_scale) / mid_scale).astype(np.int32)
+    my1 = np.ceil((pixel_coords[:, 1] + patch_scale) / mid_scale).astype(np.int32)
+    np.clip(mx0, 0, full_mid_w, out=mx0)
+    np.clip(my0, 0, full_mid_h, out=my0)
+    np.clip(mx1, 0, full_mid_w, out=mx1)
+    np.clip(my1, 0, full_mid_h, out=my1)
+
+    # Adaptive chunk height: target ~50 MB per chunk (uint8 row = full_mid_w bytes)
+    target_chunk_bytes = 50 * 1024 * 1024
+    chunk_size = max(512, min(full_mid_h, max(1, target_chunk_bytes // max(1, full_mid_w))))
+
+    for chunk_y0 in range(0, full_mid_h, chunk_size):
+        chunk_y1 = min(full_mid_h, chunk_y0 + chunk_size)
+        chunk_h = chunk_y1 - chunk_y0
+        chunk = np.zeros((chunk_h, full_mid_w), dtype=np.uint8)
+
+        # Rasterize annotations that overlap this vertical slab
+        for region in regions:
+            pts = np.array(region['points'])
+            py_min = pts[:, 1].min()
+            py_max = pts[:, 1].max()
+            if int(math.ceil(py_max / mid_scale)) <= chunk_y0 or int(py_min / mid_scale) >= chunk_y1:
+                continue
+
+            contour = np.array(
+                [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5) - chunk_y0]
+                 for x, y in pts],
+                dtype=np.int32,
+            )
+            if contour.shape[0] >= 3:
+                if cv2 is not None:
+                    cv2.fillPoly(chunk, [contour], 1)
+                else:
+                    _fill_polygon_numpy_local(chunk, contour)
+
+        # Find unlabeled patches whose mid-scale bbox overlaps this chunk
+        overlapping = np.where((my1 > chunk_y0) & (my0 < chunk_y1) & (labels == 0))[0]
+        for idx in overlapping:
+            cy0 = max(0, my0[idx] - chunk_y0)
+            cy1 = min(chunk_h, my1[idx] - chunk_y0)
+            cx0 = mx0[idx]
+            cx1 = mx1[idx]
+            if cy1 > cy0 and cx1 > cx0 and chunk[cy0:cy1, cx0:cx1].max() > 0:
+                labels[idx] = 1
+
+    return labels
 
 
-def fill_polygon_numpy(mask, contour):
+def _fill_polygon_numpy_local(mask, contour):
     try:
         import numpy as np
     except ImportError as exc:
@@ -965,29 +1026,6 @@ def fill_polygon_numpy(mask, contour):
     mask[min_y:max_y, min_x:max_x][inside] = 1
 
 
-def labels_from_mid_mask(coords, mid, mid_scale, patch_scale):
-    try:
-        import numpy as np
-    except ImportError as exc:
-        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
-
-    labels = np.zeros(coords.shape[0], dtype=np.uint8)
-    mid_h, mid_w = mid.shape
-    for idx, coord in enumerate(coords):
-        x0 = float(coord[0])
-        y0 = float(coord[1])
-        x1 = x0 + patch_scale
-        y1 = y0 + patch_scale
-        mx0 = max(0, int(math.floor(x0 / mid_scale)))
-        my0 = max(0, int(math.floor(y0 / mid_scale)))
-        mx1 = min(mid_w, int(math.ceil(x1 / mid_scale)))
-        my1 = min(mid_h, int(math.ceil(y1 / mid_scale)))
-        if mx1 <= mx0 or my1 <= my0:
-            continue
-        labels[idx] = 1 if mid[my0:my1, mx0:mx1].max() > 0 else 0
-    return labels
-
-
 def labels_for_h5_coordinates(
     regions,
     h5_path,
@@ -1007,6 +1045,17 @@ def labels_for_h5_coordinates(
         coords = read_h5_coordinates(h5_path)
     pixel_coords = h5_coords_to_pixel_coords(coords, coordinate_mode, patch_scale)
 
+    width, height = regions[0]['size']
+    mid_scale = max(1, patch_scale // 32)
+    while patch_scale % mid_scale != 0:
+        mid_scale -= 1
+    full_mid_h = int(math.ceil(height / mid_scale))
+    full_mid_w = int(math.ceil(width / mid_scale))
+
+    def _compute(regs):
+        return _compute_patch_labels_chunked(
+            pixel_coords, regs, patch_scale, mid_scale, full_mid_h, full_mid_w)
+
     if multi_label:
         if class_num <= 0:
             raise ValueError('--multi-label h5 label writing requires at least one class')
@@ -1015,19 +1064,16 @@ def labels_for_h5_coordinates(
             cls_regions = [r for r in regions if int(r['label_id']) == cls]
             if not cls_regions:
                 continue
-            mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
-            labels[:, cls - 1] = labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
+            labels[:, cls - 1] = _compute(cls_regions)
         return labels
 
     if binary_labels:
-        mid, mid_scale = rasterize_mid_mask(regions, patch_scale)
-        return labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
+        return _compute(regions)
 
     labels = np.zeros(coords.shape[0], dtype=np.uint16)
     for cls in sorted({int(r['label_id']) for r in regions}):
         cls_regions = [r for r in regions if int(r['label_id']) == cls]
-        mid, mid_scale = rasterize_mid_mask(cls_regions, patch_scale)
-        cls_hits = labels_from_mid_mask(pixel_coords, mid, mid_scale, patch_scale)
+        cls_hits = _compute(cls_regions)
         labels[cls_hits == 1] = cls
     return labels
 
