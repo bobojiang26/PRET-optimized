@@ -1,6 +1,7 @@
 import argparse
 import ast
 import csv
+import gc
 import json
 import math
 import os
@@ -826,7 +827,6 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
 
         info = {
             'path': h5_path,
-            'coordinates': coords,
             'coordinate_mode': coordinate_mode,
             'patch_scale': int(patch_scale),
             'width': width,
@@ -845,6 +845,7 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
                 f'patches={coords.shape[0]} elapsed={elapsed:.1f}s',
                 flush=True,
             )
+        del coords
 
     if coordinate_modes:
         mode_text = ', '.join(f'{mode}:{count}' for mode, count in sorted(coordinate_modes.items()))
@@ -1064,13 +1065,11 @@ def write_h5_label_files(
         slide_h5_metadata = lookup_by_slide_keys(h5_metadata or {}, slide_name) or {}
         slide_patch_scale = int(slide_h5_metadata.get('patch_scale', patch_scale))
         slide_coordinate_mode = slide_h5_metadata.get('coordinate_mode', 'pixel')
-        slide_coords = slide_h5_metadata.get('coordinates')
-        patch_count = slide_coords.shape[0] if slide_coords is not None else 'unknown'
         label_ids = sorted({int(r['label_id']) for r in regions})
         print(
             f'[info] writing h5 labels {idx}/{total}: {slide_name} '
             f'mode={slide_coordinate_mode} patch_scale={slide_patch_scale} '
-            f'patches={patch_count} regions={len(regions)} labels={label_ids}',
+            f'regions={len(regions)} labels={label_ids}',
             flush=True,
         )
         start = time.perf_counter()
@@ -1082,18 +1081,20 @@ def write_h5_label_files(
             multi_label=multi_label,
             class_num=class_num,
             binary_labels=binary_labels,
-            coords=slide_coords,
+            coords=None,
         )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
         pos_counts[slide_name] = int((labels == 1).sum())
         written += 1
+        del labels
         elapsed = time.perf_counter() - start
         print(
             f'[info] wrote h5 labels {idx}/{total}: {slide_name} '
             f'positive={pos_counts[slide_name]} elapsed={elapsed:.2f}s -> {out_path}',
             flush=True,
         )
+        gc.collect()
 
     if missing:
         preview = ', '.join(missing[:10])
@@ -1284,6 +1285,7 @@ def main():
     known_size_map.update(wsi_size_map)
     known_size_map.update(size_map)
     h5_metadata, patch_scales = infer_h5_metadata(h5_files, args, known_size_map) if h5_files else ({}, {})
+    gc.collect()
     args.patch_scale = choose_patch_scale(args, h5_metadata, patch_scales)
     h5_size_map = h5_size_map_from_metadata(h5_metadata)
     if args.size_json_out:
