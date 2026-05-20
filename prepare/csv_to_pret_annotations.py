@@ -33,6 +33,7 @@ DEFAULT_WSI_EXTENSIONS = (
 DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
 DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 DEFAULT_PATCH_SCALE = 512
+PROGRESS_INTERVAL = 10
 H5_EXTENSIONS = ('.h5', '.hdf5')
 H5_COORDINATE_KEYS = ('coords', 'coordinates')
 
@@ -281,22 +282,37 @@ def build_wsi_size_maps(
     readers=DEFAULT_SLIDE_READERS,
     name_mode='stem',
     strict=True,
+    progress_interval=PROGRESS_INTERVAL,
 ):
     lookup_map = {}
     json_map = {}
     failures = []
-    for wsi_path in iter_wsi_paths(wsi_dir, extensions=extensions, recursive=recursive):
+    print(f'[info] scanning WSI directory: dir={wsi_dir} recursive={recursive}', flush=True)
+    wsi_paths = iter_wsi_paths(wsi_dir, extensions=extensions, recursive=recursive)
+    total = len(wsi_paths)
+    print(f'[info] scanning WSI sizes: files={total} dir={wsi_dir}', flush=True)
+    start = time.perf_counter()
+    for idx, wsi_path in enumerate(wsi_paths, start=1):
+        width = None
+        height = None
         try:
             width, height = read_slide_size(str(wsi_path), readers=readers)
         except Exception as exc:
             if strict:
                 raise
             failures.append((str(wsi_path), str(exc)))
-            continue
-        slide_name = slide_name_from_path(str(wsi_path), name_mode)
-        json_map[slide_name] = {'width': width, 'height': height}
-        for key in wsi_lookup_keys(wsi_path):
-            lookup_map[key] = (width, height)
+        if width is not None and height is not None:
+            slide_name = slide_name_from_path(str(wsi_path), name_mode)
+            json_map[slide_name] = {'width': width, 'height': height}
+            for key in wsi_lookup_keys(wsi_path):
+                lookup_map[key] = (width, height)
+        if progress_interval > 0 and (idx == 1 or idx % progress_interval == 0 or idx == total):
+            elapsed = time.perf_counter() - start
+            print(
+                f'[info] WSI size progress {idx}/{total}: readable={len(json_map)} '
+                f'failed={len(failures)} elapsed={elapsed:.1f}s',
+                flush=True,
+            )
     if failures:
         preview = '; '.join(f'{os.path.basename(path)}: {err}' for path, err in failures[:5])
         print(f'[warning] skipped {len(failures)} WSI file(s) whose sizes could not be read: {preview}')
@@ -445,6 +461,26 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
     positive_labels = set(args.positive_labels) if args.positive_labels else None
     missing_h5 = defaultdict(int)
     h5_files = h5_files or {}
+    progress_interval = PROGRESS_INTERVAL
+    print(f'[info] reading annotation CSV: {csv_path}', flush=True)
+    start = time.perf_counter()
+    processed_rows = 0
+
+    def report_csv_progress(force=False):
+        should_report = (
+            force or processed_rows == 1 or
+            (progress_interval > 0 and processed_rows % progress_interval == 0)
+        )
+        if not should_report:
+            return
+        elapsed = time.perf_counter() - start
+        region_count = sum(len(v) for v in regions_by_slide.values())
+        print(
+            f'[info] CSV progress rows={processed_rows} slides={len(regions_by_slide)} '
+            f'regions={region_count} skipped_labels={sum(skipped.values())} '
+            f'missing_h5_slides={len(missing_h5)} elapsed={elapsed:.1f}s',
+            flush=True,
+        )
 
     with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
         reader = csv.DictReader(f)
@@ -456,6 +492,7 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
                 raise ValueError(f'CSV must contain column {required!r}; got {reader.fieldnames}')
 
         for row_idx, row in enumerate(reader, start=2):
+            processed_rows += 1
             raw_wsi_path = row[field_lookup['wsi_path']]
             labels = parse_label_values(row[field_lookup['labels']])
             coords = row[field_lookup['coordinates']]
@@ -463,6 +500,7 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
             slide_name = slide_name_from_path(wsi_path, args.name_mode)
             if args.skip_missing_h5 and h5_files and lookup_by_slide_keys(h5_files, slide_name, wsi_path) is None:
                 missing_h5[slide_name] += 1
+                report_csv_progress()
                 continue
             width, height = lookup_slide_size(
                 wsi_path,
@@ -476,6 +514,7 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
 
             if not labels:
                 skipped['<empty>'] += 1
+                report_csv_progress()
                 continue
 
             for label in labels:
@@ -493,6 +532,15 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
                     'points': points,
                     'size': (width, height),
                 })
+            report_csv_progress()
+    elapsed = time.perf_counter() - start
+    region_count = sum(len(v) for v in regions_by_slide.values())
+    print(
+        f'[info] CSV read complete rows={processed_rows} slides={len(regions_by_slide)} '
+        f'regions={region_count} skipped_labels={sum(skipped.values())} '
+        f'missing_h5_slides={len(missing_h5)} elapsed={elapsed:.1f}s',
+        flush=True,
+    )
     if missing_h5:
         preview = ', '.join(f'{name}:{count}' for name, count in list(sorted(missing_h5.items()))[:20])
         print(f'[warning] skipped CSV rows for {len(missing_h5)} slide(s) without matching h5: {preview}')
@@ -591,6 +639,7 @@ def write_mask_files(regions_by_slide, mask_out, patch_scale):
 def find_h5_files(path, recursive=True):
     if not path:
         return {}
+    print(f'[info] scanning h5 files: path={path} recursive={recursive}', flush=True)
     h5_files = {}
     root = Path(path)
     if root.is_file():
@@ -604,6 +653,7 @@ def find_h5_files(path, recursive=True):
         stem = h5_path.stem
         for key in slide_lookup_keys(stem):
             h5_files[key] = str(h5_path)
+    print(f'[info] h5 files found: {len(candidates)}', flush=True)
     return h5_files
 
 
@@ -733,7 +783,12 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
     metadata = {}
     patch_scales = {}
     coordinate_modes = defaultdict(int)
-    for h5_path in sorted(set(h5_files.values())):
+    h5_paths = sorted(set(h5_files.values()))
+    total = len(h5_paths)
+    progress_interval = PROGRESS_INTERVAL
+    print(f'[info] reading h5 metadata: files={total}', flush=True)
+    start = time.perf_counter()
+    for idx, h5_path in enumerate(h5_paths, start=1):
         slide_name = os.path.splitext(os.path.basename(h5_path))[0]
         coords = read_h5_coordinates(h5_path)
         coordinate_step = infer_patch_scale_from_coordinates(coords)
@@ -782,10 +837,20 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
             metadata[key] = info
         patch_scales[int(patch_scale)] = patch_scales.get(int(patch_scale), 0) + 1
         coordinate_modes[coordinate_mode] += 1
+        if progress_interval > 0 and (idx == 1 or idx % progress_interval == 0 or idx == total):
+            elapsed = time.perf_counter() - start
+            print(
+                f'[info] h5 metadata progress {idx}/{total}: {slide_name} '
+                f'mode={coordinate_mode} step={coordinate_step} patch_scale={patch_scale} '
+                f'patches={coords.shape[0]} elapsed={elapsed:.1f}s',
+                flush=True,
+            )
 
     if coordinate_modes:
         mode_text = ', '.join(f'{mode}:{count}' for mode, count in sorted(coordinate_modes.items()))
-        print(f'[info] h5 coordinate modes: {mode_text}')
+        elapsed = time.perf_counter() - start
+        print(f'[info] h5 coordinate modes: {mode_text}', flush=True)
+        print(f'[info] h5 metadata complete files={total} elapsed={elapsed:.1f}s', flush=True)
     return metadata, patch_scales
 
 
@@ -1185,6 +1250,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print('[info] csv_to_pret_annotations started', flush=True)
     slide_readers = requested_slide_readers(args)
 
     wsi_size_map = {}
@@ -1205,6 +1271,7 @@ def main():
         print(f'size_json written: {args.size_json_out}')
         return
 
+    print('[info] loading label map and size map', flush=True)
     label_map = load_label_map(args.label_map)
     size_map = load_size_map(args.size_json)
     h5_files = find_h5_files(args.h5_dir, recursive=args.h5_recursive)
