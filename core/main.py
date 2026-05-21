@@ -569,6 +569,12 @@ def has_wsi_label(info, cls):
     return int(cls) in set(get_wsi_label_ids(info))
 
 
+def has_real_wsi_label(info):
+    if info.get('pseudo_label', False):
+        return False
+    return 'wsi_label' in info or 'wsi_labels' in info
+
+
 def dataset_is_multilabel(dataset_info, args=None):
     if args is not None and getattr(args, 'multilabel', False):
         return True
@@ -1113,6 +1119,10 @@ def evaluate(args, val_only=False):
     dataset_info = load_dataset_info(args)
     multilabel = dataset_is_multilabel(dataset_info, args)
     all_names = list(dataset_info.keys())
+    if getattr(args, 'require_label', False):
+        before = len(all_names)
+        all_names = [n for n in all_names if has_real_wsi_label(dataset_info[n])]
+        print(f'[require_label] filtered {before - len(all_names)} unlabeled/pseudo-labeled WSIs, {len(all_names)} remaining')
     multilabel_repeat_metrics = []
 
     records = {}
@@ -1624,6 +1634,11 @@ def evaluate_baseline(args, mode):
         if os.path.exists(os.path.join(args.dump_features, _ + '.npy')):
             temp.append(_)
     all_names = temp
+
+    if getattr(args, 'require_label', False):
+        before = len(all_names)
+        all_names = [n for n in all_names if has_real_wsi_label(dataset_info[n])]
+        print(f'[require_label] filtered {before - len(all_names)} unlabeled/pseudo-labeled WSIs, {len(all_names)} remaining')
 
     # ====================== run for each class ======================
 
@@ -2140,6 +2155,8 @@ if __name__ == '__main__':
         help='balance validation slides by class label; default off to preserve original PRET split semantics')
     parser.add_argument('--disjoint_val_test_split', default=False, action='store_true',
         help='remove validation slides before selecting test slides; default off to preserve original PRET split semantics')
+    parser.add_argument('--require_label', default=False, action='store_true',
+        help='exclude WSIs without real labels from example construction and evaluation; unlabeled and pseudo-labeled slides are skipped')
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',
         help='also seed torch random sampling; default off to preserve original PRET subtyping sampler behavior')
     args = parser.parse_args()
