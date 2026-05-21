@@ -594,6 +594,31 @@ def _is_int_label_value(value):
         return False
 
 
+def apply_require_label_filter(dataset_info, args, context='dataset'):
+    if not getattr(args, 'require_label', False):
+        return dataset_info
+
+    before = len(dataset_info)
+    filtered = {
+        name: info
+        for name, info in dataset_info.items()
+        if has_real_wsi_label(info)
+    }
+    removed_names = [name for name in dataset_info if name not in filtered]
+    removed = before - len(filtered)
+    print(
+        f'[require_label] {context}: filtered {removed} unlabeled/pseudo-labeled WSI(s); '
+        f'{len(filtered)} labeled WSI(s) remain.',
+        flush=True,
+    )
+    if removed_names:
+        preview = ', '.join(removed_names[:20])
+        print(f'[require_label] skipped WSI preview: {preview}', flush=True)
+        if len(removed_names) > 20:
+            print(f'[require_label] ... {len(removed_names) - 20} more skipped WSI(s) omitted.', flush=True)
+    return filtered
+
+
 def dataset_is_multilabel(dataset_info, args=None):
     if args is not None and getattr(args, 'multilabel', False):
         return True
@@ -629,7 +654,7 @@ def normalize_multiclass_wsi_labels(dataset_info, class_num):
         print(f'[warning] Detected zero-based multiclass wsi labels 0..{class_num - 1}; remapped to 1..{class_num} for PRET.')
 
 
-def load_dataset_info(args):
+def load_dataset_info(args, context='dataset loading'):
     dataset_info = {}
     if args.dataset_info != '' and os.path.exists(args.dataset_info):
         dataset_info = json.load(open(args.dataset_info))
@@ -656,6 +681,8 @@ def load_dataset_info(args):
             print(f'[warning] Missing wsi_label/wsi_labels for {len(missing_label_slides)} h5 slide(s): {preview}')
             if len(missing_label_slides) > 20:
                 print(f'[warning] ... {len(missing_label_slides) - 20} more h5 slide(s) omitted.')
+
+    dataset_info = apply_require_label_filter(dataset_info, args, context=context)
 
     if dataset_is_multilabel(dataset_info, args):
         inferred_class_num = infer_dataset_class_num(dataset_info)
@@ -818,7 +845,7 @@ def feature_processor(args):
     timer = StageTimer('feature_processor')
     print_memory_usage('feature_processor start')
     io_start = time.perf_counter()
-    dataset_info = load_dataset_info(args)
+    dataset_info = load_dataset_info(args, context='feature processing')
     h5_map = h5_file_map(find_h5_files(args.raw_feature_path))
     os.makedirs(args.dump_features, exist_ok=True)
 
@@ -1135,13 +1162,14 @@ class GaussianBlur(nn.Module):
 
 def evaluate(args, val_only=False):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
-    dataset_info = load_dataset_info(args)
+    dataset_info = load_dataset_info(args, context='evaluation')
     multilabel = dataset_is_multilabel(dataset_info, args)
     all_names = list(dataset_info.keys())
-    if getattr(args, 'require_label', False):
-        before = len(all_names)
-        all_names = [n for n in all_names if has_real_wsi_label(dataset_info[n])]
-        print(f'[require_label] filtered {before - len(all_names)} unlabeled/pseudo-labeled WSIs, {len(all_names)} remaining')
+    if not all_names:
+        raise ValueError(
+            'No WSI remains after dataset loading/filtering. '
+            'If --require_label is enabled, provide wsi_label/wsi_labels for at least one slide.'
+        )
     multilabel_repeat_metrics = []
 
     records = {}
@@ -1643,7 +1671,7 @@ def evaluate(args, val_only=False):
 def evaluate_baseline(args, mode):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
     aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
-    dataset_info = load_dataset_info(args)
+    dataset_info = load_dataset_info(args, context=f'baseline {mode}')
     multilabel = dataset_is_multilabel(dataset_info, args)
     all_names = dataset_info.keys()
 
@@ -1654,10 +1682,11 @@ def evaluate_baseline(args, mode):
             temp.append(_)
     all_names = temp
 
-    if getattr(args, 'require_label', False):
-        before = len(all_names)
-        all_names = [n for n in all_names if has_real_wsi_label(dataset_info[n])]
-        print(f'[require_label] filtered {before - len(all_names)} unlabeled/pseudo-labeled WSIs, {len(all_names)} remaining')
+    if not all_names:
+        raise ValueError(
+            'No WSI remains after dataset loading/filtering. '
+            'If --require_label is enabled, provide wsi_label/wsi_labels for at least one slide.'
+        )
 
     # ====================== run for each class ======================
 
