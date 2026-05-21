@@ -215,6 +215,7 @@ Label conversion rules:
 * With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)` and is multi-hot by class. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array.
 * When `--h5-label-out` is used, CSV rows whose slide name has no matching h5 file are skipped by default and reported as warnings. Add `--no-skip-missing-h5` if you prefer a hard failure. This avoids falling back to SDPC size readers for slides that cannot produce h5-aligned labels anyway.
 * During h5 label conversion, unreadable WSI files under `--wsi-dir` are skipped with a warning unless `--strict-wsi-size-errors` is set; h5 metadata and `--patch-scale` can still provide the slide size needed for normalized CSV coordinates.
+* H5 conversion is optimized by default: the converter reuses the initial h5 file index instead of scanning `--h5-dir` again, and h5 patch overlap checks use an integral-image vectorized path instead of per-patch Python loops. No GPU flag or extra command-line option is required.
 
 First generate h5-aligned patch labels and a PRET `data_info` file:
 

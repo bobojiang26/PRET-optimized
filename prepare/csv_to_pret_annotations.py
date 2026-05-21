@@ -945,7 +945,7 @@ def _compute_patch_labels_chunked(pixel_coords, regions, patch_scale, mid_scale,
     n_patches = pixel_coords.shape[0]
     labels = np.zeros(n_patches, dtype=np.uint8)
 
-    # Pre-compute mid-scale coordinates for all patches so we can filter per chunk
+    # Pre-compute mid-scale coordinates for all patches so we can filter per chunk.
     mx0 = np.floor(pixel_coords[:, 0] / mid_scale).astype(np.int32)
     my0 = np.floor(pixel_coords[:, 1] / mid_scale).astype(np.int32)
     mx1 = np.ceil((pixel_coords[:, 0] + patch_scale) / mid_scale).astype(np.int32)
@@ -955,7 +955,18 @@ def _compute_patch_labels_chunked(pixel_coords, regions, patch_scale, mid_scale,
     np.clip(mx1, 0, full_mid_w, out=mx1)
     np.clip(my1, 0, full_mid_h, out=my1)
 
-    # Adaptive chunk height: target ~50 MB per chunk (uint8 row = full_mid_w bytes)
+    prepared_regions = []
+    for region in regions:
+        pts = np.asarray(region['points'], dtype=np.float64)
+        if pts.shape[0] < 3:
+            continue
+        contour = np.floor(pts / mid_scale + 0.5).astype(np.int32)
+        prepared_regions.append((float(pts[:, 1].min()), float(pts[:, 1].max()), contour))
+
+    if not prepared_regions:
+        return labels
+
+    # Adaptive chunk height: target ~50 MB per chunk (uint8 row = full_mid_w bytes).
     target_chunk_bytes = 50 * 1024 * 1024
     chunk_size = max(512, min(full_mid_h, max(1, target_chunk_bytes // max(1, full_mid_w))))
 
@@ -963,35 +974,60 @@ def _compute_patch_labels_chunked(pixel_coords, regions, patch_scale, mid_scale,
         chunk_y1 = min(full_mid_h, chunk_y0 + chunk_size)
         chunk_h = chunk_y1 - chunk_y0
         chunk = np.zeros((chunk_h, full_mid_w), dtype=np.uint8)
+        chunk_has_regions = False
 
         # Rasterize annotations that overlap this vertical slab
-        for region in regions:
-            pts = np.array(region['points'])
-            py_min = pts[:, 1].min()
-            py_max = pts[:, 1].max()
+        for py_min, py_max, contour in prepared_regions:
             if int(math.ceil(py_max / mid_scale)) <= chunk_y0 or int(py_min / mid_scale) >= chunk_y1:
                 continue
 
-            contour = np.array(
-                [[int(x / mid_scale + 0.5), int(y / mid_scale + 0.5) - chunk_y0]
-                 for x, y in pts],
-                dtype=np.int32,
-            )
-            if contour.shape[0] >= 3:
-                if cv2 is not None:
-                    cv2.fillPoly(chunk, [contour], 1)
-                else:
-                    _fill_polygon_numpy_local(chunk, contour)
+            chunk_contour = contour.copy()
+            chunk_contour[:, 1] -= chunk_y0
+            if cv2 is not None:
+                cv2.fillPoly(chunk, [chunk_contour], 1)
+            else:
+                _fill_polygon_numpy_local(chunk, chunk_contour)
+            chunk_has_regions = True
 
-        # Find unlabeled patches whose mid-scale bbox overlaps this chunk
-        overlapping = np.where((my1 > chunk_y0) & (my0 < chunk_y1) & (labels == 0))[0]
-        for idx in overlapping:
-            cy0 = max(0, my0[idx] - chunk_y0)
-            cy1 = min(chunk_h, my1[idx] - chunk_y0)
-            cx0 = mx0[idx]
-            cx1 = mx1[idx]
-            if cy1 > cy0 and cx1 > cx0 and chunk[cy0:cy1, cx0:cx1].max() > 0:
-                labels[idx] = 1
+        if not chunk_has_regions:
+            continue
+
+        # Use an integral image so all patch-rectangle hit tests in this chunk are vectorized.
+        overlapping = np.where(
+            (my1 > chunk_y0) &
+            (my0 < chunk_y1) &
+            (mx1 > mx0) &
+            (labels == 0)
+        )[0]
+        if overlapping.size == 0:
+            continue
+
+        cy0 = np.maximum(0, my0[overlapping] - chunk_y0)
+        cy1 = np.minimum(chunk_h, my1[overlapping] - chunk_y0)
+        cx0 = mx0[overlapping]
+        cx1 = mx1[overlapping]
+        valid = (cy1 > cy0) & (cx1 > cx0)
+        if not np.any(valid):
+            continue
+
+        overlapping = overlapping[valid]
+        cy0 = cy0[valid]
+        cy1 = cy1[valid]
+        cx0 = cx0[valid]
+        cx1 = cx1[valid]
+
+        integral = np.zeros((chunk_h + 1, full_mid_w + 1), dtype=np.uint32)
+        integral[1:, 1:] = chunk
+        np.cumsum(integral, axis=0, dtype=np.uint32, out=integral)
+        np.cumsum(integral, axis=1, dtype=np.uint32, out=integral)
+
+        hits = (
+            integral[cy1, cx1].astype(np.int64) -
+            integral[cy0, cx1].astype(np.int64) -
+            integral[cy1, cx0].astype(np.int64) +
+            integral[cy0, cx0].astype(np.int64)
+        ) > 0
+        labels[overlapping[hits]] = 1
 
     return labels
 
@@ -1087,13 +1123,14 @@ def write_h5_label_files(
     class_num=0,
     binary_labels=True,
     h5_metadata=None,
+    h5_files=None,
 ):
     if not h5_label_out:
         return {}, 0
     if not h5_dir:
         raise ValueError('--h5-dir is required when --h5-label-out is set')
 
-    h5_files = find_h5_files(h5_dir)
+    h5_files = h5_files or find_h5_files(h5_dir)
     if not h5_files:
         raise ValueError(f'No .h5/.hdf5 files found in {h5_dir}')
 
@@ -1368,6 +1405,7 @@ def main():
         class_num=class_num,
         binary_labels=h5_binary_labels,
         h5_metadata=h5_metadata,
+        h5_files=h5_files,
     )
     write_data_info(
         regions_by_slide,
