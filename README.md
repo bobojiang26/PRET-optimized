@@ -154,6 +154,15 @@ python core/main.py \
 
 `--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. If `data_info/MY_H5.json` is missing, or if a slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
 
+When your dataset contains a mix of labeled and unlabeled slides, use `--require_label` to exclude unlabeled and pseudo-labeled slides from both example construction and evaluation. This prevents unlabeled slides from contaminating the example database or appearing in val/test splits:
+
+```bash
+python core/main.py \
+  --mode eval \
+  --require_label \
+  ...
+```
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
@@ -582,6 +591,12 @@ python core/main.py ...
 ```bash
 SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=0.25 SPATIAL_SMOOTH_RADIUS=1 CONFORMAL_ALPHA=0.1 bash scripts/run_h5_eval.sh
 ```
+
+16. **无标签样本过滤**
+   - 新增 `--require_label` 开关（默认关闭）。
+   - 开启后，所有缺少 `wsi_label`/`wsi_labels` 或带有 `pseudo_label` 标记的 WSI 会在 example 库构建和 val/test 评测前被过滤掉。
+   - 适用场景：数据集中混有无标签样本，但不希望它们参与 in-context example 选择或影响评测指标。
+   - 用法：在命令行或环境变量中加 `--require_label` 即可，无需调整其他参数。
 
 ## Citation
 
