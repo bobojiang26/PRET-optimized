@@ -572,7 +572,26 @@ def has_wsi_label(info, cls):
 def has_real_wsi_label(info):
     if info.get('pseudo_label', False):
         return False
-    return 'wsi_label' in info or 'wsi_labels' in info
+    if 'wsi_labels' in info:
+        labels = info.get('wsi_labels')
+        if isinstance(labels, (list, tuple, set)):
+            return all(_is_int_label_value(_) for _ in labels)
+        return _is_int_label_value(labels)
+    if 'wsi_label' in info:
+        return _is_int_label_value(info.get('wsi_label'))
+    return False
+
+
+def _is_int_label_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def dataset_is_multilabel(dataset_info, args=None):

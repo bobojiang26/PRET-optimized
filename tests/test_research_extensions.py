@@ -9,7 +9,7 @@ if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
 from modules import compute_similarity, spatially_smooth_logits, aggregate_query_logits
-from main import apply_context_feature_centering, binary_conformal_summary, select_validation_names
+from main import apply_context_feature_centering, binary_conformal_summary, has_real_wsi_label, select_validation_names
 
 
 def test_compute_similarity_keeps_original_mean_behavior():
@@ -93,3 +93,13 @@ def test_conformal_summary_reports_prediction_set_stats():
     assert summary["coverage"] == 1.0
     assert summary["avg_set_size"] >= 1.0
     assert summary["qhat"] >= 0.0
+
+
+def test_has_real_wsi_label_filters_unlabeled_and_pseudo_labels():
+    assert has_real_wsi_label({"wsi_label": 0})
+    assert has_real_wsi_label({"wsi_labels": []})
+    assert has_real_wsi_label({"wsi_labels": [1, "2"]})
+    assert not has_real_wsi_label({})
+    assert not has_real_wsi_label({"wsi_label": None})
+    assert not has_real_wsi_label({"wsi_label": ""})
+    assert not has_real_wsi_label({"wsi_label": 1, "pseudo_label": True})

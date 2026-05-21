@@ -43,6 +43,7 @@ SPATIAL_SMOOTH_STRENGTH="${SPATIAL_SMOOTH_STRENGTH:-}"
 SPATIAL_SMOOTH_RADIUS="${SPATIAL_SMOOTH_RADIUS:-}"
 SPATIAL_FEATURE_WEIGHT="${SPATIAL_FEATURE_WEIGHT:-}"
 CONFORMAL_ALPHA="${CONFORMAL_ALPHA:-}"
+REQUIRE_LABEL="${REQUIRE_LABEL:-0}"
 
 MULTIPLE_ARGS=()
 if [[ -n "${MULTIPLE_NUM:-}" ]]; then
@@ -99,6 +100,9 @@ if [[ "${SEG}" == "1" || "${SEG}" == "true" || "${SEG}" == "TRUE" ]]; then
 fi
 if [[ "${MULTILABEL}" == "1" || "${MULTILABEL}" == "true" || "${MULTILABEL}" == "TRUE" ]]; then
   SEG_ARGS+=(--multilabel)
+fi
+if [[ "${REQUIRE_LABEL}" == "1" || "${REQUIRE_LABEL}" == "true" || "${REQUIRE_LABEL}" == "TRUE" ]]; then
+  SEG_ARGS+=(--require_label)
 fi
 
 EXTRA_ARGS=("$@")

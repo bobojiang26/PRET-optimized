@@ -163,6 +163,13 @@ python core/main.py \
   ...
 ```
 
+With the h5 wrapper, either pass it through as an extra argument or set `REQUIRE_LABEL=1`:
+
+```bash
+REQUIRE_LABEL=1 bash scripts/run_h5_eval.sh
+bash scripts/run_h5_eval.sh --require_label
+```
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
@@ -594,9 +601,9 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
 
 16. **无标签样本过滤**
    - 新增 `--require_label` 开关（默认关闭）。
-   - 开启后，所有缺少 `wsi_label`/`wsi_labels` 或带有 `pseudo_label` 标记的 WSI 会在 example 库构建和 val/test 评测前被过滤掉。
+   - 开启后，所有缺少有效 `wsi_label`/`wsi_labels` 或带有 `pseudo_label` 标记的 WSI 会在 example 库构建和 val/test 评测前被过滤掉。
    - 适用场景：数据集中混有无标签样本，但不希望它们参与 in-context example 选择或影响评测指标。
-   - 用法：在命令行或环境变量中加 `--require_label` 即可，无需调整其他参数。
+   - 用法：直接运行 `core/main.py` 时加 `--require_label`；通过 h5 wrapper 时可用 `REQUIRE_LABEL=1 bash scripts/run_h5_eval.sh`，也可以把 `--require_label` 作为 wrapper 的额外参数传入。
 
 ## Citation
 
