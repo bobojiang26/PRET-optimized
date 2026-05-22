@@ -170,6 +170,14 @@ REQUIRE_LABEL=1 bash scripts/run_h5_eval.sh
 bash scripts/run_h5_eval.sh --require_label
 ```
 
+By default PRET chooses each class threshold on the validation split and then reports metrics on the test split (`--threshold_source val`). For oracle-style diagnostics, you can instead put every non-example WSI into the test/calibration set, choose the threshold on that same set, and report metrics with that threshold:
+
+```bash
+THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh
+```
+
+The direct equivalent is `python core/main.py ... --threshold_source test`. In this mode, `VAL_NUM`, `TEST_NUM`, `--val_ratio`, fixed test flags, and `--disjoint_val_test_split` no longer control the evaluation split: after examples are sampled, all remaining WSIs become the test/calibration set and the terminal prints `threshold_source=test: using all non-example WSIs as test/calibration set`. Because the threshold is tuned on the same samples being reported, these numbers are optimistic and should be treated as diagnostic rather than strict held-out benchmark metrics.
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
@@ -605,6 +613,12 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 终端会在 dataset loading 阶段输出 `[require_label]` 摘要和最多 20 个跳过样本名，便于确认开关已经生效。
    - 适用场景：数据集中混有无标签样本，但不希望它们参与 in-context example 选择或影响评测指标。
    - 用法：直接运行 `core/main.py` 时加 `--require_label`；通过 h5 wrapper 时可用 `REQUIRE_LABEL=1 bash scripts/run_h5_eval.sh`，也可以把 `--require_label` 作为 wrapper 的额外参数传入。
+
+17. **测试集阈值诊断模式**
+   - 新增 `--threshold_source val|test`，默认 `val`，保持原有逻辑：在 validation set 上选择每个类别的阈值，再用该阈值评估 test set。
+   - 设置 `--threshold_source test` 后，PRET 会在 example 采样完成后，把除 example 之外的所有 WSI 都作为 test/calibration set；阈值也从这批 test 样本上推出。
+   - 该模式下终端会打印 `threshold_source=test: using all non-example WSIs as test/calibration set`，逐类指标会显示 `calib(test) auc/acc` 和 `test auc/f1/acc`。
+   - 通过 h5 wrapper 可用 `THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh`。注意该模式是在测试集自身调阈值，指标会偏乐观，建议用于真实数据排查和上限诊断，不作为严格 held-out benchmark。
 
 ## Citation
 

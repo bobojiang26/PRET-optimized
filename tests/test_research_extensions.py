@@ -15,6 +15,8 @@ from main import (
     binary_conformal_summary,
     has_real_wsi_label,
     select_validation_names,
+    threshold_source,
+    use_test_threshold,
 )
 
 
@@ -49,6 +51,22 @@ def test_default_validation_selection_preserves_original_order():
     }
 
     assert select_validation_names(names, dataset_info, 2, balanced=False) == ["a", "b"]
+
+
+def test_threshold_source_defaults_to_validation_split():
+    class Args:
+        pass
+
+    assert threshold_source(Args()) == "val"
+    assert not use_test_threshold(Args())
+
+
+def test_threshold_source_can_use_test_split_for_calibration():
+    class Args:
+        threshold_source = "test"
+
+    assert threshold_source(Args()) == "test"
+    assert use_test_threshold(Args())
 
 
 def test_adaptive_similarity_emphasizes_close_references():

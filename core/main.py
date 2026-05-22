@@ -1128,6 +1128,14 @@ def select_validation_names(rest_names, dataset_info, val_num, balanced=False):
     return val_names
 
 
+def threshold_source(args):
+    return getattr(args, 'threshold_source', 'val')
+
+
+def use_test_threshold(args):
+    return threshold_source(args) == 'test'
+
+
 def check_different_patient(example_names, query_candidates, mode='TCGA'):
     out = []
     if mode == 'TCGA':
@@ -1262,32 +1270,46 @@ def evaluate(args, val_only=False):
             rest_names = check_different_patient(example_names, rest_names, 'TCGA')
 
         random.shuffle(rest_names)
-        val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        use_balanced_val = getattr(args, 'balanced_val_split', False)
-        use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
-        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
-        if use_disjoint_split:
-            val_name_set = set(val_names)
-            remaining_names = [n for n in rest_names if n not in val_name_set]
+        if use_test_threshold(args):
+            val_names = []
+            test_names = [n for n in all_names if n not in example_names]
+            print(
+                '[split] repeat=' + str(i) +
+                ' threshold_source=test: using all non-example WSIs as test/calibration set; ' +
+                'test=' + str(len(test_names)) + ' val=0'
+            )
         else:
-            remaining_names = rest_names
-        if args.c > 1 and use_balanced_val:
-            print('[split] repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
-
-        # split test set by ratio, if no fixed test set
-        if len(test_names) == 0:
-            if args.val_ratio < 0:
-                test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
+            val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
+            use_balanced_val = getattr(args, 'balanced_val_split', False)
+            use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
+            val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+            if use_disjoint_split:
+                val_name_set = set(val_names)
+                remaining_names = [n for n in rest_names if n not in val_name_set]
             else:
-                test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
-            if len(val_names) + len(test_names) > len(rest_names):
-                print('wrong split size !!!')
-        else: # take partial test slides for tcga cross races
-            random.shuffle(test_names)
-            if args.test_num > 0:
-                test_names = test_names[:args.test_num]
+                remaining_names = rest_names
+            if args.c > 1 and use_balanced_val:
+                print('[split] repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
+
+            # split test set by ratio, if no fixed test set
+            if len(test_names) == 0:
+                if args.val_ratio < 0:
+                    test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
+                else:
+                    test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
+                if len(val_names) + len(test_names) > len(rest_names):
+                    print('wrong split size !!!')
+            else: # take partial test slides for tcga cross races
+                random.shuffle(test_names)
+                if args.test_num > 0:
+                    test_names = test_names[:args.test_num]
         
-        records['repeat_' + str(i)]['split'] = {'example_names': example_names, 'val_names': val_names, 'test_names': test_names}
+        records['repeat_' + str(i)]['split'] = {
+            'example_names': example_names,
+            'val_names': val_names,
+            'test_names': test_names,
+            'threshold_source': threshold_source(args),
+        }
         repeat_timer.add('split', time.perf_counter() - split_start)
 
         # ====================== run for each class ======================
@@ -1444,7 +1466,10 @@ def evaluate(args, val_only=False):
             # predict for test slides, name a test slide as query to avoid confusion with test set
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
             wsi_suffix = get_wsi_suffix(args.wsi_path)
-            all_query_names = val_names if val_only else val_names + test_names
+            if use_test_threshold(args):
+                all_query_names = test_names
+            else:
+                all_query_names = val_names if val_only else val_names + test_names
             for n in all_query_names:
                 io_start = time.perf_counter()
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
@@ -1515,25 +1540,39 @@ def evaluate(args, val_only=False):
             # Evaluate on the val set to make sure qualified results for application
             # Val set also guidances to select prediction threshod, f1 for seg. acc for others
             validation_start = time.perf_counter()
-            val_preds = torch.cat(val_preds).cpu()
-            val_labels = torch.cat(val_labels)
-            val_auc = safe_binary_auc(val_labels.numpy(), val_preds.numpy())
-            if not val_only:
+            if use_test_threshold(args):
+                if not test_preds:
+                    raise ValueError('threshold_source=test requires at least one non-example test WSI.')
                 test_preds = torch.cat(test_preds).cpu()
                 test_labels = torch.cat(test_labels)
-            
+                calib_preds = test_preds
+                calib_labels = test_labels
+                eval_preds = test_preds
+                eval_labels = test_labels
+            else:
+                if not val_preds:
+                    raise ValueError('threshold_source=val requires at least one validation WSI.')
+                val_preds = torch.cat(val_preds).cpu()
+                val_labels = torch.cat(val_labels)
+                calib_preds = val_preds
+                calib_labels = val_labels
+                if not val_only:
+                    test_preds = torch.cat(test_preds).cpu()
+                    test_labels = torch.cat(test_labels)
+                    eval_preds = test_preds
+                    eval_labels = test_labels
+                else:
+                    eval_preds = val_preds
+                    eval_labels = val_labels
+
+            calib_auc = safe_binary_auc(calib_labels.numpy(), calib_preds.numpy())
             thresh, best_acc_score, _ = select_binary_threshold(
-                val_labels.numpy(), val_preds.numpy(), prefer_f1=args.seg
+                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg
             )
 
-            if val_only:
-                preds = val_preds
-                thresh_preds = (val_preds > thresh).float()
-                labels = val_labels
-            else:
-                preds = test_preds
-                thresh_preds = (test_preds > thresh).float()
-                labels = test_labels
+            preds = eval_preds
+            thresh_preds = (eval_preds > thresh).float()
+            labels = eval_labels
 
             acc = ((thresh_preds == labels).sum() / labels.shape[0]).cpu().item()
             label_pos = labels.sum().clamp_min(1)
@@ -1549,11 +1588,15 @@ def evaluate(args, val_only=False):
             f1_list.append(f1)
             acc_list.append(acc)
             if not val_only:
-                conformal = binary_conformal_summary(
-                    val_preds, val_labels, preds, labels, thresh, args.conformal_alpha
-                )
-                s = 'class:' + str(cls) + ' val auc:' + str(round(val_auc, 4)) + ', test auc:' + str(round(auc, 4)) + \
-                    ', val acc: ' + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + \
+                conformal = None
+                if not use_test_threshold(args):
+                    conformal = binary_conformal_summary(
+                        calib_preds, calib_labels, preds, labels, thresh, args.conformal_alpha
+                    )
+                source_name = threshold_source(args)
+                source_display = 'calib(test)' if use_test_threshold(args) else 'val'
+                s = 'class:' + str(cls) + ' ' + source_display + ' auc:' + str(round(calib_auc, 4)) + ', test auc:' + str(round(auc, 4)) + \
+                    ', ' + source_display + ' acc: ' + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + \
                     ', test acc: ' + str(round(acc, 4))
                 print(s)
                 txt_rec.append(s)
@@ -1562,8 +1605,17 @@ def evaluate(args, val_only=False):
                         ', avg set size:' + str(conformal['avg_set_size'])
                     print(conformal_s)
                     txt_rec.append(conformal_s)
-                records['repeat_' + str(i)]['results_cls' + str(cls)] = {'val_auc': round(val_auc, 4), 'test_auc': round(auc, 4), \
-                        'val_acc': round(best_acc_score, 4), 'test_f1': round(f1, 4), 'test_acc': round(acc, 4)}
+                records['repeat_' + str(i)]['results_cls' + str(cls)] = {
+                    'threshold_source': source_name,
+                    'calibration_auc': round(calib_auc, 4),
+                    'test_auc': round(auc, 4),
+                    'calibration_acc': round(best_acc_score, 4),
+                    'test_f1': round(f1, 4),
+                    'test_acc': round(acc, 4),
+                    # Backward-compatible aliases: these refer to the calibration split.
+                    'val_auc': round(calib_auc, 4),
+                    'val_acc': round(best_acc_score, 4),
+                }
                 records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                         'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
                 if conformal is not None:
@@ -1571,7 +1623,7 @@ def evaluate(args, val_only=False):
                 if multilabel and not args.seg:
                     multilabel_repeat[cls] = {
                         'threshold': float(thresh),
-                        'names': list(val_names if val_only else test_names),
+                        'names': list(test_names if use_test_threshold(args) else (val_names if val_only else test_names)),
                         'logits': preds.cpu().numpy().reshape(-1),
                         'labels': labels.cpu().numpy().astype(int).reshape(-1),
                         'preds': thresh_preds.cpu().numpy().astype(int).reshape(-1),
@@ -1670,7 +1722,6 @@ def evaluate(args, val_only=False):
 
 def evaluate_baseline(args, mode):
     auc_list, f1_list, acc_list, example_list = [], [], [], []
-    aucroc = torchmetrics.AUROC(task='binary', num_classes=1)
     dataset_info = load_dataset_info(args, context=f'baseline {mode}')
     multilabel = dataset_is_multilabel(dataset_info, args)
     all_names = dataset_info.keys()
@@ -1779,32 +1830,46 @@ def evaluate_baseline(args, mode):
             rest_names = check_different_patient(example_names, rest_names, 'LN')
 
         random.shuffle(rest_names)
-        val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
-        use_balanced_val = getattr(args, 'balanced_val_split', False)
-        use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
-        val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
-        if use_disjoint_split:
-            val_name_set = set(val_names)
-            remaining_names = [n for n in rest_names if n not in val_name_set]
+        if use_test_threshold(args):
+            val_names = []
+            test_names = [n for n in all_names if n not in example_names]
+            print(
+                '[split] baseline ' + mode + ' repeat=' + str(i) +
+                ' threshold_source=test: using all non-example WSIs as test/calibration set; ' +
+                'test=' + str(len(test_names)) + ' val=0'
+            )
         else:
-            remaining_names = rest_names
-        if args.c > 1 and use_balanced_val:
-            print('[split] baseline ' + mode + ' repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
-
-        # split test set by ratio, if no fixed test set
-        if len(test_names) == 0:
-            if args.val_ratio < 0:
-                test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
+            val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
+            use_balanced_val = getattr(args, 'balanced_val_split', False)
+            use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
+            val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+            if use_disjoint_split:
+                val_name_set = set(val_names)
+                remaining_names = [n for n in rest_names if n not in val_name_set]
             else:
-                test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
-            if len(val_names) + len(test_names) > len(rest_names):
-                print('wrong split size !!!')
-        else: # take partial test slides for tcga cross races
-            random.shuffle(test_names)
-            if args.test_num > 0:
-                test_names = test_names[:args.test_num]
+                remaining_names = rest_names
+            if args.c > 1 and use_balanced_val:
+                print('[split] baseline ' + mode + ' repeat=' + str(i) + ' balanced val label counts: ' + format_label_counts(label_counts(val_names, dataset_info)))
 
-        records['repeat_' + str(i)]['split'] = {'example_names': example_names, 'val_names': val_names, 'test_names': test_names}
+            # split test set by ratio, if no fixed test set
+            if len(test_names) == 0:
+                if args.val_ratio < 0:
+                    test_names = remaining_names[-args.test_num:] if args.test_num > 0 else remaining_names
+                else:
+                    test_names = remaining_names if use_disjoint_split else rest_names[val_num:]
+                if len(val_names) + len(test_names) > len(rest_names):
+                    print('wrong split size !!!')
+            else: # take partial test slides for tcga cross races
+                random.shuffle(test_names)
+                if args.test_num > 0:
+                    test_names = test_names[:args.test_num]
+
+        records['repeat_' + str(i)]['split'] = {
+            'example_names': example_names,
+            'val_names': val_names,
+            'test_names': test_names,
+            'threshold_source': threshold_source(args),
+        }
         repeat_timer.add('split', time.perf_counter() - split_start)
         repeat_timer.report()
 
@@ -1940,7 +2005,7 @@ def evaluate_baseline(args, mode):
 
             # predict query
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
-            all_query_names = val_names + test_names
+            all_query_names = test_names if use_test_threshold(args) else val_names + test_names
             for n in all_query_names:
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
                 query_feats = torch.tensor(query_n['features'].astype(np.float32, copy=False)).cuda()
@@ -2042,24 +2107,28 @@ def evaluate_baseline(args, mode):
 
             # ====================== process validation set and assign label ======================
 
-            # search a threshold to predict label on val set for fair comparisions
-            val_preds = torch.cat(val_preds).cpu()
-            val_labels = torch.cat(val_labels)
-            val_auc = aucroc(val_preds, val_labels).item()
-            test_preds = torch.cat(test_preds).cpu()
-            test_labels = torch.cat(test_labels)
-            
-            precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
-            if args.seg:
-                f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
-                best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
-                best_acc_score = accs[best_f1_score_index]
-                thresh = thresholds[best_f1_score_index]
+            # search a threshold on the selected calibration split.
+            if use_test_threshold(args):
+                if not test_preds:
+                    raise ValueError('threshold_source=test requires at least one non-example test WSI.')
+                test_preds = torch.cat(test_preds).cpu()
+                test_labels = torch.cat(test_labels)
+                calib_preds = test_preds
+                calib_labels = test_labels
             else:
-                best_acc_score = np.max(accs[np.isfinite(accs)])
-                best_acc_score_index = np.argmax(accs[np.isfinite(accs)])
-                thresh = thresholds[best_acc_score_index]
+                if not val_preds:
+                    raise ValueError('threshold_source=val requires at least one validation WSI.')
+                val_preds = torch.cat(val_preds).cpu()
+                val_labels = torch.cat(val_labels)
+                test_preds = torch.cat(test_preds).cpu()
+                test_labels = torch.cat(test_labels)
+                calib_preds = val_preds
+                calib_labels = val_labels
+
+            calib_auc = safe_binary_auc(calib_labels.numpy(), calib_preds.numpy())
+            thresh, best_acc_score, _ = select_binary_threshold(
+                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg
+            )
 
             preds = test_preds
             thresh_preds = (test_preds > thresh).float()
@@ -2069,17 +2138,21 @@ def evaluate_baseline(args, mode):
             pred_pos = thresh_preds.sum().clamp_min(1)
             rec = ((thresh_preds * labels).sum() / label_pos).cpu().item()
             pre = ((thresh_preds * labels).sum() / pred_pos).cpu().item()
-            auc = aucroc(preds, labels).item()
+            auc = safe_binary_auc(labels.numpy(), preds.numpy())
             f1 = rec * pre * 2 / (rec + pre) if rec + pre > 0 else 0
 
             auc_list.append(auc)
             f1_list.append(f1)
             acc_list.append(acc)
 
-            conformal = binary_conformal_summary(
-                val_preds, val_labels, preds, labels, thresh, args.conformal_alpha
-            )
-            s = 'class:' + str(cls) + ' val auc:' + str(round(val_auc, 4)) + ', test auc:' + str(round(auc, 4)) + ', val acc: ' \
+            conformal = None
+            if not use_test_threshold(args):
+                conformal = binary_conformal_summary(
+                    calib_preds, calib_labels, preds, labels, thresh, args.conformal_alpha
+                )
+            source_name = threshold_source(args)
+            source_display = 'calib(test)' if use_test_threshold(args) else 'val'
+            s = 'class:' + str(cls) + ' ' + source_display + ' auc:' + str(round(calib_auc, 4)) + ', test auc:' + str(round(auc, 4)) + ', ' + source_display + ' acc: ' \
                  + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + ', test acc: ' + str(round(acc, 4))
             print(s)
             txt_rec.append(s)
@@ -2088,8 +2161,16 @@ def evaluate_baseline(args, mode):
                     ', avg set size:' + str(conformal['avg_set_size'])
                 print(conformal_s)
                 txt_rec.append(conformal_s)
-            records['repeat_' + str(i)]['results_cls' + str(cls)] = {'val_auc': round(val_auc, 4), 'test_auc': round(auc, 4), \
-                    'val_acc': round(best_acc_score, 4), 'test_f1': round(f1, 4), 'test_acc': round(acc, 4)}
+            records['repeat_' + str(i)]['results_cls' + str(cls)] = {
+                'threshold_source': source_name,
+                'calibration_auc': round(calib_auc, 4),
+                'test_auc': round(auc, 4),
+                'calibration_acc': round(best_acc_score, 4),
+                'test_f1': round(f1, 4),
+                'test_acc': round(acc, 4),
+                'val_auc': round(calib_auc, 4),
+                'val_acc': round(best_acc_score, 4),
+            }
             records['repeat_' + str(i)]['pred_cls' + str(cls)] = {'labels': labels.cpu().tolist(), \
                     'logits': preds.cpu().tolist(), 'preds': thresh_preds.cpu().tolist()}
             if conformal is not None:
@@ -2203,6 +2284,8 @@ if __name__ == '__main__':
         help='balance validation slides by class label; default off to preserve original PRET split semantics')
     parser.add_argument('--disjoint_val_test_split', default=False, action='store_true',
         help='remove validation slides before selecting test slides; default off to preserve original PRET split semantics')
+    parser.add_argument('--threshold_source', default='val', choices=['val', 'test'],
+        help='split used to choose per-class decision thresholds; test uses all non-example WSIs as test/calibration and is for oracle diagnostics only')
     parser.add_argument('--require_label', default=False, action='store_true',
         help='exclude WSIs without real labels from example construction and evaluation; unlabeled and pseudo-labeled slides are skipped')
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',
