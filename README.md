@@ -178,6 +178,14 @@ THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh
 
 The direct equivalent is `python core/main.py ... --threshold_source test`. In this mode, `VAL_NUM`, `TEST_NUM`, `--val_ratio`, fixed test flags, and `--disjoint_val_test_split` no longer control the evaluation split: after examples are sampled, all remaining WSIs become the test/calibration set and the terminal prints `threshold_source=test: using all non-example WSIs as test/calibration set`. Because the threshold is tuned on the same samples being reported, these numbers are optimistic and should be treated as diagnostic rather than strict held-out benchmark metrics.
 
+If a fixed shot count underuses large classes, set an example ratio instead of relying on `EXAMPLE_NUM`. Add a per-class cap to avoid loading too many reference examples into GPU memory. For example, this samples at most 60% of each class candidate pool, rounded up per class, but never more than 20 WSIs per class:
+
+```bash
+EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh
+```
+
+The direct equivalent is `python core/main.py ... --example_ratio 0.6 --example_ratio_max_per_class 20`. When `--example_ratio` is greater than `0`, it overrides fixed `--example_num`/`MULTIPLE_NUM` sampling. The terminal prints both the ratio-derived target counts and the actual selected label counts, for example `example_ratio=0.6 max_per_class=20 target label counts: 1:20, 2:20`.
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
@@ -619,6 +627,13 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 设置 `--threshold_source test` 后，PRET 会在 example 采样完成后，把除 example 之外的所有 WSI 都作为 test/calibration set；阈值也从这批 test 样本上推出。
    - 该模式下终端会打印 `threshold_source=test: using all non-example WSIs as test/calibration set`，逐类指标会显示 `calib(test) auc/acc` 和 `test auc/f1/acc`。
    - 通过 h5 wrapper 可用 `THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh`。注意该模式是在测试集自身调阈值，指标会偏乐观，建议用于真实数据排查和上限诊断，不作为严格 held-out benchmark。
+
+18. **按类别比例采样 example**
+   - 新增 `--example_ratio`，默认 `0`，保持原来的固定 `--example_num` / few-shot 采样。
+   - 设置 `--example_ratio 0.6` 后，每个类别会按可作为 example 的候选 WSI 总数计算目标数量，并向上取整，例如某类有 13 张候选 WSI，会选 8 张作为 example。
+   - 新增 `--example_ratio_max_per_class`，只在 `--example_ratio > 0` 时生效；默认 `0` 表示不设上限。比如 `--example_ratio 0.6 --example_ratio_max_per_class 20` 表示每类先按 60% 计算，再最多保留 20 张，避免显存被过大的 example 库撑爆。
+   - 通过 h5 wrapper 可用 `EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh`。
+   - 当 `--example_ratio > 0` 时，会覆盖固定 shot 数和 `MULTIPLE_NUM`；终端会打印 ratio 目标数量、max_per_class 和实际 example label counts，方便确认每类是否按预期进入 example 库。
 
 ## Citation
 

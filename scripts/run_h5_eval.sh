@@ -22,6 +22,8 @@ H5_PATCH_SIZE="${H5_PATCH_SIZE:-0}"
 SEG="${SEG:-0}"
 MULTILABEL="${MULTILABEL:-0}"
 EXAMPLE_NUM="${EXAMPLE_NUM:-1}"
+EXAMPLE_RATIO="${EXAMPLE_RATIO:-}"
+EXAMPLE_RATIO_MAX_PER_CLASS="${EXAMPLE_RATIO_MAX_PER_CLASS:-}"
 RUNS="${RUNS:-1}"
 VAL_NUM="${VAL_NUM:-6}"
 TEST_NUM="${TEST_NUM:-6}"
@@ -67,6 +69,12 @@ if [[ -n "${REFERENCE_RANDOM_RATIO}" ]]; then
 fi
 
 RESEARCH_ARGS=()
+if [[ -n "${EXAMPLE_RATIO}" ]]; then
+  RESEARCH_ARGS+=(--example_ratio "${EXAMPLE_RATIO}")
+fi
+if [[ -n "${EXAMPLE_RATIO_MAX_PER_CLASS}" ]]; then
+  RESEARCH_ARGS+=(--example_ratio_max_per_class "${EXAMPLE_RATIO_MAX_PER_CLASS}")
+fi
 if [[ -n "${SIMILARITY_AGGREGATION}" ]]; then
   RESEARCH_ARGS+=(--similarity_aggregation "${SIMILARITY_AGGREGATION}")
 fi

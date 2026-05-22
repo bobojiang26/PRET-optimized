@@ -13,7 +13,9 @@ from main import (
     apply_context_feature_centering,
     apply_require_label_filter,
     binary_conformal_summary,
+    get_example_names_at_label_ratio,
     has_real_wsi_label,
+    label_counts,
     select_validation_names,
     threshold_source,
     use_test_threshold,
@@ -67,6 +69,49 @@ def test_threshold_source_can_use_test_split_for_calibration():
 
     assert threshold_source(Args()) == "test"
     assert use_test_threshold(Args())
+
+
+def test_example_ratio_selects_per_class_ceiling_targets():
+    names = ["a0", "a1", "a2", "b0", "b1", "b2", "b3", "b4"]
+    dataset_info = {
+        "a0": {"wsi_label": 1},
+        "a1": {"wsi_label": 1},
+        "a2": {"wsi_label": 1},
+        "b0": {"wsi_label": 2},
+        "b1": {"wsi_label": 2},
+        "b2": {"wsi_label": 2},
+        "b3": {"wsi_label": 2},
+        "b4": {"wsi_label": 2},
+    }
+
+    selected, targets = get_example_names_at_label_ratio(
+        names, dataset_info, 0.6, check_num=True, expected_labels=[1, 2]
+    )
+
+    assert targets == {1: 2, 2: 3}
+    assert label_counts(selected, dataset_info) == targets
+
+
+def test_example_ratio_respects_per_class_cap():
+    names = ["a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3", "b4"]
+    dataset_info = {
+        "a0": {"wsi_label": 1},
+        "a1": {"wsi_label": 1},
+        "a2": {"wsi_label": 1},
+        "a3": {"wsi_label": 1},
+        "b0": {"wsi_label": 2},
+        "b1": {"wsi_label": 2},
+        "b2": {"wsi_label": 2},
+        "b3": {"wsi_label": 2},
+        "b4": {"wsi_label": 2},
+    }
+
+    selected, targets = get_example_names_at_label_ratio(
+        names, dataset_info, 0.8, max_per_class=2, check_num=True, expected_labels=[1, 2]
+    )
+
+    assert targets == {1: 2, 2: 2}
+    assert label_counts(selected, dataset_info) == targets
 
 
 def test_adaptive_similarity_emphasizes_close_references():

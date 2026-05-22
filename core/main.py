@@ -933,7 +933,7 @@ def macro_value(l, n):
     return out
 
 
-def get_example_names_at_same_num(all_names, dataset_info, example_num, check_num=False, expected_labels=None):
+def group_names_by_wsi_label(all_names, dataset_info):
     record = {}
     for n in all_names:
         labels = get_wsi_label_ids(dataset_info[n])
@@ -943,6 +943,11 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
             if lb not in record:
                 record[lb] = []
             record[lb].append(n)
+    return record
+
+
+def get_example_names_at_same_num(all_names, dataset_info, example_num, check_num=False, expected_labels=None):
+    record = group_names_by_wsi_label(all_names, dataset_info)
 
     labels = list(expected_labels) if expected_labels is not None else list(record.keys())
     if check_num:
@@ -970,6 +975,95 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
                 seen.add(name)
 
     return names
+
+
+def example_ratio(args):
+    return float(getattr(args, 'example_ratio', 0.0) or 0.0)
+
+
+def use_example_ratio(args):
+    return example_ratio(args) > 0.0
+
+
+def example_ratio_max_per_class(args):
+    return int(getattr(args, 'example_ratio_max_per_class', 0) or 0)
+
+
+def example_count_from_ratio(candidate_num, ratio, max_per_class=0):
+    if candidate_num <= 0:
+        return 0
+    count = min(candidate_num, max(1, int(math.ceil(candidate_num * ratio))))
+    if max_per_class > 0:
+        count = min(count, max_per_class)
+    return count
+
+
+def get_example_names_at_label_ratio(all_names, dataset_info, ratio, max_per_class=0, check_num=False, expected_labels=None):
+    record = group_names_by_wsi_label(all_names, dataset_info)
+    labels = list(expected_labels) if expected_labels is not None else list(record.keys())
+
+    if check_num:
+        shortages = [str(k) for k in labels if len(record.get(k, [])) == 0]
+        if shortages:
+            counts = ', '.join(f'{k}:{len(record[k])}' for k in sorted(record))
+            raise ValueError(
+                'Insufficient example WSIs for ratio-based multiclass sampling. '
+                f'Missing classes: {", ".join(shortages)}. '
+                f'Candidate label counts: {counts}.'
+            )
+
+    target_counts = {
+        k: example_count_from_ratio(len(record.get(k, [])), ratio, max_per_class)
+        for k in labels
+    }
+
+    names = []
+    seen = set()
+    for k in labels:
+        for name in record.get(k, [])[:target_counts[k]]:
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
+
+    return names, target_counts
+
+
+def select_example_names(labeled_names, dataset_info, args):
+    ratio = example_ratio(args)
+    max_per_class = example_ratio_max_per_class(args)
+    if args.c > 1 or args.prompt_type == 'slideLabel':
+        expected_labels = range(1, args.c + 1) if args.c > 1 else None
+        if ratio > 0.0:
+            return get_example_names_at_label_ratio(
+                labeled_names, dataset_info, ratio, max_per_class, args.c > 1, expected_labels
+            )
+        return get_example_names_at_same_num(
+            labeled_names, dataset_info, args.example_num, args.c > 1, expected_labels
+        ), None
+
+    if ratio > 0.0:
+        target_count = example_count_from_ratio(len(labeled_names), ratio, max_per_class)
+        return labeled_names[:target_count], {1: target_count}
+
+    return labeled_names[:args.example_num], None
+
+
+def example_run_values(args):
+    if use_example_ratio(args):
+        return [args.example_num]
+    return [args.example_num] if args.multiple_num == None else args.multiple_num
+
+
+def example_run_label(args, p):
+    if use_example_ratio(args):
+        return 'example_ratio=' + str(example_ratio(args))
+    return str(p) + '-shot'
+
+
+def example_record_key(args, p):
+    if use_example_ratio(args):
+        return 'example_ratio_' + str(example_ratio(args))
+    return str(p) + '-shot'
 
 
 def label_counts(names, dataset_info):
@@ -1230,28 +1324,31 @@ def evaluate(args, val_only=False):
                     neg_names.append(n)
 
         # shuffle example till each run is different
+        example_attempts = 0
         while True:
+            example_attempts += 1
             random.shuffle(labeled_names)
-
-            # randomly select "args.example_num" examples for each class
-            # note: for binary tasks 'slideLabel' use N // 2 pos and N // 2 neg
-            if args.c > 1 or args.prompt_type == 'slideLabel':
-                expected_labels = range(1, args.c + 1) if args.c > 1 else None
-                example_i = get_example_names_at_same_num(
-                    labeled_names, dataset_info, args.example_num, args.c > 1, expected_labels
-                )
-
-            # randomly select "args.example_num" positive examples for binary tasks
-            else:
-                example_i = labeled_names[:args.example_num]
+            example_i, example_target_counts = select_example_names(labeled_names, dataset_info, args)
 
             # avoid repeat example
             example_i.sort()
-            if example_i not in example_list:
+            if example_i not in example_list or example_attempts >= 1000:
+                if example_i in example_list and example_attempts >= 1000:
+                    print(
+                        '[split] repeat=' + str(i) +
+                        ' could not find a new unique example set after 1000 attempts; reusing a previous set.'
+                    )
                 example_list.append(example_i)
                 example_names = example_i
                 break
-        if args.c > 1:
+        if use_example_ratio(args):
+            print(
+                '[split] repeat=' + str(i) +
+                ' example_ratio=' + str(example_ratio(args)) +
+                ' max_per_class=' + str(example_ratio_max_per_class(args)) +
+                ' target label counts: ' + format_label_counts(example_target_counts)
+            )
+        if args.c > 1 or use_example_ratio(args):
             print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
 
         # split val set out of example and test set
@@ -1310,6 +1407,10 @@ def evaluate(args, val_only=False):
             'test_names': test_names,
             'threshold_source': threshold_source(args),
         }
+        if use_example_ratio(args):
+            records['repeat_' + str(i)]['split']['example_ratio'] = example_ratio(args)
+            records['repeat_' + str(i)]['split']['example_ratio_max_per_class'] = example_ratio_max_per_class(args)
+            records['repeat_' + str(i)]['split']['example_target_counts'] = example_target_counts
         repeat_timer.add('split', time.perf_counter() - split_start)
 
         # ====================== run for each class ======================
@@ -1789,28 +1890,31 @@ def evaluate_baseline(args, mode):
                     neg_names.append(n)
 
         # shuffle example till each run is different
+        example_attempts = 0
         while True:
+            example_attempts += 1
             random.shuffle(labeled_names)
-
-            # randomly select "args.example_num" examples for each class
-            # note: for binary tasks 'slideLabel' use N // 2 pos and N // 2 neg
-            if args.c > 1 or args.prompt_type == 'slideLabel':
-                expected_labels = range(1, args.c + 1) if args.c > 1 else None
-                example_i = get_example_names_at_same_num(
-                    labeled_names, dataset_info, args.example_num, args.c > 1, expected_labels
-                )
-
-            # randomly select "args.example_num" positive examples for binary tasks
-            else:
-                example_i = labeled_names[:args.example_num]
+            example_i, example_target_counts = select_example_names(labeled_names, dataset_info, args)
 
             # avoid repeat example
             example_i.sort()
-            if example_i not in example_list:
+            if example_i not in example_list or example_attempts >= 1000:
+                if example_i in example_list and example_attempts >= 1000:
+                    print(
+                        '[split] baseline ' + mode + ' repeat=' + str(i) +
+                        ' could not find a new unique example set after 1000 attempts; reusing a previous set.'
+                    )
                 example_list.append(example_i)
                 example_names = example_i
                 break
-        if args.c > 1:
+        if use_example_ratio(args):
+            print(
+                '[split] baseline ' + mode + ' repeat=' + str(i) +
+                ' example_ratio=' + str(example_ratio(args)) +
+                ' max_per_class=' + str(example_ratio_max_per_class(args)) +
+                ' target label counts: ' + format_label_counts(example_target_counts)
+            )
+        if args.c > 1 or use_example_ratio(args):
             print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
 
         # split val set out of example and test set
@@ -1870,6 +1974,10 @@ def evaluate_baseline(args, mode):
             'test_names': test_names,
             'threshold_source': threshold_source(args),
         }
+        if use_example_ratio(args):
+            records['repeat_' + str(i)]['split']['example_ratio'] = example_ratio(args)
+            records['repeat_' + str(i)]['split']['example_ratio_max_per_class'] = example_ratio_max_per_class(args)
+            records['repeat_' + str(i)]['split']['example_target_counts'] = example_target_counts
         repeat_timer.add('split', time.perf_counter() - split_start)
         repeat_timer.report()
 
@@ -2218,6 +2326,10 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', default=10, type=float, help='Temperature for sample reweights')
     parser.add_argument('--related_thresh', default=0.88, type=float, help='cosine similarity threshold to select related patchs')
     parser.add_argument('--example_num', default=3, type=int, help='number of wsi for init example')
+    parser.add_argument('--example_ratio', default=0.0, type=float,
+        help='if >0, sample this fraction of each label candidate pool as examples; overrides fixed example_num sampling')
+    parser.add_argument('--example_ratio_max_per_class', default=0, type=int,
+        help='maximum examples per class when --example_ratio is used; 0 means no cap')
     parser.add_argument('--multiple_num', type=int, nargs='+', default=None, help='multi example num')
     parser.add_argument('--reference_token_budget', default=0, type=int,
         help='maximum number of reference tokens kept after tagger; 0 keeps all tokens')
@@ -2291,6 +2403,10 @@ if __name__ == '__main__':
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',
         help='also seed torch random sampling; default off to preserve original PRET subtyping sampler behavior')
     args = parser.parse_args()
+    if args.example_ratio < 0.0 or args.example_ratio > 1.0:
+        parser.error('--example_ratio must be in [0, 1]')
+    if args.example_ratio_max_per_class < 0:
+        parser.error('--example_ratio_max_per_class must be >= 0')
     if args.h5_pixel_step_threshold <= 0:
         parser.error('--h5_pixel_step_threshold must be positive')
 
@@ -2309,46 +2425,47 @@ if __name__ == '__main__':
     if args.mode == 'eval':
         print(args)
         records = {}
-        num = [args.example_num] if args.multiple_num == None else args.multiple_num
+        num = example_run_values(args)
         for p in num:
-            print('eval %d-shot:' % (p))
+            print('eval ' + example_run_label(args, p) + ':')
             random.seed(args.seed)
             args.example_num = p
             res, rec = evaluate(args)
-            records[str(p) + '-shot'] = rec
+            records[example_record_key(args, p)] = rec
 
         save_numpy_records(args.dump_records, records)
     
     # run baselines
     if args.mode == 'baselines':
         records = {}
-        num = [args.example_num] if args.multiple_num == None else args.multiple_num
+        num = example_run_values(args)
         for p in num:
-            print('eval %d-shot:' % (p))
+            print('eval ' + example_run_label(args, p) + ':')
             args.example_num = p
-            records[str(p) + '-shot'] = {}
+            record_key = example_record_key(args, p)
+            records[record_key] = {}
 
             # segmentation need patch predictions, knn is conducted on wsi-level
             if not args.seg and args.vis_path == '':
-                print('mode: knn_mean, example ' + str(args.example_num))
+                print('mode: knn_mean, ' + example_run_label(args, p))
                 random.seed(args.seed)
                 rec_knn_mean = evaluate_baseline(args, 'knn_mean')
-                records[str(p) + '-shot']['knn_mean'] = rec_knn_mean
+                records[record_key]['knn_mean'] = rec_knn_mean
             
-                print('mode: knn_max, example ' + str(args.example_num))
+                print('mode: knn_max, ' + example_run_label(args, p))
                 random.seed(args.seed)
                 rec_knn_max = evaluate_baseline(args, 'knn_max')
-                records[str(p) + '-shot']['knn_max'] = rec_knn_max
+                records[record_key]['knn_max'] = rec_knn_max
             
-            print('mode: prototype, example ' + str(args.example_num))
+            print('mode: prototype, ' + example_run_label(args, p))
             random.seed(args.seed)
             rec_proto = evaluate_baseline(args, 'prototype')
-            records[str(p) + '-shot']['prototype'] = rec_proto
+            records[record_key]['prototype'] = rec_proto
 
-            print('mode: prototype_simple_shot, example ' + str(args.example_num))
+            print('mode: prototype_simple_shot, ' + example_run_label(args, p))
             random.seed(args.seed)
             rec_simp = evaluate_baseline(args, 'prototype_simple_shot')
-            records[str(p) + '-shot']['simple_Shot'] = rec_simp
+            records[record_key]['simple_Shot'] = rec_simp
 
         save_numpy_records(args.dump_records, records)
 
@@ -2448,13 +2565,13 @@ if __name__ == '__main__':
 
         print(args)
         records = {}
-        num = [args.example_num] if args.multiple_num == None else args.multiple_num
+        num = example_run_values(args)
         for p in num:
-            print('eval %d-shot:' % (p))
+            print('eval ' + example_run_label(args, p) + ':')
             random.seed(args.seed)
             args.example_num = p
             res, rec = evaluate(args)
-            records[str(p) + '-shot'] = rec
+            records[example_record_key(args, p)] = rec
         
         # save results
         save_numpy_records(args.dump_records, records)
