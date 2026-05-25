@@ -186,7 +186,7 @@ EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh
 
 The direct equivalent is `python core/main.py ... --example_ratio 0.6 --example_ratio_max_per_class 20`. When `--example_ratio` is greater than `0`, it overrides fixed `--example_num`/`MULTIPLE_NUM` sampling. The terminal prints both the ratio-derived target counts and the actual selected label counts, for example `example_ratio=0.6 max_per_class=20 target label counts: 1:20, 2:20`.
 
-To inspect weak classes, visualize the actual example/reference token pool used by PRET. This runs the same example sampling, one-vs-rest class labeling, optional tagger refinement, and optional reference token sparsification, then writes one t-SNE plot plus a CSV per class:
+To inspect weak classes, visualize the actual example/reference token pool used by PRET. This runs the same example sampling, one-vs-rest class labeling, optional tagger refinement, and optional reference token sparsification, then writes one combined t-SNE plot plus a CSV with all selected classes in the same feature space:
 
 ```bash
 python scripts/visualize_example_tokens.py \
@@ -196,7 +196,7 @@ python scripts/visualize_example_tokens.py \
   --dataset_info data_info/MY_H5.json \
   --prompt_type slideLabel \
   --class_num 17 \
-  --classes 10 13 14 \
+  --all_classes \
   --example_ratio 0.6 \
   --example_ratio_max_per_class 20 \
   --reference_token_budget 30000 \
@@ -205,7 +205,9 @@ python scripts/visualize_example_tokens.py \
   --out_dir records/example_token_vis
 ```
 
-Outputs include `summary.json`, `class_{id}_tokens_tsne.csv`, and `class_{id}_tokens_tsne.svg`; if `matplotlib` is installed, PNG plots are written too. In the plot/CSV, token labels are `1=target_class`, `0=other_class`, `255=background`, `254=uncertain`, and `-1=unknown`.
+Outputs include `summary.json`, `combined_classes_tokens_tsne.csv`, and `combined_classes_tokens_tsne.svg`; if `matplotlib` is installed, a PNG plot is written too. In the combined plot/CSV, each point is a positive/target example token and the color/`class` column is the class id. To focus on a subset, replace `--all_classes` with `--classes 10 13 14`. To also write the older per-class one-vs-rest plots, add `--plot_mode both`; those per-class CSVs use token labels `1=target_class`, `0=other_class`, `255=background`, `254=uncertain`, and `-1=unknown`.
+
+If the script reports that `sparsify_reference_tokens()` got an unexpected `return_indices` argument, the copied checkout is mixing a new `scripts/visualize_example_tokens.py` with an older `core/main.py`. Sync both files from `optimized/main` before running the visualization, because the script needs the latest sparsification helper to map kept tokens back to their slide/patch names.
 
 ### H5 mask evaluation from CSV annotations
 
@@ -667,8 +669,8 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
 19. **Example token 池可视化诊断**
    - 新增 `scripts/visualize_example_tokens.py`，用于分析某些表现差的类别在 example/reference token 特征空间里的分布。
    - 脚本复用 PRET 的 example 采样、类别 one-vs-rest 标签构建、slideLabel tagger refinement 和可选 reference token 稀疏化，然后用 PCA+t-SNE 降到二维。
-   - 输出每个目标类别的 `class_{id}_tokens_tsne.svg`、`class_{id}_tokens_tsne.csv` 和总览 `summary.json`。CSV 保留每个点的二维坐标、token label、slide 和 patch 名，便于继续排查异常 slide。
-   - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --classes 10 13 14 --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。
+   - 默认输出所有指定类别在同一张图上的 `combined_classes_tokens_tsne.svg`、`combined_classes_tokens_tsne.csv` 和总览 `summary.json`。合并图中每个点都是对应类别的 positive/target example token，颜色代表类别 id；CSV 保留每个点的二维坐标、class、slide 和 patch 名，便于继续排查异常 slide。
+   - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --all_classes --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。如果还需要旧版每个类别单独一张 one-vs-rest 图，加 `--plot_mode both`。
 
 ## Citation
 

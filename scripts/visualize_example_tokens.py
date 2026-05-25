@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import csv
+import inspect
 import json
 import os
 import random
@@ -56,6 +57,14 @@ TOKEN_LABEL_COLORS = {
     255: '#16a34a',
 }
 
+CLASS_COLORS = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    '#393b79', '#637939', '#8c6d31', '#843c39', '#7b4173',
+    '#3182bd', '#31a354', '#756bb1', '#636363', '#e6550d',
+]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Visualize PRET example/reference token pools with t-SNE.'
@@ -66,8 +75,10 @@ def parse_args():
     parser.add_argument('--dataset_info', required=True)
     parser.add_argument('--prompt_type', default='slideLabel')
     parser.add_argument('--prompt_path', default='')
-    parser.add_argument('--classes', type=int, nargs='+', required=True, help='target class ids to visualize')
     parser.add_argument('--class_num', '--c', dest='c', type=int, required=True)
+    parser.add_argument('--classes', type=int, nargs='+', default=None, help='target class ids to visualize')
+    parser.add_argument('--all_classes', action='store_true', help='visualize class ids 0..class_num-1')
+    parser.add_argument('--plot_mode', default='combined', choices=['combined', 'per_class', 'both'])
     parser.add_argument('--out_dir', default='records/example_token_vis')
     parser.add_argument('--seed', type=int, default=1024)
     parser.add_argument('--repeat', type=int, default=0, help='repeat index; repeated shuffles before selecting examples')
@@ -85,10 +96,16 @@ def parse_args():
     parser.add_argument('--reference_anchor_ratio', type=float, default=0.25)
     parser.add_argument('--reference_random_ratio', type=float, default=0.1)
     parser.add_argument('--max_tokens_per_class', type=int, default=10000, help='max tokens sampled for t-SNE plotting per class; 0 keeps all')
+    parser.add_argument('--max_tokens_total', type=int, default=30000, help='max tokens in the combined t-SNE plot; 0 keeps all')
     parser.add_argument('--pca_dim', type=int, default=50)
     parser.add_argument('--perplexity', type=float, default=30.0)
     parser.add_argument('--tsne_iter', type=int, default=1000)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.all_classes:
+        args.classes = list(range(args.c))
+    elif not args.classes:
+        parser.error('provide --classes or use --all_classes')
+    return args
 
 
 def load_labeled_names(dataset_info, args):
@@ -234,6 +251,13 @@ def apply_reference_sparsity(example_feats, example_labels, slide_names, patch_n
     strategy = args.reference_sparsify_strategy
     if strategy == 'auto':
         strategy = 'legacy' if args.c == 1 else 'quality'
+    if 'return_indices' not in inspect.signature(sparsify_reference_tokens).parameters:
+        raise RuntimeError(
+            'The imported core/main.py is older than scripts/visualize_example_tokens.py: '
+            'sparsify_reference_tokens() does not support return_indices. '
+            'Please update/sync core/main.py from optimized/main, or copy the latest '
+            'core/main.py together with this script before running the visualization.'
+        )
     example_feats, example_labels, keep_idxs = sparsify_reference_tokens(
         example_feats,
         example_labels,
@@ -256,6 +280,10 @@ def sample_tokens_for_tsne(feats, labels, slide_names, patch_names, max_tokens, 
         idx = np.sort(rng.choice(total, size=max_tokens, replace=False))
     torch_idx = torch.as_tensor(idx, device=feats.device, dtype=torch.long)
     return feats[torch_idx], labels[idx], slide_names[idx], patch_names[idx]
+
+
+def class_color(label):
+    return CLASS_COLORS[int(label) % len(CLASS_COLORS)]
 
 
 def embed_tokens(feats, args):
@@ -292,6 +320,14 @@ def save_csv(path, embedding, labels, slide_names, patch_names):
                 TOKEN_LABEL_NAMES.get(label_int, str(label_int)),
                 slide, patch,
             ])
+
+
+def save_class_csv(path, embedding, class_labels, slide_names, patch_names):
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['x', 'y', 'class', 'slide', 'patch'])
+        for xy, label, slide, patch in zip(embedding, class_labels, slide_names, patch_names):
+            writer.writerow([float(xy[0]), float(xy[1]), int(label), slide, patch])
 
 
 def save_svg_plot(path, embedding, labels, slide_names, title):
@@ -353,6 +389,63 @@ def save_svg_plot(path, embedding, labels, slide_names, title):
         f.write(svg)
 
 
+def save_svg_class_plot(path, embedding, class_labels, slide_names, title):
+    labels_np = np.asarray(class_labels).astype(int)
+    width, height = 980, 820
+    margin = 70
+    if embedding.shape[0] == 0:
+        xs = np.asarray([])
+        ys = np.asarray([])
+    else:
+        x_min, x_max = float(embedding[:, 0].min()), float(embedding[:, 0].max())
+        y_min, y_max = float(embedding[:, 1].min()), float(embedding[:, 1].max())
+        x_span = max(x_max - x_min, 1e-8)
+        y_span = max(y_max - y_min, 1e-8)
+        xs = margin + (embedding[:, 0] - x_min) / x_span * (width - margin * 2)
+        ys = height - margin - (embedding[:, 1] - y_min) / y_span * (height - margin * 2)
+
+    unique_labels = sorted(set(labels_np.tolist()))
+    legend_items = []
+    y_legend = 44
+    for label in unique_labels:
+        color = class_color(label)
+        legend_items.append(
+            f'<circle cx="780" cy="{y_legend}" r="5" fill="{color}" opacity="0.85" />'
+            f'<text x="794" y="{y_legend + 4}" font-size="12" fill="#111827">'
+            f'class {escape(str(label))}</text>'
+        )
+        y_legend += 20
+
+    points = []
+    for x, y, label, slide in zip(xs, ys, labels_np, slide_names):
+        points.append(
+            f'<circle cx="{float(x):.3f}" cy="{float(y):.3f}" r="2.8" '
+            f'fill="{class_color(label)}" opacity="0.68"><title>{escape(str(slide))} '
+            f'class={int(label)}</title></circle>'
+        )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">\n'
+        '<rect width="100%" height="100%" fill="#ffffff" />\n'
+        f'<text x="{margin}" y="38" font-size="20" font-family="Arial, sans-serif" '
+        f'fill="#111827">{escape(title)}</text>\n'
+        f'<rect x="{margin}" y="{margin}" width="{width - margin * 2}" '
+        f'height="{height - margin * 2}" fill="#f9fafb" stroke="#d1d5db" />\n'
+        + '\n'.join(points) + '\n'
+        + '\n'.join(legend_items) + '\n'
+        f'<text x="{width / 2 - 35:.0f}" y="{height - 24}" font-size="13" '
+        'font-family="Arial, sans-serif" fill="#374151">t-SNE 1</text>\n'
+        f'<text x="18" y="{height / 2 + 35:.0f}" font-size="13" '
+        'font-family="Arial, sans-serif" fill="#374151" '
+        'transform="rotate(-90 18 '
+        f'{height / 2 + 35:.0f})">t-SNE 2</text>\n'
+        '</svg>\n'
+    )
+    with open(path, 'w') as f:
+        f.write(svg)
+
+
 def save_plot(path, embedding, labels, slide_names, title):
     if plt is None:
         print('[warning] matplotlib is not installed; skipped plot generation.')
@@ -377,6 +470,28 @@ def save_plot(path, embedding, labels, slide_names, title):
     plt.close()
 
 
+def save_class_plot(path, embedding, class_labels, slide_names, title):
+    if plt is None:
+        print('[warning] matplotlib is not installed; skipped plot generation.')
+        return
+    labels_np = np.asarray(class_labels).astype(int)
+    unique_labels = sorted(set(labels_np.tolist()))
+    plt.figure(figsize=(9.5, 7.8))
+    for label in unique_labels:
+        mask = labels_np == label
+        plt.scatter(
+            embedding[mask, 0], embedding[mask, 1],
+            s=7, alpha=0.7, color=class_color(label), label=f'class {label}'
+        )
+    plt.title(title)
+    plt.xlabel('t-SNE 1')
+    plt.ylabel('t-SNE 2')
+    plt.legend(markerscale=2, fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(path, dpi=220)
+    plt.close()
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -395,11 +510,18 @@ def main():
 
     summary = {
         'classes': args.classes,
+        'plot_mode': args.plot_mode,
         'example_names': example_names,
         'example_target_counts': target_counts,
         'selected_example_label_counts': label_counts(example_names, dataset_info),
         'outputs': {},
     }
+    combined_feats = []
+    combined_labels = []
+    combined_slides = []
+    combined_patches = []
+    combined_class_counts = {}
+    sparse_strategies = {}
 
     for cls in args.classes:
         print(f'[visualize] class={cls}: loading example token pool')
@@ -415,41 +537,118 @@ def main():
         if args.context_centering == 'example':
             example_feats, _ = apply_context_feature_centering(example_feats, example_feats[:1], mode='example')
 
-        sampled_feats, sampled_labels, sampled_slides, sampled_patches = sample_tokens_for_tsne(
-            example_feats, example_labels.detach().cpu().numpy(), slide_names, patch_names,
-            args.max_tokens_per_class, args.seed + int(cls)
-        )
-        embedding, _ = embed_tokens(sampled_feats, args)
-        class_prefix = os.path.join(args.out_dir, f'class_{cls}')
-        csv_path = class_prefix + '_tokens_tsne.csv'
-        png_path = class_prefix + '_tokens_tsne.png'
-        svg_path = class_prefix + '_tokens_tsne.svg'
-        save_csv(csv_path, embedding, sampled_labels, sampled_slides, sampled_patches)
-        save_svg_plot(
-            svg_path, embedding, sampled_labels, sampled_slides,
-            f'class {cls} example tokens ({sampled_feats.shape[0]} sampled)'
-        )
-        save_plot(
-            png_path, embedding, sampled_labels, sampled_slides,
-            f'class {cls} example tokens ({sampled_feats.shape[0]} sampled)'
-        )
-        counts = {str(k): int(v) for k, v in zip(*np.unique(sampled_labels.astype(int), return_counts=True))}
+        labels_np = example_labels.detach().cpu().numpy()
+        pos_mask = labels_np == 1
+        pos_count = int(pos_mask.sum())
+        sparse_strategies[str(cls)] = sparse_strategy
+        combined_class_counts[str(cls)] = pos_count
+        if args.plot_mode in ['combined', 'both']:
+            if pos_count == 0:
+                print(f'[warning] class={cls}: no positive target tokens kept for combined plot; skipped.')
+            else:
+                pos_torch = torch.as_tensor(pos_mask, device=example_feats.device, dtype=torch.bool)
+                pos_feats = example_feats[pos_torch]
+                pos_labels = np.full(pos_count, int(cls), dtype=np.int64)
+                sampled_feats, sampled_labels, sampled_slides, sampled_patches = sample_tokens_for_tsne(
+                    pos_feats, pos_labels, slide_names[pos_mask], patch_names[pos_mask],
+                    args.max_tokens_per_class, args.seed + int(cls)
+                )
+                combined_feats.append(sampled_feats.detach().cpu())
+                combined_labels.append(sampled_labels)
+                combined_slides.append(sampled_slides)
+                combined_patches.append(sampled_patches)
+                print(
+                    f'[visualize] class={cls}: collected {sampled_feats.shape[0]} '
+                    f'positive tokens for combined plot'
+                )
+                del pos_feats, sampled_feats
+
+        class_output = {
+            'positive_tokens_before_plot_sampling': pos_count,
+            'reference_sparsify_strategy': sparse_strategy,
+        }
+        if args.plot_mode in ['per_class', 'both']:
+            sampled_feats, sampled_labels, sampled_slides, sampled_patches = sample_tokens_for_tsne(
+                example_feats, labels_np, slide_names, patch_names,
+                args.max_tokens_per_class, args.seed + int(cls)
+            )
+            embedding, _ = embed_tokens(sampled_feats, args)
+            class_prefix = os.path.join(args.out_dir, f'class_{cls}')
+            csv_path = class_prefix + '_tokens_tsne.csv'
+            png_path = class_prefix + '_tokens_tsne.png'
+            svg_path = class_prefix + '_tokens_tsne.svg'
+            save_csv(csv_path, embedding, sampled_labels, sampled_slides, sampled_patches)
+            save_svg_plot(
+                svg_path, embedding, sampled_labels, sampled_slides,
+                f'class {cls} example tokens ({sampled_feats.shape[0]} sampled)'
+            )
+            save_plot(
+                png_path, embedding, sampled_labels, sampled_slides,
+                f'class {cls} example tokens ({sampled_feats.shape[0]} sampled)'
+            )
+            counts = {str(k): int(v) for k, v in zip(*np.unique(sampled_labels.astype(int), return_counts=True))}
+            class_output.update({
+                'csv': csv_path,
+                'svg': svg_path,
+                'plot': png_path if plt is not None else None,
+                'tokens_before_plot_sampling': int(example_feats.shape[0]),
+                'tokens_plotted': int(sampled_feats.shape[0]),
+                'token_label_counts_plotted': counts,
+            })
+            print(f'[visualize] class={cls}: wrote {csv_path}')
+            print(f'[visualize] class={cls}: wrote {svg_path}')
+            if plt is not None:
+                print(f'[visualize] class={cls}: wrote {png_path}')
+            del sampled_feats
         summary['outputs'][str(cls)] = {
+            **class_output,
+        }
+
+        del example_feats, example_labels
+        torch.cuda.empty_cache()
+
+    if args.plot_mode in ['combined', 'both']:
+        if not combined_feats:
+            raise ValueError('No positive target tokens were collected for the combined class plot.')
+        all_feats = torch.cat(combined_feats, 0)
+        all_labels = np.concatenate(combined_labels, 0)
+        all_slides = np.concatenate(combined_slides, 0)
+        all_patches = np.concatenate(combined_patches, 0)
+        if args.max_tokens_total > 0 and all_feats.shape[0] > args.max_tokens_total:
+            all_feats, all_labels, all_slides, all_patches = sample_tokens_for_tsne(
+                all_feats, all_labels, all_slides, all_patches,
+                args.max_tokens_total, args.seed + 7919
+            )
+
+        print(f'[visualize] combined: running t-SNE for {all_feats.shape[0]} tokens')
+        embedding, _ = embed_tokens(all_feats, args)
+        combined_prefix = os.path.join(args.out_dir, 'combined_classes')
+        csv_path = combined_prefix + '_tokens_tsne.csv'
+        png_path = combined_prefix + '_tokens_tsne.png'
+        svg_path = combined_prefix + '_tokens_tsne.svg'
+        save_class_csv(csv_path, embedding, all_labels, all_slides, all_patches)
+        save_svg_class_plot(
+            svg_path, embedding, all_labels, all_slides,
+            f'combined class example tokens ({all_feats.shape[0]} sampled)'
+        )
+        save_class_plot(
+            png_path, embedding, all_labels, all_slides,
+            f'combined class example tokens ({all_feats.shape[0]} sampled)'
+        )
+        counts = {str(k): int(v) for k, v in zip(*np.unique(all_labels.astype(int), return_counts=True))}
+        summary['combined_output'] = {
             'csv': csv_path,
             'svg': svg_path,
             'plot': png_path if plt is not None else None,
-            'tokens_before_plot_sampling': int(example_feats.shape[0]),
-            'tokens_plotted': int(sampled_feats.shape[0]),
-            'token_label_counts_plotted': counts,
-            'reference_sparsify_strategy': sparse_strategy,
+            'tokens_plotted': int(all_feats.shape[0]),
+            'class_token_counts_before_total_sampling': combined_class_counts,
+            'class_token_counts_plotted': counts,
+            'reference_sparsify_strategy_by_class': sparse_strategies,
         }
-        print(f'[visualize] class={cls}: wrote {csv_path}')
-        print(f'[visualize] class={cls}: wrote {svg_path}')
+        print(f'[visualize] combined: wrote {csv_path}')
+        print(f'[visualize] combined: wrote {svg_path}')
         if plt is not None:
-            print(f'[visualize] class={cls}: wrote {png_path}')
-
-        del example_feats, example_labels, sampled_feats
-        torch.cuda.empty_cache()
+            print(f'[visualize] combined: wrote {png_path}')
 
     summary_path = os.path.join(args.out_dir, 'summary.json')
     with open(summary_path, 'w') as f:
