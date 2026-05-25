@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument('--tsne_iter', type=int, default=1000)
     args = parser.parse_args()
     if args.all_classes:
-        args.classes = list(range(args.c))
+        args.classes = list(range(1, args.c + 1)) if args.c > 1 else [1]
     elif not args.classes:
         parser.error('provide --classes or use --all_classes')
     return args
