@@ -13,6 +13,7 @@ from main import (
     apply_context_feature_centering,
     apply_require_label_filter,
     binary_conformal_summary,
+    chunked_min_cosine_distance,
     get_example_names_at_label_ratio,
     has_real_wsi_label,
     label_counts,
@@ -147,6 +148,24 @@ def test_context_centering_returns_normalized_rows():
 
     assert torch.allclose(centered_example.norm(dim=1), torch.ones(2), atol=1e-6)
     assert torch.allclose(centered_query.norm(dim=1), torch.ones(2), atol=1e-6)
+
+
+def test_chunked_min_cosine_distance_matches_dense_calculation():
+    feats = torch.nn.functional.normalize(torch.tensor([
+        [1.0, 0.0],
+        [0.8, 0.2],
+        [0.0, 1.0],
+        [-1.0, 0.0],
+    ]), p=2, dim=1)
+    refs = torch.nn.functional.normalize(torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ]), p=2, dim=1)
+
+    chunked = chunked_min_cosine_distance(feats, refs, query_chunk=2, ref_chunk=1)
+    dense = (1 - feats @ refs.t()).min(1).values
+
+    assert torch.allclose(chunked, dense, atol=1e-6)
 
 
 def test_conformal_summary_reports_prediction_set_stats():

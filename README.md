@@ -596,6 +596,14 @@ python core/main.py ...
      - `--reference_token_budget`：reference token 总预算；`0` 表示不稀疏化。
      - `--reference_sparsify_strategy`：可选 `auto / quality / legacy / hierarchical`。`hierarchical` 会在每个 label 内递归二分 token，形成一个轻量层次化聚类树，再从每个叶簇中选择兼顾 cluster centrality 和 importance 的代表 token。
      - `--reference_anchor_ratio`：预算中先分给 strongest anchors 的比例，默认 `0.25`。
+   - `quality` 策略在挑选多样性 token 时需要计算 token 到 anchor token 的距离。为了避免一次性生成巨大的 `tokens x anchors` 临时矩阵，当前实现使用分块计算；可通过环境变量继续压低稀疏化阶段的峰值显存：
+
+```bash
+PRET_SPARSIFY_QUERY_CHUNK=2048 PRET_SPARSIFY_REF_CHUNK=512 \
+REFERENCE_TOKEN_BUDGET=30000 REFERENCE_SPARSIFY_STRATEGY=quality \
+bash scripts/run_h5_eval.sh
+```
+
    - 本地 smoke test 的结论是：功能上没有问题，但如果预算压得太狠，精度仍可能下降。因此默认仍建议 `--reference_token_budget 0`，或者先用较保守的预算，从保留 70%-85% token 开始试。
 
 14. **混合特征维度兼容**

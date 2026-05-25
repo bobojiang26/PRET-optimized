@@ -49,6 +49,8 @@ except ImportError:
 
 DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 H5_COORDINATE_KEYS = ('coords', 'coordinates')
+SPARSIFY_QUERY_CHUNK = max(1, int(os.environ.get('PRET_SPARSIFY_QUERY_CHUNK', 4096)))
+SPARSIFY_REF_CHUNK = max(1, int(os.environ.get('PRET_SPARSIFY_REF_CHUNK', 1024)))
 
 if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
@@ -209,6 +211,26 @@ def normalize_score_range(scores):
     return (scores - score_min) / (score_max - score_min + 1e-8)
 
 
+def chunked_min_cosine_distance(feats, refs, query_chunk=SPARSIFY_QUERY_CHUNK, ref_chunk=SPARSIFY_REF_CHUNK):
+    if feats.shape[0] == 0:
+        return torch.empty(0, device=feats.device, dtype=feats.dtype)
+    if refs.shape[0] == 0:
+        return torch.full((feats.shape[0],), float('inf'), device=feats.device, dtype=feats.dtype)
+
+    min_distance = torch.full((feats.shape[0],), float('inf'), device=feats.device, dtype=feats.dtype)
+    with torch.no_grad():
+        for q_start in range(0, feats.shape[0], query_chunk):
+            feats_q = feats[q_start: q_start + query_chunk]
+            local_min = torch.full((feats_q.shape[0],), float('inf'), device=feats.device, dtype=feats.dtype)
+            for r_start in range(0, refs.shape[0], ref_chunk):
+                refs_r = refs[r_start: r_start + ref_chunk]
+                distances = 1 - feats_q @ refs_r.t()
+                local_min = torch.minimum(local_min, distances.min(1).values)
+                del distances
+            min_distance[q_start: q_start + feats_q.shape[0]] = local_min
+    return min_distance
+
+
 def normalize_torch_rows(feats):
     return F.normalize(feats.float(), p=2, dim=1, eps=1e-8)
 
@@ -283,7 +305,7 @@ def select_high_quality_tokens(feats, importance, budget, anchor_ratio=0.25):
     selected = anchors.tolist()
 
     anchor_feats = feats[anchors]
-    min_distance = (1 - feats @ anchor_feats.t()).min(1).values
+    min_distance = chunked_min_cosine_distance(feats, anchor_feats)
     min_distance[selected_mask] = -1
     importance_norm = normalize_score_range(importance)
 
