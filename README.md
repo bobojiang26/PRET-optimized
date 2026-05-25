@@ -186,6 +186,27 @@ EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh
 
 The direct equivalent is `python core/main.py ... --example_ratio 0.6 --example_ratio_max_per_class 20`. When `--example_ratio` is greater than `0`, it overrides fixed `--example_num`/`MULTIPLE_NUM` sampling. The terminal prints both the ratio-derived target counts and the actual selected label counts, for example `example_ratio=0.6 max_per_class=20 target label counts: 1:20, 2:20`.
 
+To inspect weak classes, visualize the actual example/reference token pool used by PRET. This runs the same example sampling, one-vs-rest class labeling, optional tagger refinement, and optional reference token sparsification, then writes one t-SNE plot plus a CSV per class:
+
+```bash
+python scripts/visualize_example_tokens.py \
+  --raw_feature_path data/MY_H5/h5 \
+  --wsi_path data/MY_H5/images \
+  --dump_features data/MY_H5/collected_features \
+  --dataset_info data_info/MY_H5.json \
+  --prompt_type slideLabel \
+  --class_num 17 \
+  --classes 10 13 14 \
+  --example_ratio 0.6 \
+  --example_ratio_max_per_class 20 \
+  --reference_token_budget 30000 \
+  --reference_sparsify_strategy quality \
+  --max_tokens_per_class 10000 \
+  --out_dir records/example_token_vis
+```
+
+Outputs include `summary.json`, `class_{id}_tokens_tsne.csv`, and `class_{id}_tokens_tsne.svg`; if `matplotlib` is installed, PNG plots are written too. In the plot/CSV, token labels are `1=target_class`, `0=other_class`, `255=background`, `254=uncertain`, and `-1=unknown`.
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
@@ -642,6 +663,12 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 新增 `--example_ratio_max_per_class`，只在 `--example_ratio > 0` 时生效；默认 `0` 表示不设上限。比如 `--example_ratio 0.6 --example_ratio_max_per_class 20` 表示每类先按 60% 计算，再最多保留 20 张，避免显存被过大的 example 库撑爆。
    - 通过 h5 wrapper 可用 `EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh`。
    - 当 `--example_ratio > 0` 时，会覆盖固定 shot 数和 `MULTIPLE_NUM`；终端会打印 ratio 目标数量、max_per_class 和实际 example label counts，方便确认每类是否按预期进入 example 库。
+
+19. **Example token 池可视化诊断**
+   - 新增 `scripts/visualize_example_tokens.py`，用于分析某些表现差的类别在 example/reference token 特征空间里的分布。
+   - 脚本复用 PRET 的 example 采样、类别 one-vs-rest 标签构建、slideLabel tagger refinement 和可选 reference token 稀疏化，然后用 PCA+t-SNE 降到二维。
+   - 输出每个目标类别的 `class_{id}_tokens_tsne.svg`、`class_{id}_tokens_tsne.csv` 和总览 `summary.json`。CSV 保留每个点的二维坐标、token label、slide 和 patch 名，便于继续排查异常 slide。
+   - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --classes 10 13 14 --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。
 
 ## Citation
 

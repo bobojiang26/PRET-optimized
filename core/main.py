@@ -442,8 +442,11 @@ def select_hierarchical_tokens(feats, importance, budget):
 
 
 def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_ratio=0.25,
-                              strategy='quality', random_ratio=0.1):
+                              strategy='quality', random_ratio=0.1, return_indices=False):
     if budget <= 0 or example_feats.shape[0] <= budget:
+        if return_indices:
+            keep_idxs = torch.arange(example_feats.shape[0], device=example_feats.device)
+            return example_feats, example_labels, keep_idxs
         return example_feats, example_labels
     strategy = strategy.lower()
     if strategy not in ['quality', 'legacy', 'hierarchical']:
@@ -521,6 +524,8 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_rati
         keep_idxs = keep_idxs[torch.randperm(keep_idxs.shape[0], device=keep_idxs.device)[:budget]]
     keep_idxs = keep_idxs.sort()[0]
     print(f'[reference] sparsified tokens ({strategy}): {example_feats.shape[0]} -> {keep_idxs.shape[0]}')
+    if return_indices:
+        return example_feats[keep_idxs], example_labels[keep_idxs], keep_idxs
     return example_feats[keep_idxs], example_labels[keep_idxs]
 
 
