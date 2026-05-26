@@ -687,6 +687,14 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 通过 h5 wrapper 可用 `EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh`。
    - 当 `--example_ratio > 0` 时，会覆盖固定 shot 数和 `MULTIPLE_NUM`；终端会打印 ratio 目标数量、max_per_class 和实际 example label counts，方便确认每类是否按预期进入 example 库。
 
+19. **多标签联合阈值选择**
+   - 新增 `--multilabel_threshold per_class|joint`，默认 `per_class`，保持原有逐类独立选阈值的行为。
+   - 设置 `--multilabel_threshold joint` 后，PRET 会用贪心坐标下降法在 validation set 上联合搜索一组阈值，直接优化 exact match accuracy，而非逐类独立优化单类 accuracy。
+   - 原理：逐类独立选阈值时，accuracy 对类别不平衡敏感，某些弱信号类的阈值偏低导致假阳性，而 exact match 要求所有类同时正确，一个类错判就整条样本全错。联合阈值搜索在各类阈值之间做权衡，以减少假阳性对 exact match 的冲击。
+   - 终端会打印 `[multilabel_threshold] joint thresholds` 和 `per-class thresholds` 对比，以及最终的 exact match / hamming / samples-F1 等指标。
+   - 通过 h5 wrapper 可用 `MULTILABEL_THRESHOLD=joint bash scripts/run_h5_eval.sh`。
+   - 仅在多标签模式（`--multilabel` 或 `wsi_labels`）下生效；二分类/多类单标签不受影响。
+
 19. **Example token 池可视化诊断**
    - 新增 `scripts/visualize_example_tokens.py`，用于分析某些表现差的类别在 example/reference token 特征空间里的分布。
    - 脚本复用 PRET 的 example 采样、类别 one-vs-rest 标签构建、slideLabel tagger refinement 和可选 reference token 稀疏化，然后用 PCA+t-SNE 降到二维。
