@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument('--prompt_path', default='')
     parser.add_argument('--class_num', '--c', dest='c', type=int, required=True)
     parser.add_argument('--classes', type=int, nargs='+', default=None, help='target class ids to visualize')
-    parser.add_argument('--all_classes', action='store_true', help='visualize class ids 0..class_num-1')
+    parser.add_argument('--all_classes', action='store_true', help='visualize class ids 1..class_num')
     parser.add_argument('--plot_mode', default='combined', choices=['combined', 'per_class', 'both'])
     parser.add_argument('--out_dir', default='records/example_token_vis')
     parser.add_argument('--seed', type=int, default=1024)
