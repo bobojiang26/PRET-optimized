@@ -96,37 +96,25 @@ def one_vs_rest_patch_labels(raw_patch_labels, cls, class_num, slide_has_target,
                 f'but class_num={class_num}. Using available columns.'
             )
         target_col = int(cls) - 1
-        unique = set(np.unique(raw).astype(int).tolist())
-        if unique.issubset({0, 1}):
-            target = raw[:, target_col] > 0 if 0 <= target_col < raw.shape[1] else np.zeros(raw.shape[0], dtype=bool)
-            other = np.zeros(raw.shape[0], dtype=bool)
-            if 0 <= target_col < raw.shape[1] and raw.shape[1] > 1:
-                other = np.delete(raw, target_col, axis=1).max(1) > 0
+        target = raw[:, target_col] > 0 if 0 <= target_col < raw.shape[1] else np.zeros(raw.shape[0], dtype=bool)
+        foreground = (raw > 0).any(1)
+        other = foreground.copy()
+        if 0 <= target_col < raw.shape[1]:
+            other = np.delete(raw, target_col, axis=1).max(1) > 0 if raw.shape[1] > 1 else np.zeros(raw.shape[0], dtype=bool)
 
-            labels = np.full(raw.shape[0], 255, dtype=np.int64)
-            labels[other] = 0
-            labels[target] = 1
-            overlap = target & other
-            if overlap_label == 'other':
-                labels[overlap] = 0
-            elif overlap_label == 'uncertain':
-                labels[overlap] = 254
-            return labels
-
-        target = raw[:, target_col] == 1 if 0 <= target_col < raw.shape[1] else np.zeros(raw.shape[0], dtype=bool)
-        explicit_background = (raw == 255).all(1)
-        labels = np.full(raw.shape[0], 254, dtype=np.int64)
-        labels[explicit_background] = 255
+        labels = np.full(raw.shape[0], 255, dtype=np.int64)
+        labels[other] = 0
         labels[target] = 1
-        if overlap_label == 'uncertain' and raw.shape[1] > 1:
-            other_positive = np.delete(raw, target_col, axis=1).max(1) == 1 if 0 <= target_col < raw.shape[1] else np.zeros(raw.shape[0], dtype=bool)
-            labels[target & other_positive] = 254
+        overlap = target & other
+        if overlap_label == 'other':
+            labels[overlap] = 0
+        elif overlap_label == 'uncertain':
+            labels[overlap] = 254
         return labels
 
     raw = raw.reshape(-1)
-    labels = np.full(raw.shape[0], 254 if np.any(raw == 254) else 255, dtype=np.int64)
-    labels[raw == 255] = 255
-    labels[raw == 254] = 254
+    labels = np.full(raw.shape[0], 255, dtype=np.int64)
+    valid_foreground = (raw > 0) & (raw != 255)
 
     unique = set(np.unique(raw).astype(int).tolist())
     if class_num > 1 and unique.issubset({0, 1}):
@@ -137,12 +125,10 @@ def one_vs_rest_patch_labels(raw_patch_labels, cls, class_num, slide_has_target,
         return labels
 
     if class_num > 1:
-        valid_foreground = (raw > 0) & (raw < 254)
         labels[(valid_foreground) & (raw != int(cls))] = 0
         labels[raw == int(cls)] = 1
         return labels
 
-    valid_foreground = (raw > 0) & (raw < 254)
     labels[valid_foreground] = 1
     return labels
 

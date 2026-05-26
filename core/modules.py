@@ -246,16 +246,6 @@ def aggregate_query_logits(query_feats, query_logits, top_instance, related_thre
     return torch.cat(wsi_pred_list, 0).mean()
 
 
-def reference_label_masks(example_labels, args=None):
-    pos_mask = example_labels == 1
-    neg_mask = example_labels == 0
-    if getattr(args, 'multilabel', False) and getattr(args, 'prompt_type', None) == 'mask':
-        neg_mask = example_labels == 255
-    elif getattr(args, 'multilabel', False):
-        neg_mask = neg_mask | (example_labels == 255)
-    return pos_mask, neg_mask
-
-
 # Kept for compatibility with older callers; large paths should use compute_similarity.
 def low_memory_matrix_multiply(A, B, max_size=20000):
     na,  nb = A.shape[0], B.shape[-1]
@@ -553,9 +543,8 @@ def inference(args, example_feats, example_labels, example_patch_names,
         'adaptive_min_k': getattr(args, 'adaptive_min_topk', 1),
         'adaptive_window': getattr(args, 'adaptive_window', 0.6),
     }
-    pos_mask, neg_mask = reference_label_masks(example_labels, args)
-    pos_score = compute_similarity(query_feats, example_feats[pos_mask], topk=args.topk, **similarity_kwargs)
-    neg_score = compute_similarity(query_feats, example_feats[neg_mask], topk=args.topk, **similarity_kwargs)
+    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk, **similarity_kwargs)
+    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk, **similarity_kwargs)
     query_logits = (pos_score - neg_score).to(query_feats.device)
     query_logits = spatially_smooth_logits(
         query_logits, query_patch_names,

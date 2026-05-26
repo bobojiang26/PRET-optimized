@@ -205,9 +205,9 @@ python scripts/visualize_example_tokens.py \
   --out_dir records/example_token_vis
 ```
 
-Outputs include `summary.json`, `combined_classes_tokens_tsne.csv`, and `combined_classes_tokens_tsne.svg`; if `matplotlib` is installed, a PNG plot is written too. In the combined plot/CSV, each point is a positive/target example token and the color/`class` column is the class id. `--all_classes` follows PRET's class ids and expands to `1..class_num` for multi-class/multi-label runs. To focus on a subset, replace `--all_classes` with `--classes 10 13 14`. To also write the older per-class one-vs-rest plots, add `--plot_mode both`; those per-class CSVs use token labels `1=target_class`, `0=other_class` for legacy subtyping or slide-label negatives, `255=explicit background`, `254=uncertain/ignored`, and `-1=unknown`. For `PROMPT_TYPE=mask` and `MULTILABEL=1`, the script filters ignored `254` tokens before sparsification so the visualized reference pool matches PRET inference.
+Outputs include `summary.json`, `combined_classes_tokens_tsne.csv`, and `combined_classes_tokens_tsne.svg`; if `matplotlib` is installed, a PNG plot is written too. In the combined plot/CSV, each point is a positive/target example token and the color/`class` column is the class id. `--all_classes` follows PRET's class ids and expands to `1..class_num` for multi-class/multi-label runs. To focus on a subset, replace `--all_classes` with `--classes 10 13 14`. To also write the older per-class one-vs-rest plots, add `--plot_mode both`; those per-class CSVs use token labels `1=target_class`, `0=other_class`, `255=background`, `254=uncertain`, and `-1=unknown`.
 
-To inspect one target class against other foreground classes and explicit background, use the dedicated class-vs-rest visualization. With the new CSV-derived multi-label h5 mask labels, other annotated classes and unlabeled outside-box regions are shown as `254=uncertain/ignored`, while only explicit negative/background annotations are shown as `255=background`. The `0=other_foreground` group appears only for legacy mutually exclusive masks or old binary multi-hot matrices. In this diagnostic plot, `254` is shown as an unknown/ignored group for inspection; PRET inference still drops it from the reference pool:
+To inspect one target class against other foreground classes and background, use the dedicated class-vs-rest visualization. This is most informative with `--prompt_type mask`, because mask labels can explicitly separate `1=target_class`, `0=other_foreground`, and `255=background`:
 
 ```bash
 python scripts/visualize_class_vs_rest_tokens.py \
@@ -288,9 +288,7 @@ Label conversion rules:
 * `--auto-label-map` assigns IDs by first appearance in the CSV: the first new tumor name becomes `1`, the next new tumor name becomes `2`, and so on. Use `--label-map-out` to save this mapping. If you already have a stable mapping, pass it with `--label-map` instead.
 * For binary or ordinary single-label multiclass tasks, use `--wsi-label-mode binary`, `single-label`, or `max-label`. The generated `data_info` writes only `wsi_label`.
 * For multi-label tasks, use `--wsi-label-mode multi-label`. The generated `data_info` writes only `wsi_labels`, for example `"wsi_labels": [1, 3, 5]`; it does not write `wsi_label`.
-* With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)`, but it is not a plain multi-hot negative matrix. Each class column uses `1=annotated target`, `254=uncertain/ignore`, and `255=explicit background`. A patch annotated as another class is `254` for the current class, because multi-label classes are not assumed to be mutually exclusive. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array by default.
-* `--outside-label auto` is the default. In multi-label mode it writes annotation-box/polygon outside regions as `254` uncertain, which is the recommended setting when unboxed tissue may still contain lesions of unknown class. Use `--outside-label background` only when annotations are exhaustive enough that outside regions are reliable negatives.
-* If you have explicit negative/background boxes, map that label to id `0` and add `--include-zero-labels`; in multi-label h5 labels those boxes become `255` for every class and are not written into slide-level `wsi_labels`. If you also use `--positive-labels`, `--include-zero-labels` still keeps label id `0` as explicit background.
+* With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)` and is multi-hot by class. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array.
 * When `--h5-label-out` is used, CSV rows whose slide name has no matching h5 file are skipped by default and reported as warnings. Add `--no-skip-missing-h5` if you prefer a hard failure. This avoids falling back to SDPC size readers for slides that cannot produce h5-aligned labels anyway.
 * During h5 label conversion, unreadable WSI files under `--wsi-dir` are skipped with a warning unless `--strict-wsi-size-errors` is set; h5 metadata and `--patch-scale` can still provide the slide size needed for normalized CSV coordinates.
 * H5 conversion is optimized by default: the converter reuses the initial h5 file index instead of scanning `--h5-dir` again, and h5 patch overlap checks use an integral-image vectorized path instead of per-patch Python loops. No GPU flag or extra command-line option is required.
@@ -311,7 +309,6 @@ python prepare/csv_to_pret_annotations.py \
   --patch-scale 0 \
   --prompt-type mask \
   --wsi-label-mode multi-label \
-  --outside-label auto \
   --slide-reader auto
 ```
 
@@ -322,11 +319,11 @@ This writes:
 * `data_info/MY_H5_label_map.json`: label names assigned in first-seen CSV order as `1, 2, 3, ...`.
 * `data_info/MY_H5_size.json`: slide level-0 sizes read from the SDPC folder and/or inferred from h5 coordinates.
 
-Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`. For multi-label class-wise PRET runs, prefer the h5-aligned `.npy` labels because a single PNG mask cannot fully represent per-class `1/254/255` columns.
+Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`.
 
-By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for a binary or single-label task, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`. For multi-label tasks, a negative slide should use `wsi_labels: []`, and explicit background patches should be encoded as `255` via label id `0` when patch-level negative references are available.
+By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for a binary or single-label task, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`. For multi-label tasks, a negative slide should use `wsi_labels: []`.
 
-Then run h5 WSI-level multi-label evaluation. For `PROMPT_TYPE=mask` and `MULTILABEL=1`, PRET does not run `execute_tagger`; it consumes the h5 patch labels directly, drops `254` ignored reference tokens before sparsification/inference, uses `1` as the positive reference pool, and uses only `255` as the explicit negative/background reference pool. PRET fits one threshold per class on the validation split, combines the per-class decisions back into a multi-hot WSI prediction such as `[1, 0, 0, 0, 1, 0]`, and reports multi-label metrics:
+Then run h5 WSI-level multi-label evaluation. PRET fits one threshold per class on the validation split, combines the per-class decisions back into a multi-hot WSI prediction such as `[1, 0, 0, 0, 1, 0]`, and reports multi-label metrics:
 
 ```
 DATASET_NAME=MY_H5 \
@@ -629,7 +626,7 @@ python core/main.py ...
 13. **高质量 reference token 稀疏化**
    - reference token 的目标不是“随机删点”，而是“尽量保留最强、最有区分度、同时又不完全重复的 token”。
    - 旧版实验性实现里带有少量随机补位；当前版本已经改成**全确定性选择**，核心思路是一个 `importance-aware coreset`：
-     - 先按当前任务可用的 reference label 给 token 分预算，避免某一类 token 被整体压得过狠。普通二分类/旧 subtyping 路径通常是 `0 / 1 / 255`；`PROMPT_TYPE=mask` 且 `MULTILABEL=1` 时，`254` 会先被过滤，实际只在 `1` 和显式背景 `255` 之间分预算。
+     - 先按 label (`0 / 1 / 255`) 给 token 分预算，避免某一类 token 被整体压得过狠。
      - 对每个 label 内的 token，计算 importance：
        - `own-centroid similarity`：token 和本类中心有多接近。
        - `margin to other centroids`：token 相对其他类中心有多可分。

@@ -1,34 +1,26 @@
 import os
 import sys
 
-import numpy as np
 import torch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CORE = os.path.join(ROOT, "core")
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
-PREPARE = os.path.join(ROOT, "prepare")
-if PREPARE not in sys.path:
-    sys.path.insert(0, PREPARE)
 
-from modules import compute_similarity, spatially_smooth_logits, aggregate_query_logits, reference_label_masks
+from modules import compute_similarity, spatially_smooth_logits, aggregate_query_logits
 from main import (
     apply_context_feature_centering,
     apply_require_label_filter,
     binary_conformal_summary,
     chunked_min_cosine_distance,
-    filter_reference_tokens,
     get_example_names_at_label_ratio,
     has_real_wsi_label,
     label_counts,
-    patch_labels_for_class,
-    reference_mask_for_task,
     select_validation_names,
     threshold_source,
     use_test_threshold,
 )
-from csv_to_pret_annotations import BACKGROUND_LABEL, UNCERTAIN_LABEL, labels_for_h5_coordinates
 
 
 def test_compute_similarity_keeps_original_mean_behavior():
@@ -215,95 +207,3 @@ def test_require_label_filter_keeps_only_real_labels():
     filtered = apply_require_label_filter(dataset_info, Args(), context="test")
 
     assert list(filtered.keys()) == ["labeled_neg", "labeled_multi_neg"]
-
-
-def test_multilabel_h5_converter_marks_unannotated_and_other_classes_uncertain():
-    coords = np.array([[0, 0], [10, 0], [20, 0], [30, 0]], dtype=np.float32)
-    size = (40, 10)
-    regions = [
-        {
-            "label_id": 1,
-            "points": [(0, 0), (8, 0), (8, 10), (0, 10)],
-            "size": size,
-        },
-        {
-            "label_id": 2,
-            "points": [(12, 0), (18, 0), (18, 10), (12, 10)],
-            "size": size,
-        },
-        {
-            "label_id": 0,
-            "points": [(22, 0), (28, 0), (28, 10), (22, 10)],
-            "size": size,
-        },
-    ]
-
-    labels = labels_for_h5_coordinates(
-        regions,
-        h5_path="",
-        patch_scale=10,
-        coordinate_mode="pixel",
-        multi_label=True,
-        class_num=2,
-        coords=coords,
-        outside_label=UNCERTAIN_LABEL,
-        background_label=BACKGROUND_LABEL,
-    )
-
-    assert labels.tolist() == [
-        [1, UNCERTAIN_LABEL],
-        [UNCERTAIN_LABEL, 1],
-        [BACKGROUND_LABEL, BACKGROUND_LABEL],
-        [UNCERTAIN_LABEL, UNCERTAIN_LABEL],
-    ]
-
-
-def test_multilabel_patch_labels_for_class_preserves_ignore_and_background():
-    raw = np.array([
-        [1, UNCERTAIN_LABEL],
-        [UNCERTAIN_LABEL, 1],
-        [BACKGROUND_LABEL, BACKGROUND_LABEL],
-        [UNCERTAIN_LABEL, UNCERTAIN_LABEL],
-        [1, 1],
-    ], dtype=np.uint8)
-
-    assert patch_labels_for_class(raw, 1, 2, multilabel=True).tolist() == [
-        1, UNCERTAIN_LABEL, BACKGROUND_LABEL, UNCERTAIN_LABEL, 1
-    ]
-    assert patch_labels_for_class(raw, 2, 2, multilabel=True).tolist() == [
-        UNCERTAIN_LABEL, 1, BACKGROUND_LABEL, UNCERTAIN_LABEL, 1
-    ]
-
-
-def test_multilabel_mask_reference_pool_uses_only_target_and_explicit_background():
-    class Args:
-        multilabel = True
-        prompt_type = "mask"
-
-    labels = torch.tensor([1, 0, UNCERTAIN_LABEL, BACKGROUND_LABEL, -1])
-
-    pos_mask, neg_mask = reference_label_masks(labels, Args())
-    assert pos_mask.tolist() == [True, False, False, False, False]
-    assert neg_mask.tolist() == [False, False, False, True, False]
-    assert reference_mask_for_task(labels, Args()).tolist() == [True, False, False, True, False]
-
-    feats = torch.arange(10, dtype=torch.float32).reshape(5, 2)
-    filtered_feats, filtered_labels = filter_reference_tokens(feats, labels, Args(), "test")
-    assert filtered_labels.tolist() == [1, BACKGROUND_LABEL]
-    assert filtered_feats.tolist() == [[0.0, 1.0], [6.0, 7.0]]
-
-
-def test_multilabel_mask_reference_pool_requires_positive_tokens():
-    class Args:
-        multilabel = True
-        prompt_type = "mask"
-
-    feats = torch.arange(4, dtype=torch.float32).reshape(2, 2)
-    labels = torch.tensor([BACKGROUND_LABEL, BACKGROUND_LABEL])
-
-    try:
-        filter_reference_tokens(feats, labels, Args(), "test")
-    except ValueError as exc:
-        assert "no positive reference tokens" in str(exc)
-    else:
-        raise AssertionError("filter_reference_tokens should reject a class with no positive tokens")
