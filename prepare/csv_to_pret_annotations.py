@@ -37,6 +37,18 @@ DEFAULT_PATCH_SCALE = 512
 PROGRESS_INTERVAL = 10
 H5_EXTENSIONS = ('.h5', '.hdf5')
 H5_COORDINATE_KEYS = ('coords', 'coordinates')
+UNCERTAIN_LABEL = 254
+BACKGROUND_LABEL = 255
+
+
+def outside_label_value(mode, wsi_label_mode='binary'):
+    if mode == 'auto':
+        mode = 'uncertain' if wsi_label_mode == 'multi-label' else 'background'
+    if mode == 'background':
+        return BACKGROUND_LABEL if wsi_label_mode == 'multi-label' else 0
+    if mode == 'uncertain':
+        return UNCERTAIN_LABEL
+    raise ValueError(f'unsupported outside label mode: {mode}')
 
 
 def load_label_map(path):
@@ -442,6 +454,8 @@ def label_to_id(label, label_map, auto=False):
 
 
 def should_keep_label(label, label_id, positive_labels, include_zero_labels):
+    if include_zero_labels and label_id == 0:
+        return True
     if positive_labels is not None:
         return label in positive_labels or str(label_id) in positive_labels
     if include_zero_labels:
@@ -584,7 +598,7 @@ def write_xml_files(regions_by_slide, xml_out):
     return written
 
 
-def rasterize_patch_mask(regions, patch_scale):
+def rasterize_patch_mask(regions, patch_scale, outside_label=0, background_label=0):
     try:
         import cv2
         import numpy as np
@@ -604,7 +618,7 @@ def rasterize_patch_mask(regions, patch_scale):
     mid_h = pad_h // mid_scale
     mid_w = pad_w // mid_scale
 
-    mask = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    mask = np.full((grid_h, grid_w), int(outside_label), dtype=np.uint8)
 
     # Adaptive chunk height in mid-scale: target ~50 MB per chunk
     target_chunk_bytes = 50 * 1024 * 1024
@@ -619,7 +633,8 @@ def rasterize_patch_mask(regions, patch_scale):
         chunk_grid_h = chunk_h // resize_scale
         effective_chunk_h = chunk_grid_h * resize_scale
 
-        chunk = np.zeros((effective_chunk_h, mid_w), dtype=np.uint8)
+        positive_chunk = np.zeros((effective_chunk_h, mid_w), dtype=np.uint8)
+        background_chunk = np.zeros((effective_chunk_h, mid_w), dtype=np.uint8)
 
         for region in regions:
             pts = np.array(region['points'])
@@ -634,19 +649,25 @@ def rasterize_patch_mask(regions, patch_scale):
                 dtype=np.int32,
             )
             if contour.shape[0] >= 3:
+                chunk = background_chunk if int(region['label_id']) == 0 else positive_chunk
                 cv2.fillPoly(chunk, [contour], 1)
 
         if chunk_grid_h > 0:
             grid_y0 = chunk_mid_y0 // resize_scale
-            chunk_mask = chunk.reshape(
+            positive_mask = positive_chunk.reshape(
                 chunk_grid_h, resize_scale, grid_w, resize_scale
             ).max(axis=(1, 3))
-            mask[grid_y0:grid_y0 + chunk_grid_h, :] = chunk_mask
+            background_mask = background_chunk.reshape(
+                chunk_grid_h, resize_scale, grid_w, resize_scale
+            ).max(axis=(1, 3))
+            out_slice = mask[grid_y0:grid_y0 + chunk_grid_h, :]
+            out_slice[background_mask > 0] = int(background_label)
+            out_slice[positive_mask > 0] = 1
 
     return mask.astype(np.uint8)
 
 
-def write_mask_files(regions_by_slide, mask_out, patch_scale):
+def write_mask_files(regions_by_slide, mask_out, patch_scale, outside_label=0, background_label=0):
     if not mask_out:
         return {}, 0
     try:
@@ -658,7 +679,12 @@ def write_mask_files(regions_by_slide, mask_out, patch_scale):
     pos_counts = {}
     written = 0
     for slide_name, regions in sorted(regions_by_slide.items()):
-        mask = rasterize_patch_mask(regions, patch_scale)
+        mask = rasterize_patch_mask(
+            regions,
+            patch_scale,
+            outside_label=outside_label,
+            background_label=background_label,
+        )
         out_path = os.path.join(mask_out, slide_name + '.png')
         cv2.imwrite(out_path, mask)
         pos_counts[slide_name] = int((mask == 1).sum())
@@ -1071,6 +1097,8 @@ def labels_for_h5_coordinates(
     class_num=0,
     binary_labels=True,
     coords=None,
+    outside_label=0,
+    background_label=0,
 ):
     try:
         import numpy as np
@@ -1092,26 +1120,55 @@ def labels_for_h5_coordinates(
         return _compute_patch_labels_chunked(
             pixel_coords, regs, patch_scale, mid_scale, full_mid_h, full_mid_w)
 
+    foreground_regions = [r for r in regions if int(r['label_id']) != 0]
+    background_regions = [r for r in regions if int(r['label_id']) == 0]
+
     if multi_label:
         if class_num <= 0:
             raise ValueError('--multi-label h5 label writing requires at least one class')
-        labels = np.zeros((coords.shape[0], class_num), dtype=np.uint8)
+        labels = np.full((coords.shape[0], class_num), int(outside_label), dtype=np.uint8)
+        if background_regions:
+            background_hits = _compute(background_regions)
+            labels[background_hits == 1, :] = int(background_label)
+        if foreground_regions:
+            foreground_hits = _compute(foreground_regions)
+            labels[foreground_hits == 1, :] = UNCERTAIN_LABEL
         for cls in range(1, class_num + 1):
-            cls_regions = [r for r in regions if int(r['label_id']) == cls]
+            cls_regions = [r for r in foreground_regions if int(r['label_id']) == cls]
             if not cls_regions:
                 continue
-            labels[:, cls - 1] = _compute(cls_regions)
+            cls_hits = _compute(cls_regions)
+            labels[cls_hits == 1, cls - 1] = 1
         return labels
 
     if binary_labels:
-        return _compute(regions)
+        labels = np.full(coords.shape[0], int(outside_label), dtype=np.uint8)
+        if background_regions:
+            background_hits = _compute(background_regions)
+            labels[background_hits == 1] = int(background_label)
+        if foreground_regions:
+            foreground_hits = _compute(foreground_regions)
+            labels[foreground_hits == 1] = 1
+        return labels
 
-    labels = np.zeros(coords.shape[0], dtype=np.uint16)
-    for cls in sorted({int(r['label_id']) for r in regions}):
-        cls_regions = [r for r in regions if int(r['label_id']) == cls]
+    labels = np.full(coords.shape[0], int(outside_label), dtype=np.uint16)
+    if background_regions:
+        background_hits = _compute(background_regions)
+        labels[background_hits == 1] = int(background_label)
+    for cls in sorted({int(r['label_id']) for r in foreground_regions}):
+        cls_regions = [r for r in foreground_regions if int(r['label_id']) == cls]
         cls_hits = _compute(cls_regions)
         labels[cls_hits == 1] = cls
     return labels
+
+
+def count_positive_patch_labels(labels):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+    labels = np.asarray(labels)
+    return int((labels == 1).sum())
 
 
 def write_h5_label_files(
@@ -1124,6 +1181,8 @@ def write_h5_label_files(
     binary_labels=True,
     h5_metadata=None,
     h5_files=None,
+    outside_label=0,
+    background_label=0,
 ):
     if not h5_label_out:
         return {}, 0
@@ -1165,10 +1224,12 @@ def write_h5_label_files(
             class_num=class_num,
             binary_labels=binary_labels,
             coords=None,
+            outside_label=outside_label,
+            background_label=background_label,
         )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
-        pos_counts[slide_name] = int((labels == 1).sum())
+        pos_counts[slide_name] = count_positive_patch_labels(labels)
         written += 1
         del labels
         elapsed = time.perf_counter() - start
@@ -1211,6 +1272,7 @@ def write_data_info(
     out = {}
     for slide_name, regions in sorted(regions_by_slide.items()):
         label_ids = sorted({int(r['label_id']) for r in regions})
+        foreground_label_ids = [label_id for label_id in label_ids if label_id != 0]
         if wsi_label_mode == 'binary':
             wsi_label = 1
         elif wsi_label_mode == 'single-label':
@@ -1226,7 +1288,7 @@ def write_data_info(
             'fixed_test_set': False,
         }
         if wsi_label_mode == 'multi-label':
-            item['wsi_labels'] = [int(_) for _ in label_ids]
+            item['wsi_labels'] = [int(_) for _ in foreground_label_ids]
         else:
             item['wsi_label'] = int(wsi_label)
         if mask_out:
@@ -1293,6 +1355,8 @@ def parse_args():
     parser.add_argument('--prompt-type', default='mask',
         choices=['mask', 'box', 'roughMask', 'label-id'],
         help='XML Annotation Id convention: mask=1, box=2, roughMask=3, label-id preserves the label map id')
+    parser.add_argument('--outside-label', default='auto', choices=['auto', 'background', 'uncertain'],
+        help='patch label for regions outside CSV boxes/polygons; auto uses uncertain for multi-label and background otherwise')
     parser.add_argument('--positive-labels', nargs='*',
         help='optional label names or ids to keep; by default all non-zero label ids are kept')
     parser.add_argument('--include-zero-labels', action='store_true',
@@ -1391,10 +1455,26 @@ def main():
         raise SystemExit('No regions were converted. Check labels, label map, and --positive-labels.')
     write_label_map(label_map, args.label_map_out)
 
-    xml_count = write_xml_files(regions_by_slide, args.xml_out)
-    pos_counts, mask_count = write_mask_files(regions_by_slide, args.mask_out, args.patch_scale)
     h5_multi_label = args.wsi_label_mode == 'multi-label'
     h5_binary_labels = args.wsi_label_mode == 'binary'
+    outside_label = outside_label_value(args.outside_label, args.wsi_label_mode)
+    background_label = BACKGROUND_LABEL if h5_multi_label else 0
+    if h5_multi_label:
+        print(
+            f'[info] multi-label patch semantics: 1=target, '
+            f'{UNCERTAIN_LABEL}=uncertain/ignore, {BACKGROUND_LABEL}=explicit background; '
+            f'outside_label={outside_label}',
+            flush=True,
+        )
+
+    xml_count = write_xml_files(regions_by_slide, args.xml_out)
+    pos_counts, mask_count = write_mask_files(
+        regions_by_slide,
+        args.mask_out,
+        args.patch_scale,
+        outside_label=outside_label,
+        background_label=background_label,
+    )
     class_num = max(label_map.values(), default=0)
     h5_pos_counts, h5_label_count = write_h5_label_files(
         regions_by_slide,
@@ -1406,6 +1486,8 @@ def main():
         binary_labels=h5_binary_labels,
         h5_metadata=h5_metadata,
         h5_files=h5_files,
+        outside_label=outside_label,
+        background_label=background_label,
     )
     write_data_info(
         regions_by_slide,

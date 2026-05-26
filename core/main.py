@@ -460,6 +460,9 @@ def sparsify_reference_tokens(example_feats, example_labels, budget, anchor_rati
     }
     total_tokens = sum(idx.shape[0] for idx in label_idxs.values())
     if total_tokens == 0:
+        if return_indices:
+            keep_idxs = torch.arange(example_feats.shape[0], device=example_feats.device)
+            return example_feats, example_labels, keep_idxs
         return example_feats, example_labels
 
     quotas = {}
@@ -1112,22 +1115,83 @@ def patch_labels_for_class(patch_labels, cls, class_num, multilabel=False):
     patch_labels = np.asarray(patch_labels)
     if multilabel:
         if patch_labels.ndim == 2:
-            out = np.zeros(patch_labels.shape[0], dtype=np.int64)
+            out = np.full(patch_labels.shape[0], 254, dtype=np.int64)
             col = int(cls) - 1
             if 0 <= col < patch_labels.shape[1]:
-                out[patch_labels[:, col] > 0] = 1
+                cls_labels = patch_labels[:, col]
+                out[cls_labels == 255] = 255
+                out[cls_labels == 1] = 1
             return out
-        return (patch_labels == int(cls)).astype(np.int64)
+        out = np.full(patch_labels.shape[0], 254, dtype=np.int64)
+        out[patch_labels == 255] = 255
+        out[patch_labels == int(cls)] = 1
+        return out
 
     if class_num > 1:
         out = np.full(patch_labels.shape[0], 255, dtype=np.int64)
+        out[patch_labels == 254] = 254
         out[patch_labels == int(cls)] = 1
-        out[(patch_labels > 0) & (patch_labels != int(cls))] = 0
+        out[(patch_labels > 0) & (patch_labels != int(cls)) & (patch_labels < 254)] = 0
         if np.any(patch_labels == 1) and not np.any(patch_labels == int(cls)):
             out[patch_labels == 1] = 0
         return out
 
     return patch_labels.astype(np.int64, copy=True)
+
+
+def reference_masks_from_numpy_labels(labels, multilabel=False, prompt_type='mask'):
+    labels = np.asarray(labels)
+    pos_mask = labels == 1
+    if multilabel and prompt_type == 'mask':
+        neg_mask = labels == 255
+    else:
+        neg_mask = labels == 0
+        if multilabel:
+            neg_mask = neg_mask | (labels == 255)
+    return pos_mask, neg_mask
+
+
+def reference_mask_for_task(labels, args):
+    labels = torch.as_tensor(labels)
+    pos_mask = labels == 1
+    if getattr(args, 'multilabel', False) and getattr(args, 'prompt_type', None) == 'mask':
+        neg_mask = labels == 255
+    else:
+        neg_mask = labels == 0
+        if getattr(args, 'multilabel', False):
+            neg_mask = neg_mask | (labels == 255)
+    return pos_mask | neg_mask
+
+
+def filter_reference_tokens(example_feats, example_labels, args, context):
+    keep = reference_mask_for_task(example_labels, args)
+    kept = int(keep.sum().item())
+    total = int(example_labels.shape[0])
+    positive_count = int((example_labels == 1).sum().item())
+    if kept == 0:
+        unique_labels, unique_counts = torch.unique(example_labels.detach().cpu(), return_counts=True)
+        label_counts = ', '.join(
+            f'{int(label.item())}:{int(count.item())}'
+            for label, count in zip(unique_labels, unique_counts)
+        )
+        raise ValueError(
+            f'{context}: no usable reference tokens after dropping uncertain/ignored labels. '
+            f'Label counts: {label_counts}.'
+        )
+    if positive_count == 0:
+        unique_labels, unique_counts = torch.unique(example_labels.detach().cpu(), return_counts=True)
+        label_counts = ', '.join(
+            f'{int(label.item())}:{int(count.item())}'
+            for label, count in zip(unique_labels, unique_counts)
+        )
+        raise ValueError(
+            f'{context}: no positive reference tokens for this class. '
+            f'Label counts: {label_counts}.'
+        )
+    if kept == total:
+        return example_feats, example_labels
+    print(f'[reference] {context}: kept {kept}/{total} usable tokens; dropped {total - kept} ignored tokens.')
+    return example_feats[keep], example_labels[keep]
 
 
 def safe_binary_auc(labels, scores):
@@ -1574,6 +1638,13 @@ def evaluate(args, val_only=False):
                         example_labels[example_labels_others == 0] = 255
                         example_labels[example_labels_this == 0] = 255
             class_timer.add('tagger', time.perf_counter() - tagger_start)
+
+            example_feats, example_labels = filter_reference_tokens(
+                example_feats,
+                example_labels,
+                args,
+                f'evaluate repeat={i} class={cls}'
+            )
 
             sparse_start = time.perf_counter()
             sparsify_strategy = args.reference_sparsify_strategy
@@ -2072,14 +2143,18 @@ def evaluate_baseline(args, mode):
                         else:
                             pl[pl == -1] = 1 if example_wsi_label == cls else 0
                 
+                pos_mask, neg_mask = reference_masks_from_numpy_labels(
+                    pl, multilabel=multilabel, prompt_type=args.prompt_type
+                )
+
                 if 'prototype' in mode:
-                    pos_feats.append(example_n['features'][(pl != 0) * (pl != 255)])
-                    neg_feats.append(example_n['features'][pl == 0])
+                    pos_feats.append(example_n['features'][pos_mask])
+                    neg_feats.append(example_n['features'][neg_mask])
 
                 if 'knn' in mode:
 
                     if args.prompt_type != 'slideLabel':
-                        feat_fg = example_n['features'][(pl != 0) * (pl != 255)]
+                        feat_fg = example_n['features'][pos_mask]
                         if feat_fg.shape[0] != 0:
                             if 'mean' in mode:
                                 example_feats.append(feat_fg.mean(0, keepdims=True))
@@ -2087,7 +2162,7 @@ def evaluate_baseline(args, mode):
                                 example_feats.append(feat_fg.max(0, keepdims=True))
                             example_labels.append(1)
                         
-                        feat_bg = example_n['features'][pl == 0]
+                        feat_bg = example_n['features'][neg_mask]
                         if feat_bg.shape[0] != 0:
                             if 'mean' in mode:
                                 example_feats.append(feat_bg.mean(0, keepdims=True))

@@ -28,6 +28,7 @@ from main import (  # noqa: E402
     load_dataset_info,
     load_weak_prompts,
     patch_labels_for_class,
+    reference_mask_for_task,
     select_example_names,
     sparsify_reference_tokens,
 )
@@ -269,6 +270,22 @@ def apply_reference_sparsity(example_feats, example_labels, slide_names, patch_n
     )
     keep_idxs_np = keep_idxs.detach().cpu().numpy()
     return example_feats, example_labels, slide_names[keep_idxs_np], patch_names[keep_idxs_np], strategy
+
+
+def filter_visualized_reference_tokens(example_feats, example_labels, slide_names, patch_names, args, context):
+    keep = reference_mask_for_task(example_labels, args)
+    kept = int(keep.sum().item())
+    total = int(example_labels.shape[0])
+    positive_count = int((example_labels == 1).sum().item())
+    if kept == 0:
+        raise ValueError(f'{context}: no usable reference tokens after dropping uncertain/ignored labels.')
+    if positive_count == 0:
+        raise ValueError(f'{context}: no positive target tokens for this class.')
+    if kept == total:
+        return example_feats, example_labels, slide_names, patch_names
+    keep_np = keep.detach().cpu().numpy()
+    print(f'[reference] {context}: kept {kept}/{total} usable tokens; dropped {total - kept} ignored tokens.')
+    return example_feats[keep], example_labels[keep], slide_names[keep_np], patch_names[keep_np]
 
 
 def sample_tokens_for_tsne(feats, labels, slide_names, patch_names, max_tokens, seed):
@@ -530,6 +547,9 @@ def main():
         )
         example_labels = refine_example_labels(
             example_feats, example_labels, list(patch_names), example_names, cls, args, multilabel
+        )
+        example_feats, example_labels, slide_names, patch_names = filter_visualized_reference_tokens(
+            example_feats, example_labels, slide_names, patch_names, args, f'visualize class={cls}'
         )
         example_feats, example_labels, slide_names, patch_names, sparse_strategy = apply_reference_sparsity(
             example_feats, example_labels, slide_names, patch_names, args
