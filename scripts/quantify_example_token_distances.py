@@ -11,6 +11,13 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import silhouette_score
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
@@ -57,6 +64,8 @@ def parse_args():
         help='chunk size for sampled pair distance computation')
     parser.add_argument('--max_silhouette_tokens', type=int, default=5000,
         help='max tokens used for cosine silhouette; 0 disables silhouette')
+    parser.add_argument('--no_plots', action='store_true',
+        help='skip matplotlib visualizations and write only CSV/JSON outputs')
     args = parser.parse_args()
     if args.all_classes:
         args.classes = list(range(1, args.c + 1)) if args.c > 1 else [1]
@@ -349,6 +358,218 @@ def write_confusion(path, rows):
             writer.writerow(row)
 
 
+def centroid_distance_matrix(classes, centroids):
+    matrix = np.full((len(classes), len(classes)), np.nan, dtype=np.float64)
+    for i, cls_i in enumerate(classes):
+        for j, cls_j in enumerate(classes):
+            sim = float((centroids[cls_i] @ centroids[cls_j].t()).item())
+            matrix[i, j] = 1.0 - sim
+    return matrix
+
+
+def pairwise_metric_matrix(classes, pair_rows, metric_key):
+    class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+    matrix = np.full((len(classes), len(classes)), np.nan, dtype=np.float64)
+    for row in pair_rows:
+        cls_i = int(row['class_i'])
+        cls_j = int(row['class_j'])
+        if cls_i not in class_to_idx or cls_j not in class_to_idx:
+            continue
+        value = row.get(metric_key)
+        if value is None:
+            continue
+        i = class_to_idx[cls_i]
+        j = class_to_idx[cls_j]
+        matrix[i, j] = float(value)
+        matrix[j, i] = float(value)
+    return matrix
+
+
+def confusion_rate_matrix(classes, confusion_rows):
+    class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+    matrix = np.zeros((len(classes), len(classes)), dtype=np.float64)
+    for row in confusion_rows:
+        true_cls = int(row['true_class'])
+        pred_cls = int(row['pred_class'])
+        if true_cls not in class_to_idx or pred_cls not in class_to_idx:
+            continue
+        matrix[class_to_idx[true_cls], class_to_idx[pred_cls]] = float(row['row_rate'])
+    return matrix
+
+
+def _finite_bounds(matrix):
+    finite = np.asarray(matrix)[np.isfinite(matrix)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    low = float(np.min(finite))
+    high = float(np.max(finite))
+    if low == high:
+        high = low + 1e-6
+    return low, high
+
+
+def save_heatmap(path_prefix, matrix, classes, title, cbar_label, cmap='magma',
+                 vmin=None, vmax=None, annotate_fmt='.2f'):
+    if plt is None:
+        return {}
+
+    n = len(classes)
+    if vmin is None or vmax is None:
+        auto_vmin, auto_vmax = _finite_bounds(matrix)
+        if vmin is None:
+            vmin = auto_vmin
+        if vmax is None:
+            vmax = auto_vmax
+
+    width = max(7.0, 0.48 * n + 3.0)
+    height = max(6.5, 0.48 * n + 2.5)
+    fig, ax = plt.subplots(figsize=(width, height))
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad('#e5e7eb')
+    im = ax.imshow(matrix, cmap=cmap_obj, vmin=vmin, vmax=vmax, aspect='auto')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label)
+
+    ax.set_xticks(np.arange(n))
+    ax.set_yticks(np.arange(n))
+    ax.set_xticklabels([str(cls) for cls in classes], rotation=45, ha='right')
+    ax.set_yticklabels([str(cls) for cls in classes])
+    ax.set_xlabel('Class')
+    ax.set_ylabel('Class')
+    ax.set_title(title)
+
+    if n <= 20:
+        threshold = (float(vmin) + float(vmax)) / 2.0
+        for i in range(n):
+            for j in range(n):
+                value = matrix[i, j]
+                if not np.isfinite(value):
+                    text = 'NA'
+                    color = '#111827'
+                else:
+                    text = format(float(value), annotate_fmt)
+                    color = 'white' if float(value) > threshold else '#111827'
+                ax.text(j, i, text, ha='center', va='center', fontsize=7, color=color)
+
+    fig.tight_layout()
+    outputs = {}
+    png_path = path_prefix + '.png'
+    svg_path = path_prefix + '.svg'
+    fig.savefig(png_path, dpi=220)
+    fig.savefig(svg_path)
+    plt.close(fig)
+    outputs['png'] = png_path
+    outputs['svg'] = svg_path
+    return outputs
+
+
+def save_class_summary_plot(path_prefix, class_rows):
+    if plt is None:
+        return {}
+
+    rows = sorted(class_rows, key=lambda row: int(row['class']))
+    classes = [int(row['class']) for row in rows]
+    nearest_dist = np.asarray([
+        float(row['nearest_other_centroid_distance'])
+        if row.get('nearest_other_centroid_distance') is not None else np.nan
+        for row in rows
+    ], dtype=np.float64)
+    own_p95 = np.asarray([
+        float(row['p95_distance_to_own_centroid'])
+        if row.get('p95_distance_to_own_centroid') is not None else np.nan
+        for row in rows
+    ], dtype=np.float64)
+    recall = np.asarray([
+        float(row['nearest_centroid_recall'])
+        if row.get('nearest_centroid_recall') is not None else np.nan
+        for row in rows
+    ], dtype=np.float64)
+    competitor = [
+        str(int(row['nearest_other_centroid_class']))
+        if row.get('nearest_other_centroid_class') is not None else 'NA'
+        for row in rows
+    ]
+
+    x = np.arange(len(classes))
+    width = max(9.0, 0.52 * len(classes) + 4.0)
+    fig, axes = plt.subplots(2, 1, figsize=(width, 8.0), sharex=True)
+
+    axes[0].bar(x, nearest_dist, color='#2563eb', alpha=0.82, label='Nearest other centroid distance')
+    axes[0].plot(x, own_p95, color='#dc2626', marker='o', linewidth=1.6, label='P95 own-centroid distance')
+    axes[0].set_ylabel('Cosine distance')
+    axes[0].set_title('Class Separation Summary')
+    axes[0].legend(loc='best')
+    axes[0].grid(axis='y', alpha=0.25)
+    for idx, label in enumerate(competitor):
+        if np.isfinite(nearest_dist[idx]):
+            axes[0].text(idx, nearest_dist[idx], '->' + label, ha='center', va='bottom', fontsize=8)
+
+    axes[1].bar(x, recall, color='#059669', alpha=0.82)
+    axes[1].set_ylim(0.0, 1.05)
+    axes[1].set_ylabel('Nearest-centroid recall')
+    axes[1].set_xlabel('Class')
+    axes[1].grid(axis='y', alpha=0.25)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([str(cls) for cls in classes])
+
+    fig.tight_layout()
+    outputs = {}
+    png_path = path_prefix + '.png'
+    svg_path = path_prefix + '.svg'
+    fig.savefig(png_path, dpi=220)
+    fig.savefig(svg_path)
+    plt.close(fig)
+    outputs['png'] = png_path
+    outputs['svg'] = svg_path
+    return outputs
+
+
+def write_visualizations(out_dir, classes, centroids, pair_rows, confusion_rows, class_rows):
+    if plt is None:
+        print('[warning] matplotlib is not installed; skipped distance plots.')
+        return {}
+
+    outputs = {}
+    centroid_matrix = centroid_distance_matrix(classes, centroids)
+    pair_median_matrix = pairwise_metric_matrix(classes, pair_rows, 'cosine_distance_median')
+    confusion_matrix = confusion_rate_matrix(classes, confusion_rows)
+
+    outputs['centroid_distance_heatmap'] = save_heatmap(
+        os.path.join(out_dir, 'centroid_distance_heatmap'),
+        centroid_matrix,
+        classes,
+        'Class Centroid Cosine Distance',
+        '1 - cosine similarity (smaller = closer)',
+        cmap='magma',
+        annotate_fmt='.2f',
+    )
+    outputs['pairwise_token_median_distance_heatmap'] = save_heatmap(
+        os.path.join(out_dir, 'pairwise_token_median_distance_heatmap'),
+        pair_median_matrix,
+        classes,
+        'Median Token-Pair Cosine Distance',
+        'Median sampled token distance (smaller = closer)',
+        cmap='magma',
+        annotate_fmt='.2f',
+    )
+    outputs['nearest_centroid_confusion_heatmap'] = save_heatmap(
+        os.path.join(out_dir, 'nearest_centroid_confusion_heatmap'),
+        confusion_matrix,
+        classes,
+        'Nearest-Centroid Token Assignment',
+        'Row-normalized rate',
+        cmap='Blues',
+        vmin=0.0,
+        vmax=1.0,
+        annotate_fmt='.2f',
+    )
+    outputs['class_distance_summary'] = save_class_summary_plot(
+        os.path.join(out_dir, 'class_distance_summary'),
+        class_rows,
+    )
+    return outputs
+
+
 def silhouette_summary(class_feats, classes, max_tokens, seed):
     if max_tokens <= 0:
         return None
@@ -429,6 +650,11 @@ def main():
     pair_rows = write_pairwise_token_distances(pairwise_path, classes, class_feats, args)
     write_confusion(confusion_path, confusion_rows)
     sil = silhouette_summary(class_feats, classes, args.max_silhouette_tokens, args.seed + 31337)
+    plot_outputs = {}
+    if not args.no_plots:
+        plot_outputs = write_visualizations(
+            args.out_dir, classes, centroids, pair_rows, confusion_rows, class_rows
+        )
 
     summary = {
         **split_summary,
@@ -437,6 +663,7 @@ def main():
             'centroid_distances': centroid_path,
             'pairwise_token_distances': pairwise_path,
             'nearest_centroid_confusion': confusion_path,
+            'plots': plot_outputs,
         },
         'class_meta': class_meta,
         'nearest_centroid_overall_acc': nearest_acc,
@@ -448,6 +675,7 @@ def main():
             'centroid_distances': 'Distances between L2-normalized class centroids.',
             'pairwise_token_distances': 'Random sampled token-pair cosine distance quantiles per class pair.',
             'nearest_centroid_confusion': 'Each token assigned to the closest class centroid.',
+            'plots': 'Heatmaps are written when matplotlib is available; darker/brighter colors should be read with the colorbar.',
         },
     }
     with open(summary_path, 'w') as f:
@@ -457,6 +685,10 @@ def main():
     print(f'[distance] wrote {centroid_path}')
     print(f'[distance] wrote {pairwise_path}')
     print(f'[distance] wrote {confusion_path}')
+    if plot_outputs:
+        for plot_name, paths in plot_outputs.items():
+            for path in paths.values():
+                print(f'[distance] wrote {plot_name}: {path}')
     print(f'[distance] wrote {summary_path}')
 
 

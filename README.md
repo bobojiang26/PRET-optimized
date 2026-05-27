@@ -266,7 +266,7 @@ python scripts/quantify_example_token_distances.py \
   --out_dir records/example_token_distances
 ```
 
-This writes `class_stats.csv`, `centroid_distances.csv`, `pairwise_token_distances.csv`, `nearest_centroid_confusion.csv`, and `summary.json`. Smaller cosine distance means two classes are closer. For classes 2/3, first check rows involving `class_i=2` or `class_i=3` in `centroid_distances.csv`, then inspect `nearest_token_competitor_class` and `nearest_centroid_recall` in `class_stats.csv`.
+This writes `class_stats.csv`, `centroid_distances.csv`, `pairwise_token_distances.csv`, `nearest_centroid_confusion.csv`, and `summary.json`. When `matplotlib` is available it also writes PNG/SVG plots: `centroid_distance_heatmap`, `pairwise_token_median_distance_heatmap`, `nearest_centroid_confusion_heatmap`, and `class_distance_summary`. Smaller cosine distance means two classes are closer. For classes 2/3, first inspect the 2/3 rows and columns in `centroid_distance_heatmap.png` and `pairwise_token_median_distance_heatmap.png`, then check `nearest_centroid_confusion_heatmap.png` for whether their tokens are assigned to other class centroids. `class_distance_summary.png` gives a quick per-class view: low nearest-other distance, high own-centroid spread, or low nearest-centroid recall indicates a class that may be poorly separated. Add `--no_plots` if you only want the CSV/JSON outputs.
 
 If the script reports that `sparsify_reference_tokens()` got an unexpected `return_indices` argument, the copied checkout is mixing a new `scripts/visualize_example_tokens.py` with an older `core/main.py`. Sync both files from `optimized/main` before running the visualization, because the script needs the latest sparsification helper to map kept tokens back to their slide/patch names.
 
@@ -744,7 +744,7 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 默认输出所有指定类别在同一张图上的 `combined_classes_tokens_tsne.svg`、`combined_classes_tokens_tsne.csv` 和总览 `summary.json`。合并图中每个点都是对应类别的 positive/target example token，颜色代表类别 id；CSV 保留每个点的二维坐标、class、slide 和 patch 名，便于继续排查异常 slide。`--all_classes` 会按 PRET 的类别编号展开为 `1..class_num`。
    - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --all_classes --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。如果还需要旧版每个类别单独一张 one-vs-rest 图，加 `--plot_mode both`。
    - 新增 `scripts/visualize_class_vs_rest_tokens.py`，用于单独查看某个目标类别和其他前景类别、未标注/背景 token 之间的区分度。推荐配合 `--prompt_type mask` 使用；输出 `class_{id}_target_vs_rest_tsne.svg/csv`，并在 `summary.json` 中写入 target-vs-non-target AUC、target-vs-other-foreground AUC、target-vs-unannotated/background AUC、nearest-centroid accuracy 和 silhouette 等诊断指标。
-   - 新增 `scripts/quantify_example_token_distances.py`，用于量化 t-SNE 背后的类间距离；输出类内紧凑度、类中心距离、随机 token-pair 距离分位数和 nearest-centroid 混淆矩阵，便于排序查看哪些类别和 2/3 类最接近。
+   - 新增 `scripts/quantify_example_token_distances.py`，用于量化 t-SNE 背后的类间距离；输出类内紧凑度、类中心距离、随机 token-pair 距离分位数和 nearest-centroid 混淆矩阵，便于排序查看哪些类别和 2/3 类最接近。默认还会在安装了 `matplotlib` 时写出 `centroid_distance_heatmap.png/svg`、`pairwise_token_median_distance_heatmap.png/svg`、`nearest_centroid_confusion_heatmap.png/svg` 和 `class_distance_summary.png/svg`，可以直接看类别之间谁更接近、哪些 token 容易被分到其他类中心；如只需要原始 CSV/JSON，可加 `--no_plots`。
 
 ## Citation
 
