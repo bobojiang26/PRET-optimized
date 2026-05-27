@@ -1138,160 +1138,36 @@ def safe_binary_auc(labels, scores):
     return float(roc_auc_score(labels, scores))
 
 
-def binary_confusion_counts(labels, pred_labels):
-    labels = np.asarray(labels).astype(int)
-    pred_labels = np.asarray(pred_labels).astype(int)
-    tp = int(((pred_labels == 1) & (labels == 1)).sum())
-    fp = int(((pred_labels == 1) & (labels == 0)).sum())
-    tn = int(((pred_labels == 0) & (labels == 0)).sum())
-    fn = int(((pred_labels == 0) & (labels == 1)).sum())
-    return {'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn}
-
-
-def binary_metric_from_counts(counts, metric):
-    tp, fp, tn, fn = counts['tp'], counts['fp'], counts['tn'], counts['fn']
-    total = tp + fp + tn + fn
-    acc = (tp + tn) / max(total, 1)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    specificity = tn / max(tn + fp, 1)
-    f1 = (2 * precision * recall) / max(precision + recall, 1e-8)
-    balanced_acc = 0.5 * (recall + specificity)
-    values = {
-        'acc': acc,
-        'f1': f1,
-        'balanced_acc': balanced_acc,
-        'youden': recall + specificity - 1.0,
-        'precision': precision,
-        'recall': recall,
-        'specificity': specificity,
-    }
-    return values[metric]
-
-
-def binary_score_summary(labels, pred_labels):
-    counts = binary_confusion_counts(labels, pred_labels)
-    out = dict(counts)
-    for metric in ['acc', 'f1', 'balanced_acc', 'precision', 'recall', 'specificity']:
-        out[metric] = float(binary_metric_from_counts(counts, metric))
-    out['pos'] = int(np.asarray(labels).astype(int).sum())
-    out['neg'] = int(np.asarray(labels).shape[0] - out['pos'])
-    out['pred_pos'] = int(np.asarray(pred_labels).astype(int).sum())
-    out['pred_neg'] = int(np.asarray(pred_labels).shape[0] - out['pred_pos'])
-    return out
-
-
-def binary_threshold_candidates(preds):
-    preds = np.asarray(preds, dtype=float)
-    unique = np.unique(preds)
-    if unique.size == 0:
-        return np.asarray([0.0], dtype=float)
-    eps = max(float(unique[-1] - unique[0]) * 1e-6, 1e-6)
-    if unique.size == 1:
-        return np.asarray([unique[0] - eps, unique[0] + eps], dtype=float)
-    mids = (unique[:-1] + unique[1:]) / 2.0
-    return np.concatenate(([unique[0] - eps], mids, [unique[-1] + eps]))
-
-
-def select_binary_threshold(val_labels, val_preds, prefer_f1=False, metric='acc', min_precision=0.0):
+def select_binary_threshold(val_labels, val_preds, prefer_f1=False):
     labels = np.asarray(val_labels).astype(int)
     preds = np.asarray(val_preds, dtype=float)
     if labels.size == 0:
         return 0.0, float('nan'), float('nan')
-    metric = 'f1' if prefer_f1 and metric == 'acc' else metric
     unique = np.unique(labels)
     if unique.size < 2:
         if unique[0] == 1:
             thresh = float(preds.min() - 1e-6)
         else:
             thresh = float(preds.max() + 1e-6)
-        pred_labels = (preds > thresh).astype(int)
-        counts = binary_confusion_counts(labels, pred_labels)
-        score = float(binary_metric_from_counts(counts, metric if metric != 'youden' else 'balanced_acc'))
-        f1 = float(binary_metric_from_counts(counts, 'f1'))
-        return thresh, score, f1
+        acc = float(((preds > thresh).astype(int) == labels).mean())
+        f1 = float(f1_score(labels, (preds > thresh).astype(int), zero_division=0))
+        return thresh, acc, f1
 
-    candidates = binary_threshold_candidates(preds)
-    rows = []
-    for thresh in candidates:
+    precisions, recalls, thresholds = precision_recall_curve(labels, preds)
+    if thresholds.size == 0:
+        thresh = float(np.median(preds))
         pred_labels = (preds > thresh).astype(int)
-        counts = binary_confusion_counts(labels, pred_labels)
-        rows.append({
-            'threshold': float(thresh),
-            'counts': counts,
-            'metric': float(binary_metric_from_counts(counts, metric)),
-            'f1': float(binary_metric_from_counts(counts, 'f1')),
-            'balanced_acc': float(binary_metric_from_counts(counts, 'balanced_acc')),
-            'precision': float(binary_metric_from_counts(counts, 'precision')),
-            'recall': float(binary_metric_from_counts(counts, 'recall')),
-        })
+        return thresh, float((pred_labels == labels).mean()), float(f1_score(labels, pred_labels, zero_division=0))
 
-    constrained = rows
-    if min_precision > 0:
-        constrained = [row for row in rows if row['precision'] >= min_precision and row['counts']['tp'] + row['counts']['fp'] > 0]
-        if constrained:
-            constrained = sorted(
-                constrained,
-                key=lambda row: (row['recall'], row['f1'], row['balanced_acc'], row['threshold']),
-                reverse=True,
-            )
-            best = constrained[0]
-        else:
-            rows = sorted(
-                rows,
-                key=lambda row: (row['precision'], row['recall'], row['f1'], row['balanced_acc'], row['threshold']),
-                reverse=True,
-            )
-            best = rows[0]
+    accs = np.array([((preds > _).astype(int) == labels).mean() for _ in thresholds])
+    if prefer_f1:
+        f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-8)
+        idx = int(np.nanargmax(f1_scores))
     else:
-        constrained = sorted(
-            constrained,
-            key=lambda row: (row['metric'], row['f1'], row['balanced_acc'], row['precision'], row['threshold']),
-            reverse=True,
-        )
-        best = constrained[0]
-    return best['threshold'], best['metric'], best['f1']
-
-
-def select_multilabel_joint_thresholds(y_score_val, y_true_val, per_class_thresholds, max_candidates=50, max_iter=10):
-    """Jointly optimize per-class thresholds to maximize exact match accuracy.
-
-    Uses greedy coordinate descent: iterates over classes, testing each
-    candidate threshold while holding the others fixed.
-    """
-    y_score_val = np.asarray(y_score_val, dtype=float)
-    y_true_val = np.asarray(y_true_val).astype(int)
-    n_samples, n_classes = y_score_val.shape
-    thresholds = np.asarray(per_class_thresholds, dtype=float).copy()
-
-    # Build candidate lists per class
-    all_candidates = []
-    for c in range(n_classes):
-        cands = binary_threshold_candidates(y_score_val[:, c])
-        if cands.size > max_candidates:
-            idx = np.linspace(0, cands.size - 1, max_candidates).astype(int)
-            cands = cands[idx]
-        all_candidates.append(cands)
-
-    for _ in range(max_iter):
-        changed = False
-        for c in range(n_classes):
-            best_score = -1.0
-            best_t = thresholds[c]
-            for t in all_candidates[c]:
-                thresholds[c] = t
-                y_pred = (y_score_val > thresholds.reshape(1, -1)).astype(int)
-                score = float(accuracy_score(y_true_val, y_pred))
-                if score > best_score:
-                    best_score = score
-                    best_t = t
-            if best_t != thresholds[c]:
-                changed = True
-            thresholds[c] = best_t
-        if not changed:
-            break
-
-    return thresholds
+        idx = int(np.nanargmax(accs))
+    thresh = float(thresholds[idx])
+    pred_labels = (preds > thresh).astype(int)
+    return thresh, float(accs[idx]), float(f1_score(labels, pred_labels, zero_division=0))
 
 
 def multilabel_metrics(y_true, y_score, y_pred):
@@ -1879,8 +1755,6 @@ def evaluate(args, val_only=False):
                         'logits': preds.cpu().numpy().reshape(-1),
                         'labels': labels.cpu().numpy().astype(int).reshape(-1),
                         'preds': thresh_preds.cpu().numpy().astype(int).reshape(-1),
-                        'calib_logits': calib_preds.numpy().reshape(-1),
-                        'calib_labels': calib_labels.numpy().astype(int).reshape(-1),
                     }
 
             class_timer.add('validation', time.perf_counter() - validation_start)
@@ -1890,15 +1764,6 @@ def evaluate(args, val_only=False):
             y_score = np.stack([multilabel_repeat[cls]['logits'] for cls in range(1, args.c + 1)], axis=1)
             y_true = np.stack([multilabel_repeat[cls]['labels'] for cls in range(1, args.c + 1)], axis=1)
             thresholds = np.array([multilabel_repeat[cls]['threshold'] for cls in range(1, args.c + 1)])
-            per_class_thresholds = thresholds.copy()
-            if getattr(args, 'multilabel_threshold', 'per_class') == 'joint':
-                calib_scores = np.stack([multilabel_repeat[cls]['calib_logits'] for cls in range(1, args.c + 1)], axis=1)
-                calib_labels_ml = np.stack([multilabel_repeat[cls]['calib_labels'] for cls in range(1, args.c + 1)], axis=1)
-                thresholds = select_multilabel_joint_thresholds(calib_scores, calib_labels_ml, thresholds)
-                print('[multilabel_threshold] joint thresholds: ' + ', '.join(
-                    f'class{c}:{t:.4f}' for c, t in enumerate(thresholds, 1)))
-                print('[multilabel_threshold] per-class thresholds: ' + ', '.join(
-                    f'class{c}:{t:.4f}' for c, t in enumerate(per_class_thresholds, 1)))
             y_pred = (y_score > thresholds.reshape(1, -1)).astype(int)
             metrics = multilabel_metrics(y_true, y_score, y_pred)
             multilabel_repeat_metrics.append(metrics)
@@ -1907,9 +1772,7 @@ def evaluate(args, val_only=False):
                 for idx in range(min(10, len(names)))
             ]
             records['repeat_' + str(i)]['multilabel'] = {
-                'class_thresholds': {str(c + 1): float(t) for c, t in enumerate(thresholds)},
-                'per_class_thresholds': {str(c + 1): float(t) for c, t in enumerate(per_class_thresholds)},
-                'threshold_mode': getattr(args, 'multilabel_threshold', 'per_class'),
+                'class_thresholds': {str(cls): float(multilabel_repeat[cls]['threshold']) for cls in range(1, args.c + 1)},
                 'names': names,
                 'labels': y_true.astype(int).tolist(),
                 'logits': y_score.tolist(),
@@ -2543,8 +2406,6 @@ if __name__ == '__main__':
     parser.add_argument('--multilabel', default=False, action='store_true',
         help='evaluate WSI labels as multi-hot vectors; enabled automatically when dataset_info has wsi_labels')
     parser.add_argument('--seg', default=False, action='store_true', help='True to evaluate segmentation task (f1 = dice)')
-    parser.add_argument('--multilabel_threshold', default='per_class', choices=['per_class', 'joint'],
-        help='per_class: independent per-class threshold (default); joint: jointly optimize thresholds for exact match')
 
     # for weak prompts
     parser.add_argument('--prompt_type', default='mask', help='prompttation type')
