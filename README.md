@@ -244,6 +244,30 @@ python scripts/visualize_class_vs_rest_tokens.py \
 
 This writes `class_{id}_target_vs_rest_tsne.csv/svg/png` and records separability metrics in `summary.json`, including target-vs-non-target AUC, target-vs-other-foreground AUC, target-vs-unannotated/background AUC, nearest-centroid accuracy, and cosine silhouette. For positive-only CSVs, `255` means unknown/unannotated rather than proven negative background.
 
+To quantify class distances behind the t-SNE plot, run:
+
+```bash
+python scripts/quantify_example_token_distances.py \
+  --raw_feature_path data/MY_H5/h5 \
+  --wsi_path data/MY_H5/images \
+  --dump_features data/MY_H5/collected_features \
+  --dataset_info data_info/MY_H5.json \
+  --prompt_type mask \
+  --class_num 17 \
+  --all_classes \
+  --multilabel \
+  --example_ratio 0.6 \
+  --example_ratio_max_per_class 20 \
+  --reference_token_budget 30000 \
+  --reference_sparsify_strategy quality \
+  --multilabel_mask_negative_source other_positive \
+  --max_tokens_per_class 5000 \
+  --pair_sample_size 20000 \
+  --out_dir records/example_token_distances
+```
+
+This writes `class_stats.csv`, `centroid_distances.csv`, `pairwise_token_distances.csv`, `nearest_centroid_confusion.csv`, and `summary.json`. Smaller cosine distance means two classes are closer. For classes 2/3, first check rows involving `class_i=2` or `class_i=3` in `centroid_distances.csv`, then inspect `nearest_token_competitor_class` and `nearest_centroid_recall` in `class_stats.csv`.
+
 If the script reports that `sparsify_reference_tokens()` got an unexpected `return_indices` argument, the copied checkout is mixing a new `scripts/visualize_example_tokens.py` with an older `core/main.py`. Sync both files from `optimized/main` before running the visualization, because the script needs the latest sparsification helper to map kept tokens back to their slide/patch names.
 
 ### H5 mask evaluation from CSV annotations
@@ -720,6 +744,7 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 默认输出所有指定类别在同一张图上的 `combined_classes_tokens_tsne.svg`、`combined_classes_tokens_tsne.csv` 和总览 `summary.json`。合并图中每个点都是对应类别的 positive/target example token，颜色代表类别 id；CSV 保留每个点的二维坐标、class、slide 和 patch 名，便于继续排查异常 slide。`--all_classes` 会按 PRET 的类别编号展开为 `1..class_num`。
    - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --all_classes --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。如果还需要旧版每个类别单独一张 one-vs-rest 图，加 `--plot_mode both`。
    - 新增 `scripts/visualize_class_vs_rest_tokens.py`，用于单独查看某个目标类别和其他前景类别、未标注/背景 token 之间的区分度。推荐配合 `--prompt_type mask` 使用；输出 `class_{id}_target_vs_rest_tsne.svg/csv`，并在 `summary.json` 中写入 target-vs-non-target AUC、target-vs-other-foreground AUC、target-vs-unannotated/background AUC、nearest-centroid accuracy 和 silhouette 等诊断指标。
+   - 新增 `scripts/quantify_example_token_distances.py`，用于量化 t-SNE 背后的类间距离；输出类内紧凑度、类中心距离、随机 token-pair 距离分位数和 nearest-centroid 混淆矩阵，便于排序查看哪些类别和 2/3 类最接近。
 
 ## Citation
 
