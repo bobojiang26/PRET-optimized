@@ -1,6 +1,7 @@
 import os
 import sys
 
+import numpy as np
 import torch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -13,10 +14,13 @@ from main import (
     apply_context_feature_centering,
     apply_require_label_filter,
     binary_conformal_summary,
+    binary_decision_counts,
     chunked_min_cosine_distance,
     get_example_names_at_label_ratio,
     has_real_wsi_label,
     label_counts,
+    patch_labels_for_class,
+    select_binary_threshold,
     select_validation_names,
     threshold_source,
     use_test_threshold,
@@ -54,6 +58,23 @@ def test_default_validation_selection_preserves_original_order():
     }
 
     assert select_validation_names(names, dataset_info, 2, balanced=False) == ["a", "b"]
+
+
+def test_multilabel_balanced_validation_covers_rare_labels():
+    names = ["a", "b", "c", "d"]
+    dataset_info = {
+        "a": {"wsi_labels": [1]},
+        "b": {"wsi_labels": [2]},
+        "c": {"wsi_labels": [3]},
+        "d": {"wsi_labels": [1, 2]},
+    }
+
+    selected = select_validation_names(names, dataset_info, 2, balanced=True, class_num=3)
+    covered = set()
+    for name in selected:
+        covered.update(dataset_info[name]["wsi_labels"])
+
+    assert covered == {1, 2, 3}
 
 
 def test_threshold_source_defaults_to_validation_split():
@@ -207,3 +228,62 @@ def test_require_label_filter_keeps_only_real_labels():
     filtered = apply_require_label_filter(dataset_info, Args(), context="test")
 
     assert list(filtered.keys()) == ["labeled_neg", "labeled_multi_neg"]
+
+
+def test_multilabel_mask_other_positive_negative_source_ignores_unannotated_patches():
+    raw = np.array([
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 0],
+        [0, 1, 1],
+    ])
+
+    labels = patch_labels_for_class(
+        raw, 2, 3, multilabel=True, multilabel_negative_source="other_positive"
+    )
+
+    assert labels.tolist() == [0, 1, 255, 1]
+
+
+def test_threshold_tie_break_can_choose_conservative_threshold():
+    labels = np.array([0, 1, 0])
+    preds = np.array([0.1, 0.2, 0.3])
+
+    conservative, _, _ = select_binary_threshold(labels, preds, tie_break="conservative")
+    first, _, _ = select_binary_threshold(labels, preds, tie_break="first")
+
+    assert conservative == 0.3
+    assert first == 0.1
+
+
+def test_single_label_calibration_uses_one_sided_thresholds():
+    neg_labels = np.array([0, 0, 0])
+    pos_labels = np.array([1, 1, 1])
+    preds = np.array([0.1, 0.2, 0.3])
+
+    neg_threshold, neg_acc, _ = select_binary_threshold(neg_labels, preds)
+    pos_threshold, pos_acc, _ = select_binary_threshold(pos_labels, preds)
+
+    assert neg_threshold > preds.max()
+    assert pos_threshold < preds.min()
+    assert neg_acc == 1.0
+    assert pos_acc == 1.0
+
+
+def test_binary_decision_counts_reports_false_positives_and_ignores_nonbinary_labels():
+    labels = np.array([1, 0, 0, 1, 255])
+    preds = np.array([1, 1, 0, 0, 1])
+
+    counts = binary_decision_counts(labels, preds)
+
+    assert counts == {
+        "total": 4,
+        "label_pos": 2,
+        "label_neg": 2,
+        "pred_pos": 2,
+        "pred_neg": 2,
+        "tp": 1,
+        "fp": 1,
+        "tn": 1,
+        "fn": 1,
+    }

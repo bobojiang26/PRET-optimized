@@ -1012,6 +1012,10 @@ def use_example_ratio(args):
     return example_ratio(args) > 0.0
 
 
+def multilabel_mask_negative_source(args):
+    return getattr(args, 'multilabel_mask_negative_source', 'other_positive')
+
+
 def example_ratio_max_per_class(args):
     return int(getattr(args, 'example_ratio_max_per_class', 0) or 0)
 
@@ -1108,16 +1112,34 @@ def format_label_counts(counts):
     return ', '.join(f'{k}:{counts[k]}' for k in sorted(counts))
 
 
-def patch_labels_for_class(patch_labels, cls, class_num, multilabel=False):
+def patch_labels_for_class(patch_labels, cls, class_num, multilabel=False, multilabel_negative_source='all_zero'):
     patch_labels = np.asarray(patch_labels)
     if multilabel:
         if patch_labels.ndim == 2:
-            out = np.zeros(patch_labels.shape[0], dtype=np.int64)
             col = int(cls) - 1
+            source = (multilabel_negative_source or 'all_zero').lower()
+            if source not in ['all_zero', 'other_positive', 'none']:
+                raise ValueError(f'unsupported multilabel negative source: {multilabel_negative_source}')
+            if source == 'all_zero':
+                out = np.zeros(patch_labels.shape[0], dtype=np.int64)
+            else:
+                out = np.full(patch_labels.shape[0], 255, dtype=np.int64)
             if 0 <= col < patch_labels.shape[1]:
-                out[patch_labels[:, col] > 0] = 1
+                target = patch_labels[:, col] > 0
+                if source == 'other_positive' and patch_labels.shape[1] > 1:
+                    other = np.delete(patch_labels, col, axis=1).max(1) > 0
+                    out[other] = 0
+                out[target] = 1
             return out
-        return (patch_labels == int(cls)).astype(np.int64)
+        source = (multilabel_negative_source or 'all_zero').lower()
+        if source == 'all_zero':
+            return (patch_labels == int(cls)).astype(np.int64)
+        out = np.full(patch_labels.shape[0], 255, dtype=np.int64)
+        out[patch_labels == int(cls)] = 1
+        if source == 'other_positive':
+            other = (patch_labels > 0) & (patch_labels != int(cls)) & (patch_labels < 254)
+            out[other] = 0
+        return out
 
     if class_num > 1:
         out = np.full(patch_labels.shape[0], 255, dtype=np.int64)
@@ -1138,7 +1160,7 @@ def safe_binary_auc(labels, scores):
     return float(roc_auc_score(labels, scores))
 
 
-def select_binary_threshold(val_labels, val_preds, prefer_f1=False):
+def select_binary_threshold(val_labels, val_preds, prefer_f1=False, tie_break='conservative'):
     labels = np.asarray(val_labels).astype(int)
     preds = np.asarray(val_preds, dtype=float)
     if labels.size == 0:
@@ -1161,13 +1183,94 @@ def select_binary_threshold(val_labels, val_preds, prefer_f1=False):
 
     accs = np.array([((preds > _).astype(int) == labels).mean() for _ in thresholds])
     if prefer_f1:
-        f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-8)
-        idx = int(np.nanargmax(f1_scores))
+        scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-8)
     else:
-        idx = int(np.nanargmax(accs))
+        scores = accs
+    best_score = np.nanmax(scores)
+    candidate_idxs = np.where(np.isclose(scores, best_score, rtol=1e-12, atol=1e-12))[0]
+    if (tie_break or 'conservative') == 'conservative':
+        idx = int(candidate_idxs[-1])
+    else:
+        idx = int(candidate_idxs[0])
     thresh = float(thresholds[idx])
     pred_labels = (preds > thresh).astype(int)
     return thresh, float(accs[idx]), float(f1_score(labels, pred_labels, zero_division=0))
+
+
+def binary_decision_counts(labels, pred_labels):
+    labels = np.asarray(labels).astype(int).reshape(-1)
+    pred_labels = np.asarray(pred_labels).astype(int).reshape(-1)
+    length = min(labels.shape[0], pred_labels.shape[0])
+    labels = labels[:length]
+    pred_labels = pred_labels[:length]
+    valid = (labels == 0) | (labels == 1)
+    labels = labels[valid]
+    pred_labels = pred_labels[valid]
+
+    tp = int(((labels == 1) & (pred_labels == 1)).sum())
+    fp = int(((labels == 0) & (pred_labels == 1)).sum())
+    tn = int(((labels == 0) & (pred_labels == 0)).sum())
+    fn = int(((labels == 1) & (pred_labels == 0)).sum())
+    total = int(labels.shape[0])
+    label_pos = int((labels == 1).sum())
+    pred_pos = int((pred_labels == 1).sum())
+    return {
+        'total': total,
+        'label_pos': label_pos,
+        'label_neg': total - label_pos,
+        'pred_pos': pred_pos,
+        'pred_neg': total - pred_pos,
+        'tp': tp,
+        'fp': fp,
+        'tn': tn,
+        'fn': fn,
+    }
+
+
+def format_binary_decision_counts(counts):
+    return (
+        'pos/pred_pos:' + str(counts['label_pos']) + '/' + str(counts['pred_pos']) +
+        ', tp/fp/tn/fn:' + str(counts['tp']) + '/' + str(counts['fp']) + '/' +
+        str(counts['tn']) + '/' + str(counts['fn'])
+    )
+
+
+def reference_label_counts(labels):
+    labels_cpu = torch.as_tensor(labels).detach().cpu()
+    if labels_cpu.numel() == 0:
+        return {}
+    unique_labels, unique_counts = torch.unique(labels_cpu, return_counts=True)
+    return {
+        int(label.item()): int(count.item())
+        for label, count in zip(unique_labels, unique_counts)
+    }
+
+
+def filter_reference_labels(example_feats, example_labels, keep_labels, context):
+    keep = torch.zeros_like(example_labels, dtype=torch.bool)
+    for label in keep_labels:
+        keep = keep | (example_labels == int(label))
+    kept = int(keep.sum().item())
+    total = int(example_labels.shape[0])
+    if kept == 0:
+        raise ValueError(
+            f'{context}: no reference tokens remain after filtering labels {keep_labels}. '
+            f'Label counts: {reference_label_counts(example_labels)}.'
+        )
+    if int((example_labels[keep] == 1).sum().item()) == 0:
+        raise ValueError(
+            f'{context}: no positive reference tokens remain after filtering labels {keep_labels}. '
+            f'Label counts: {reference_label_counts(example_labels)}.'
+        )
+    if kept < total:
+        print(
+            f'[reference] {context}: kept {kept}/{total} tokens with labels {list(keep_labels)}; '
+            f'dropped {total - kept} ignored/unannotated tokens. '
+            f'counts before={reference_label_counts(example_labels)}',
+            flush=True,
+        )
+        return example_feats[keep], example_labels[keep]
+    return example_feats, example_labels
 
 
 def multilabel_metrics(y_true, y_score, y_pred):
@@ -1202,13 +1305,65 @@ def format_metric_value(value):
     return str(round(float(value), 4))
 
 
-def select_validation_names(rest_names, dataset_info, val_num, balanced=False):
+def select_multilabel_validation_names(rest_names, dataset_info, val_num, class_num=None):
+    label_to_names = {}
+    rest_index = {name: idx for idx, name in enumerate(rest_names)}
+    for name in rest_names:
+        for label in get_wsi_label_ids(dataset_info[name]):
+            if label > 0:
+                label_to_names.setdefault(label, []).append(name)
+
+    if class_num is not None and class_num > 0:
+        labels = [label for label in range(1, class_num + 1) if label_to_names.get(label)]
+    else:
+        labels = sorted(label_to_names)
+    if not labels:
+        return rest_names[:val_num]
+
+    selected, selected_set, covered = [], set(), set()
+    labels_by_rarity = sorted(labels, key=lambda label: (len(label_to_names[label]), label))
+    coverable = set(labels)
+    for label in labels_by_rarity:
+        if len(selected) >= val_num:
+            break
+        if label in covered:
+            continue
+
+        candidates = [name for name in label_to_names[label] if name not in selected_set]
+        if not candidates:
+            continue
+
+        def gain(name):
+            slide_labels = set(get_wsi_label_ids(dataset_info[name]))
+            new_labels = (slide_labels & coverable) - covered
+            return (len(new_labels), -len(slide_labels), -rest_index[name])
+
+        chosen = max(candidates, key=gain)
+        selected.append(chosen)
+        selected_set.add(chosen)
+        covered.update(set(get_wsi_label_ids(dataset_info[chosen])) & coverable)
+
+    for name in rest_names:
+        if len(selected) >= val_num:
+            break
+        if name not in selected_set:
+            selected.append(name)
+            selected_set.add(name)
+
+    random.shuffle(selected)
+    return selected[:val_num]
+
+
+def select_validation_names(rest_names, dataset_info, val_num, balanced=False, class_num=None):
     if val_num <= 0 or len(rest_names) == 0:
         return []
 
     val_num = min(val_num, len(rest_names))
     if not balanced:
         return rest_names[:val_num]
+
+    if dataset_is_multilabel(dataset_info):
+        return select_multilabel_validation_names(rest_names, dataset_info, val_num, class_num=class_num)
 
     grouped = {}
     for n in rest_names:
@@ -1406,7 +1561,9 @@ def evaluate(args, val_only=False):
             val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
             use_balanced_val = getattr(args, 'balanced_val_split', False)
             use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
-            val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+            val_names = select_validation_names(
+                rest_names, dataset_info, val_num, balanced=use_balanced_val, class_num=args.c
+            )
             if use_disjoint_split:
                 val_name_set = set(val_names)
                 remaining_names = [n for n in rest_names if n not in val_name_set]
@@ -1470,7 +1627,10 @@ def evaluate(args, val_only=False):
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
                         if multilabel:
-                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=True)
+                            pl = patch_labels_for_class(
+                                raw_pl, cls, args.c, multilabel=True,
+                                multilabel_negative_source=multilabel_mask_negative_source(args)
+                            )
                         elif raw_pl.ndim == 1 and set(np.unique(raw_pl).tolist()).issubset({0, 1}):
                             pl = raw_pl.astype(np.int64, copy=True)
                             pl[pl == 0] = 255
@@ -1574,6 +1734,14 @@ def evaluate(args, val_only=False):
                         example_labels[example_labels_others == 0] = 255
                         example_labels[example_labels_this == 0] = 255
             class_timer.add('tagger', time.perf_counter() - tagger_start)
+
+            if multilabel and args.prompt_type == 'mask' and multilabel_mask_negative_source(args) in ['other_positive', 'none']:
+                example_feats, example_labels = filter_reference_labels(
+                    example_feats,
+                    example_labels,
+                    keep_labels=[0, 1],
+                    context=f'evaluate repeat={i} class={cls} multilabel mask'
+                )
 
             sparse_start = time.perf_counter()
             sparsify_strategy = args.reference_sparsify_strategy
@@ -1695,12 +1863,21 @@ def evaluate(args, val_only=False):
 
             calib_auc = safe_binary_auc(calib_labels.numpy(), calib_preds.numpy())
             thresh, best_acc_score, _ = select_binary_threshold(
-                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg
+                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg,
+                tie_break=args.threshold_tie_break
             )
 
             preds = eval_preds
             thresh_preds = (eval_preds > thresh).float()
             labels = eval_labels
+            decision_counts = binary_decision_counts(
+                labels.detach().cpu().numpy(),
+                thresh_preds.detach().cpu().numpy()
+            )
+            calib_counts = binary_decision_counts(
+                calib_labels.detach().cpu().numpy(),
+                (calib_preds > thresh).float().detach().cpu().numpy()
+            )
 
             acc = ((thresh_preds == labels).sum() / labels.shape[0]).cpu().item()
             label_pos = labels.sum().clamp_min(1)
@@ -1723,9 +1900,20 @@ def evaluate(args, val_only=False):
                     )
                 source_name = threshold_source(args)
                 source_display = 'calib(test)' if use_test_threshold(args) else 'val'
+                if calib_counts['label_pos'] == 0 or calib_counts['label_neg'] == 0:
+                    warning_s = (
+                        'class:' + str(cls) + ' ' + source_display +
+                        ' calibration has a single observed label; pos/neg:' +
+                        str(calib_counts['label_pos']) + '/' + str(calib_counts['label_neg']) +
+                        '. Threshold is conservative but this class needs a calibration split with both labels.'
+                    )
+                    print(warning_s)
+                    txt_rec.append(warning_s)
                 s = 'class:' + str(cls) + ' ' + source_display + ' auc:' + str(round(calib_auc, 4)) + ', test auc:' + str(round(auc, 4)) + \
                     ', ' + source_display + ' acc: ' + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + \
-                    ', test acc: ' + str(round(acc, 4))
+                    ', test acc: ' + str(round(acc, 4)) + ', threshold: ' + format_metric_value(thresh) + \
+                    ', calib ' + format_binary_decision_counts(calib_counts) + \
+                    ', test ' + format_binary_decision_counts(decision_counts)
                 print(s)
                 txt_rec.append(s)
                 if conformal is not None:
@@ -1740,6 +1928,9 @@ def evaluate(args, val_only=False):
                     'calibration_acc': round(best_acc_score, 4),
                     'test_f1': round(f1, 4),
                     'test_acc': round(acc, 4),
+                    'threshold': float(thresh),
+                    'calibration_counts': calib_counts,
+                    'test_counts': decision_counts,
                     # Backward-compatible aliases: these refer to the calibration split.
                     'val_auc': round(calib_auc, 4),
                     'val_acc': round(best_acc_score, 4),
@@ -1973,7 +2164,9 @@ def evaluate_baseline(args, mode):
             val_num = args.val_num if args.val_ratio < 0 else int(len(rest_names) * args.val_ratio)
             use_balanced_val = getattr(args, 'balanced_val_split', False)
             use_disjoint_split = getattr(args, 'disjoint_val_test_split', False)
-            val_names = select_validation_names(rest_names, dataset_info, val_num, balanced=use_balanced_val)
+            val_names = select_validation_names(
+                rest_names, dataset_info, val_num, balanced=use_balanced_val, class_num=args.c
+            )
             if use_disjoint_split:
                 val_name_set = set(val_names)
                 remaining_names = [n for n in rest_names if n not in val_name_set]
@@ -2033,7 +2226,10 @@ def evaluate_baseline(args, mode):
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
                         if multilabel:
-                            pl = patch_labels_for_class(raw_pl, cls, args.c, multilabel=True)
+                            pl = patch_labels_for_class(
+                                raw_pl, cls, args.c, multilabel=True,
+                                multilabel_negative_source=multilabel_mask_negative_source(args)
+                            )
                         elif raw_pl.ndim == 1 and set(np.unique(raw_pl).tolist()).issubset({0, 1}):
                             pl = raw_pl.astype(np.int64, copy=True)
                             pl[pl == 0] = 255
@@ -2262,12 +2458,21 @@ def evaluate_baseline(args, mode):
 
             calib_auc = safe_binary_auc(calib_labels.numpy(), calib_preds.numpy())
             thresh, best_acc_score, _ = select_binary_threshold(
-                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg
+                calib_labels.numpy(), calib_preds.numpy(), prefer_f1=args.seg,
+                tie_break=args.threshold_tie_break
             )
 
             preds = test_preds
             thresh_preds = (test_preds > thresh).float()
             labels = test_labels
+            decision_counts = binary_decision_counts(
+                labels.detach().cpu().numpy(),
+                thresh_preds.detach().cpu().numpy()
+            )
+            calib_counts = binary_decision_counts(
+                calib_labels.detach().cpu().numpy(),
+                (calib_preds > thresh).float().detach().cpu().numpy()
+            )
             acc = ((thresh_preds == labels).sum() / labels.shape[0]).cpu().item()
             label_pos = labels.sum().clamp_min(1)
             pred_pos = thresh_preds.sum().clamp_min(1)
@@ -2287,8 +2492,19 @@ def evaluate_baseline(args, mode):
                 )
             source_name = threshold_source(args)
             source_display = 'calib(test)' if use_test_threshold(args) else 'val'
+            if calib_counts['label_pos'] == 0 or calib_counts['label_neg'] == 0:
+                warning_s = (
+                    'class:' + str(cls) + ' baseline ' + mode + ' ' + source_display +
+                    ' calibration has a single observed label; pos/neg:' +
+                    str(calib_counts['label_pos']) + '/' + str(calib_counts['label_neg']) +
+                    '. Threshold is conservative but this class needs a calibration split with both labels.'
+                )
+                print(warning_s)
+                txt_rec.append(warning_s)
             s = 'class:' + str(cls) + ' ' + source_display + ' auc:' + str(round(calib_auc, 4)) + ', test auc:' + str(round(auc, 4)) + ', ' + source_display + ' acc: ' \
-                 + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + ', test acc: ' + str(round(acc, 4))
+                 + str(round(best_acc_score, 4)) + ', test f1: ' + str(round(f1, 4)) + ', test acc: ' + str(round(acc, 4)) \
+                 + ', threshold: ' + format_metric_value(thresh) + ', calib ' + format_binary_decision_counts(calib_counts) \
+                 + ', test ' + format_binary_decision_counts(decision_counts)
             print(s)
             txt_rec.append(s)
             if conformal is not None:
@@ -2303,6 +2519,9 @@ def evaluate_baseline(args, mode):
                 'calibration_acc': round(best_acc_score, 4),
                 'test_f1': round(f1, 4),
                 'test_acc': round(acc, 4),
+                'threshold': float(thresh),
+                'calibration_counts': calib_counts,
+                'test_counts': decision_counts,
                 'val_auc': round(calib_auc, 4),
                 'val_acc': round(best_acc_score, 4),
             }
@@ -2425,6 +2644,11 @@ if __name__ == '__main__':
         help='remove validation slides before selecting test slides; default off to preserve original PRET split semantics')
     parser.add_argument('--threshold_source', default='val', choices=['val', 'test'],
         help='split used to choose per-class decision thresholds; test uses all non-example WSIs as test/calibration and is for oracle diagnostics only')
+    parser.add_argument('--threshold_tie_break', default='conservative', choices=['conservative', 'first'],
+        help='when multiple thresholds have the same calibration score, choose the highest threshold (conservative) or the first/lowest threshold')
+    parser.add_argument('--multilabel_mask_negative_source', default='other_positive',
+        choices=['all_zero', 'other_positive', 'none'],
+        help='for mask+multilabel examples: all_zero treats every non-target patch as negative; other_positive uses only other annotated classes as hard negatives and ignores unannotated patches; none uses no negative reference tokens')
     parser.add_argument('--require_label', default=False, action='store_true',
         help='exclude WSIs without real labels from example construction and evaluation; unlabeled and pseudo-labeled slides are skipped')
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',

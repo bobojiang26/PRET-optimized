@@ -24,7 +24,7 @@ except ImportError:
 TOKEN_LABEL_NAMES = {
     1: 'target_class',
     0: 'other_foreground',
-    255: 'background',
+    255: 'unannotated_or_background',
     254: 'uncertain_overlap',
     -1: 'unknown',
 }
@@ -40,7 +40,7 @@ TOKEN_LABEL_COLORS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Visualize one target class against other foreground classes and background.'
+        description='Visualize one target class against other foreground classes and unannotated/background tokens.'
     )
     parser.add_argument('--raw_feature_path', default='', help='h5 folder/path; used only to fill h5 dataset_info entries when needed')
     parser.add_argument('--wsi_path', required=True)
@@ -81,8 +81,8 @@ def parse_args():
         parser.error('provide --classes or use --all_classes')
     if args.prompt_type != 'mask':
         print(
-            '[warning] background/other_foreground separation is only explicit with --prompt_type mask. '
-            'Non-mask prompts may not contain reliable patch-level background labels.'
+            '[warning] unannotated/background and other_foreground separation is only explicit with --prompt_type mask. '
+            'Non-mask prompts may not contain reliable patch-level token labels.'
         )
     return args
 
@@ -262,7 +262,8 @@ def separability_metrics(feats, labels, max_metric_tokens, seed):
     y, score = centroid_margin(1, [0])
     metrics['auc_target_vs_other_foreground'] = safe_auc(y, score) if y is not None else None
     y, score = centroid_margin(1, [255])
-    metrics['auc_target_vs_background'] = safe_auc(y, score) if y is not None else None
+    metrics['auc_target_vs_unannotated_or_background'] = safe_auc(y, score) if y is not None else None
+    metrics['auc_target_vs_background'] = metrics['auc_target_vs_unannotated_or_background']
 
     if len(present) >= 2 and feats_np.shape[0] >= len(present) + 1:
         try:
@@ -427,7 +428,7 @@ def main():
         csv_path = class_prefix + '_tsne.csv'
         svg_path = class_prefix + '_tsne.svg'
         png_path = class_prefix + '_tsne.png'
-        title = f'class {cls}: target vs other foreground vs background ({sampled_feats.shape[0]} sampled)'
+        title = f'class {cls}: target vs other foreground vs unannotated/background ({sampled_feats.shape[0]} sampled)'
         save_csv(csv_path, embedding, sampled_labels, sampled_slides, sampled_patches)
         save_svg(svg_path, embedding, sampled_labels, sampled_slides, title)
         save_png(png_path, embedding, sampled_labels, title)

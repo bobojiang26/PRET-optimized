@@ -27,6 +27,7 @@ EXAMPLE_RATIO_MAX_PER_CLASS="${EXAMPLE_RATIO_MAX_PER_CLASS:-}"
 RUNS="${RUNS:-1}"
 VAL_NUM="${VAL_NUM:-6}"
 TEST_NUM="${TEST_NUM:-6}"
+VAL_RATIO="${VAL_RATIO:-}"
 TOPK="${TOPK:-3}"
 TOP_INSTANCE="${TOP_INSTANCE:-3}"
 TEMPERATURE="${TEMPERATURE:-10}"
@@ -46,7 +47,11 @@ SPATIAL_SMOOTH_RADIUS="${SPATIAL_SMOOTH_RADIUS:-}"
 SPATIAL_FEATURE_WEIGHT="${SPATIAL_FEATURE_WEIGHT:-}"
 CONFORMAL_ALPHA="${CONFORMAL_ALPHA:-}"
 REQUIRE_LABEL="${REQUIRE_LABEL:-0}"
+BALANCED_VAL_SPLIT="${BALANCED_VAL_SPLIT:-0}"
+DISJOINT_VAL_TEST_SPLIT="${DISJOINT_VAL_TEST_SPLIT:-0}"
 THRESHOLD_SOURCE="${THRESHOLD_SOURCE:-}"
+THRESHOLD_TIE_BREAK="${THRESHOLD_TIE_BREAK:-}"
+MULTILABEL_MASK_NEGATIVE_SOURCE="${MULTILABEL_MASK_NEGATIVE_SOURCE:-}"
 
 MULTIPLE_ARGS=()
 if [[ -n "${MULTIPLE_NUM:-}" ]]; then
@@ -102,8 +107,17 @@ fi
 if [[ -n "${CONFORMAL_ALPHA}" ]]; then
   RESEARCH_ARGS+=(--conformal_alpha "${CONFORMAL_ALPHA}")
 fi
+if [[ -n "${VAL_RATIO}" ]]; then
+  RESEARCH_ARGS+=(--val_ratio "${VAL_RATIO}")
+fi
 if [[ -n "${THRESHOLD_SOURCE}" ]]; then
   RESEARCH_ARGS+=(--threshold_source "${THRESHOLD_SOURCE}")
+fi
+if [[ -n "${THRESHOLD_TIE_BREAK}" ]]; then
+  RESEARCH_ARGS+=(--threshold_tie_break "${THRESHOLD_TIE_BREAK}")
+fi
+if [[ -n "${MULTILABEL_MASK_NEGATIVE_SOURCE}" ]]; then
+  RESEARCH_ARGS+=(--multilabel_mask_negative_source "${MULTILABEL_MASK_NEGATIVE_SOURCE}")
 fi
 
 SEG_ARGS=()
@@ -115,6 +129,12 @@ if [[ "${MULTILABEL}" == "1" || "${MULTILABEL}" == "true" || "${MULTILABEL}" == 
 fi
 if [[ "${REQUIRE_LABEL}" == "1" || "${REQUIRE_LABEL}" == "true" || "${REQUIRE_LABEL}" == "TRUE" ]]; then
   SEG_ARGS+=(--require_label)
+fi
+if [[ "${BALANCED_VAL_SPLIT}" == "1" || "${BALANCED_VAL_SPLIT}" == "true" || "${BALANCED_VAL_SPLIT}" == "TRUE" ]]; then
+  SEG_ARGS+=(--balanced_val_split)
+fi
+if [[ "${DISJOINT_VAL_TEST_SPLIT}" == "1" || "${DISJOINT_VAL_TEST_SPLIT}" == "true" || "${DISJOINT_VAL_TEST_SPLIT}" == "TRUE" ]]; then
+  SEG_ARGS+=(--disjoint_val_test_split)
 fi
 
 EXTRA_ARGS=("$@")

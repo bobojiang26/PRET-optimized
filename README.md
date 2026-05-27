@@ -178,6 +178,22 @@ THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh
 
 The direct equivalent is `python core/main.py ... --threshold_source test`. In this mode, `VAL_NUM`, `TEST_NUM`, `--val_ratio`, fixed test flags, and `--disjoint_val_test_split` no longer control the evaluation split: after examples are sampled, all remaining WSIs become the test/calibration set and the terminal prints `threshold_source=test: using all non-example WSIs as test/calibration set`. Because the threshold is tuned on the same samples being reported, these numbers are optimistic and should be treated as diagnostic rather than strict held-out benchmark metrics.
 
+For positive-only CSV mask annotations in multi-label runs, use hard negatives from other annotated cancer classes instead of treating every unannotated/outside-box patch as background. This is the recommended setting when CSV rows only mark cancer regions:
+
+```bash
+MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive bash scripts/run_h5_eval.sh
+```
+
+The direct equivalent is `python core/main.py ... --multilabel_mask_negative_source other_positive`. This maps the current class to `1`, other annotated classes to hard negative `0`, and unannotated/outside-box patches to ignored `255` before reference sparsification. If your masks are exhaustive and every unannotated patch is a reliable negative, use `--multilabel_mask_negative_source all_zero`. Threshold ties are broken conservatively by default (`--threshold_tie_break conservative`), so when several thresholds have the same calibration accuracy PRET picks the higher threshold to reduce false positives.
+
+For multi-label datasets with many classes, keep the calibration split large enough to contain positives for the weak classes. The h5 wrapper exposes PRET's balanced split controls:
+
+```bash
+BALANCED_VAL_SPLIT=1 VAL_NUM=100 MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive bash scripts/run_h5_eval.sh
+```
+
+In multi-label mode, `BALANCED_VAL_SPLIT=1` greedily covers rare class labels in validation. Per-class terminal lines also print the chosen threshold plus `tp/fp/tn/fn`, so classes like 2 and 3 can be checked directly for false positives.
+
 If a fixed shot count underuses large classes, set an example ratio instead of relying on `EXAMPLE_NUM`. Add a per-class cap to avoid loading too many reference examples into GPU memory. For example, this samples at most 60% of each class candidate pool, rounded up per class, but never more than 20 WSIs per class:
 
 ```bash
@@ -205,9 +221,9 @@ python scripts/visualize_example_tokens.py \
   --out_dir records/example_token_vis
 ```
 
-Outputs include `summary.json`, `combined_classes_tokens_tsne.csv`, and `combined_classes_tokens_tsne.svg`; if `matplotlib` is installed, a PNG plot is written too. In the combined plot/CSV, each point is a positive/target example token and the color/`class` column is the class id. `--all_classes` follows PRET's class ids and expands to `1..class_num` for multi-class/multi-label runs. To focus on a subset, replace `--all_classes` with `--classes 10 13 14`. To also write the older per-class one-vs-rest plots, add `--plot_mode both`; those per-class CSVs use token labels `1=target_class`, `0=other_class`, `255=background`, `254=uncertain`, and `-1=unknown`.
+Outputs include `summary.json`, `combined_classes_tokens_tsne.csv`, and `combined_classes_tokens_tsne.svg`; if `matplotlib` is installed, a PNG plot is written too. In the combined plot/CSV, each point is a positive/target example token and the color/`class` column is the class id. `--all_classes` follows PRET's class ids and expands to `1..class_num` for multi-class/multi-label runs. To focus on a subset, replace `--all_classes` with `--classes 10 13 14`. To also write the older per-class one-vs-rest plots, add `--plot_mode both`; those per-class CSVs use token labels `1=target_class`, `0=other_class`, `255=unannotated_or_background`, `254=uncertain`, and `-1=unknown`.
 
-To inspect one target class against other foreground classes and background, use the dedicated class-vs-rest visualization. This is most informative with `--prompt_type mask`, because mask labels can explicitly separate `1=target_class`, `0=other_foreground`, and `255=background`:
+To inspect one target class against other foreground classes and unannotated/background tokens, use the dedicated class-vs-rest visualization. This is most informative with `--prompt_type mask`, because mask labels can explicitly separate `1=target_class`, `0=other_foreground`, and `255=unannotated_or_background`:
 
 ```bash
 python scripts/visualize_class_vs_rest_tokens.py \
@@ -226,7 +242,7 @@ python scripts/visualize_class_vs_rest_tokens.py \
   --out_dir records/class_vs_rest_token_vis
 ```
 
-This writes `class_{id}_target_vs_rest_tsne.csv/svg/png` and records separability metrics in `summary.json`, including target-vs-non-target AUC, target-vs-other-foreground AUC, target-vs-background AUC, nearest-centroid accuracy, and cosine silhouette.
+This writes `class_{id}_target_vs_rest_tsne.csv/svg/png` and records separability metrics in `summary.json`, including target-vs-non-target AUC, target-vs-other-foreground AUC, target-vs-unannotated/background AUC, nearest-centroid accuracy, and cosine silhouette. For positive-only CSVs, `255` means unknown/unannotated rather than proven negative background.
 
 If the script reports that `sparsify_reference_tokens()` got an unexpected `return_indices` argument, the copied checkout is mixing a new `scripts/visualize_example_tokens.py` with an older `core/main.py`. Sync both files from `optimized/main` before running the visualization, because the script needs the latest sparsification helper to map kept tokens back to their slide/patch names.
 
@@ -323,7 +339,7 @@ Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for insp
 
 By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for a binary or single-label task, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`. For multi-label tasks, a negative slide should use `wsi_labels: []`.
 
-Then run h5 WSI-level multi-label evaluation. PRET fits one threshold per class on the validation split, combines the per-class decisions back into a multi-hot WSI prediction such as `[1, 0, 0, 0, 1, 0]`, and reports multi-label metrics:
+Then run h5 WSI-level multi-label evaluation. For positive-only CSV annotations, `MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive` keeps unannotated/outside-box patches out of the reference pool and uses other annotated cancer classes as hard negatives. PRET fits one threshold per class on the validation split, combines the per-class decisions back into a multi-hot WSI prediction such as `[1, 0, 0, 0, 1, 0]`, and reports multi-label metrics:
 
 ```
 DATASET_NAME=MY_H5 \
@@ -332,7 +348,9 @@ DATASET_INFO=data_info/MY_H5_mask.json \
 DUMP_FEATURES=data/MY_H5/collected_features_mask \
 PROMPT_TYPE=mask \
 MULTILABEL=1 \
+MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive \
 CLASS_NUM=6 \
+BALANCED_VAL_SPLIT=1 \
 H5_COORDINATE_MODE=auto \
 H5_PIXEL_STEP_THRESHOLD=16 \
 H5_PATCH_SIZE=0 \
@@ -679,20 +697,29 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 设置 `--threshold_source test` 后，PRET 会在 example 采样完成后，把除 example 之外的所有 WSI 都作为 test/calibration set；阈值也从这批 test 样本上推出。
    - 该模式下终端会打印 `threshold_source=test: using all non-example WSIs as test/calibration set`，逐类指标会显示 `calib(test) auc/acc` 和 `test auc/f1/acc`。
    - 通过 h5 wrapper 可用 `THRESHOLD_SOURCE=test bash scripts/run_h5_eval.sh`。注意该模式是在测试集自身调阈值，指标会偏乐观，建议用于真实数据排查和上限诊断，不作为严格 held-out benchmark。
+   - 阈值搜索现在默认使用保守 tie-break：多个阈值在 calibration split 上准确率相同时，选择更高阈值，以减少多标签任务里的假阳性。可用 `THRESHOLD_TIE_BREAK=first` 恢复旧的最低阈值 tie-break。
+   - 逐类终端输出会额外显示 `threshold`、calibration/test 的 `pos/pred_pos` 和 `tp/fp/tn/fn`，用于直接定位某类是否因为阈值过低产生假阳性。
 
-18. **按类别比例采样 example**
+18. **多标签 mask hard negative 策略**
+   - 新增 `--multilabel_mask_negative_source all_zero|other_positive|none`，h5 wrapper 对应 `MULTILABEL_MASK_NEGATIVE_SOURCE`。
+   - 默认 `other_positive`：当前类标注 token 是 `1`，其他已标注癌区 token 是 hard negative `0`，未标注/框外 token 作为 `255` 忽略，不进入 reference pool。
+   - `all_zero` 保留旧逻辑：当前类列为 `0` 的所有 token 都作为负样本。只有当标注是穷尽的、框外区域确实可靠阴性时才建议使用。
+   - `none` 只用当前类阳性 reference，不使用负样本，主要用于消融诊断。
+   - h5 wrapper 现在也支持 `BALANCED_VAL_SPLIT=1`、`DISJOINT_VAL_TEST_SPLIT=1` 和 `VAL_RATIO=0.2`。多标签下的 balanced validation 会优先覆盖稀有类别，减少某些类别 calibration 缺正例导致阈值不稳定的问题。
+
+19. **按类别比例采样 example**
    - 新增 `--example_ratio`，默认 `0`，保持原来的固定 `--example_num` / few-shot 采样。
    - 设置 `--example_ratio 0.6` 后，每个类别会按可作为 example 的候选 WSI 总数计算目标数量，并向上取整，例如某类有 13 张候选 WSI，会选 8 张作为 example。
    - 新增 `--example_ratio_max_per_class`，只在 `--example_ratio > 0` 时生效；默认 `0` 表示不设上限。比如 `--example_ratio 0.6 --example_ratio_max_per_class 20` 表示每类先按 60% 计算，再最多保留 20 张，避免显存被过大的 example 库撑爆。
    - 通过 h5 wrapper 可用 `EXAMPLE_RATIO=0.6 EXAMPLE_RATIO_MAX_PER_CLASS=20 bash scripts/run_h5_eval.sh`。
    - 当 `--example_ratio > 0` 时，会覆盖固定 shot 数和 `MULTIPLE_NUM`；终端会打印 ratio 目标数量、max_per_class 和实际 example label counts，方便确认每类是否按预期进入 example 库。
 
-19. **Example token 池可视化诊断**
+20. **Example token 池可视化诊断**
    - 新增 `scripts/visualize_example_tokens.py`，用于分析某些表现差的类别在 example/reference token 特征空间里的分布。
    - 脚本复用 PRET 的 example 采样、类别 one-vs-rest 标签构建、slideLabel tagger refinement 和可选 reference token 稀疏化，然后用 PCA+t-SNE 降到二维。
    - 默认输出所有指定类别在同一张图上的 `combined_classes_tokens_tsne.svg`、`combined_classes_tokens_tsne.csv` 和总览 `summary.json`。合并图中每个点都是对应类别的 positive/target example token，颜色代表类别 id；CSV 保留每个点的二维坐标、class、slide 和 patch 名，便于继续排查异常 slide。`--all_classes` 会按 PRET 的类别编号展开为 `1..class_num`。
    - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --all_classes --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。如果还需要旧版每个类别单独一张 one-vs-rest 图，加 `--plot_mode both`。
-   - 新增 `scripts/visualize_class_vs_rest_tokens.py`，用于单独查看某个目标类别和其他前景类别、背景之间的区分度。推荐配合 `--prompt_type mask` 使用；输出 `class_{id}_target_vs_rest_tsne.svg/csv`，并在 `summary.json` 中写入 target-vs-non-target AUC、target-vs-other-foreground AUC、target-vs-background AUC、nearest-centroid accuracy 和 silhouette 等诊断指标。
+   - 新增 `scripts/visualize_class_vs_rest_tokens.py`，用于单独查看某个目标类别和其他前景类别、未标注/背景 token 之间的区分度。推荐配合 `--prompt_type mask` 使用；输出 `class_{id}_target_vs_rest_tsne.svg/csv`，并在 `summary.json` 中写入 target-vs-non-target AUC、target-vs-other-foreground AUC、target-vs-unannotated/background AUC、nearest-centroid accuracy 和 silhouette 等诊断指标。
 
 ## Citation
 

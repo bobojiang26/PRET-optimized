@@ -46,7 +46,7 @@ TOKEN_LABEL_NAMES = {
     0: 'other_class',
     1: 'target_class',
     254: 'uncertain',
-    255: 'background',
+    255: 'unannotated_or_background',
 }
 
 TOKEN_LABEL_COLORS = {
@@ -95,6 +95,8 @@ def parse_args():
     parser.add_argument('--reference_sparsify_strategy', default='auto', choices=['auto', 'quality', 'legacy', 'hierarchical'])
     parser.add_argument('--reference_anchor_ratio', type=float, default=0.25)
     parser.add_argument('--reference_random_ratio', type=float, default=0.1)
+    parser.add_argument('--multilabel_mask_negative_source', default='other_positive',
+        choices=['all_zero', 'other_positive', 'none'])
     parser.add_argument('--max_tokens_per_class', type=int, default=10000, help='max tokens sampled for t-SNE plotting per class; 0 keeps all')
     parser.add_argument('--max_tokens_total', type=int, default=30000, help='max tokens in the combined t-SNE plot; 0 keeps all')
     parser.add_argument('--pca_dim', type=int, default=50)
@@ -163,11 +165,14 @@ def slide_wsi_label(dataset_info, slide_features, slide_name, cls, multilabel):
     return int(slide_features.get('wsi_label', 0))
 
 
-def class_patch_labels(raw_pl, example_wsi_label, cls, class_num, multilabel):
+def class_patch_labels(raw_pl, example_wsi_label, cls, class_num, multilabel, negative_source='all_zero'):
     raw_pl = np.asarray(raw_pl)
     if class_num > 1:
         if multilabel:
-            return patch_labels_for_class(raw_pl, cls, class_num, multilabel=True)
+            return patch_labels_for_class(
+                raw_pl, cls, class_num, multilabel=True,
+                multilabel_negative_source=negative_source
+            )
         if raw_pl.ndim == 1 and set(np.unique(raw_pl).tolist()).issubset({0, 1}):
             pl = raw_pl.astype(np.int64, copy=True)
             pl[pl == 0] = 255
@@ -196,7 +201,10 @@ def load_example_pool(example_names, dataset_info, cls, args, multilabel):
         example_wsi_label = slide_wsi_label(dataset_info, slide_features, slide_name, cls, multilabel)
 
         if args.prompt_type == 'mask':
-            pl = class_patch_labels(slide_features['patch_labels'], example_wsi_label, cls, args.c, multilabel)
+            pl = class_patch_labels(
+                slide_features['patch_labels'], example_wsi_label, cls, args.c, multilabel,
+                negative_source=args.multilabel_mask_negative_source
+            )
         else:
             pl = np.zeros(feats.shape[0]) - 1
 
@@ -269,6 +277,21 @@ def apply_reference_sparsity(example_feats, example_labels, slide_names, patch_n
     )
     keep_idxs_np = keep_idxs.detach().cpu().numpy()
     return example_feats, example_labels, slide_names[keep_idxs_np], patch_names[keep_idxs_np], strategy
+
+
+def filter_ignored_reference_tokens(example_feats, example_labels, slide_names, patch_names, args, context):
+    if args.prompt_type != 'mask' or args.multilabel_mask_negative_source == 'all_zero':
+        return example_feats, example_labels, slide_names, patch_names
+    keep = example_labels != 255
+    kept = int(keep.sum().item())
+    total = int(example_labels.shape[0])
+    if kept == total:
+        return example_feats, example_labels, slide_names, patch_names
+    if kept == 0:
+        raise ValueError(f'{context}: no reference tokens remain after dropping ignored/unannotated patches.')
+    keep_np = keep.detach().cpu().numpy()
+    print(f'[reference] {context}: kept {kept}/{total} non-ignored tokens; dropped {total - kept}.')
+    return example_feats[keep], example_labels[keep], slide_names[keep_np], patch_names[keep_np]
 
 
 def sample_tokens_for_tsne(feats, labels, slide_names, patch_names, max_tokens, seed):
@@ -531,6 +554,10 @@ def main():
         example_labels = refine_example_labels(
             example_feats, example_labels, list(patch_names), example_names, cls, args, multilabel
         )
+        if multilabel:
+            example_feats, example_labels, slide_names, patch_names = filter_ignored_reference_tokens(
+                example_feats, example_labels, slide_names, patch_names, args, f'visualize class={cls}'
+            )
         example_feats, example_labels, slide_names, patch_names, sparse_strategy = apply_reference_sparsity(
             example_feats, example_labels, slide_names, patch_names, args
         )
