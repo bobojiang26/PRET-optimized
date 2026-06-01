@@ -387,6 +387,26 @@ bash scripts/run_h5_eval.sh
 
 Set `CLASS_NUM` to the number of entries in the generated label map. Add `SEG=1` only when you want patch-level segmentation metrics instead of WSI-level multi-label classification metrics.
 
+For ordinary single-label multi-class classification, each WSI should have exactly one `wsi_label` in `1..CLASS_NUM`; do not set `MULTILABEL=1`. PRET still computes one-vs-rest class scores internally, then combines the `N x CLASS_NUM` logits with `argmax` so each WSI receives exactly one predicted class. The terminal and records will include `multiclass test ...` and `multiclass mean ...` metrics with the same metric names used by multi-label evaluation: `acc_exact_match`, `acc_hamming`, `auc_micro`, `auc_macro`, `f1_micro`, `f1_macro`, and `f1_samples`. The saved repeat record also contains `labels`, `preds`, `logits`, `pred_onehot`, and a `confusion_matrix`.
+
+Example h5 single-label multi-class run:
+
+```
+DATASET_NAME=MY_H5 \
+H5_DIR=data/MY_H5/h5 \
+DATASET_INFO=data_info/MY_H5_multiclass.json \
+DUMP_FEATURES=data/MY_H5/collected_features_multiclass \
+PROMPT_TYPE=slideLabel \
+CLASS_NUM=17 \
+BALANCED_VAL_SPLIT=1 \
+EXAMPLE_RATIO=0.6 \
+EXAMPLE_RATIO_MAX_PER_CLASS=20 \
+VAL_NUM=100 \
+TEST_NUM=-1 \
+RUNS=5 \
+bash scripts/run_h5_eval.sh
+```
+
 Use a fresh `DUMP_FEATURES` directory for mask runs, because PRET skips feature collection when a cached `dump_features/{slide}.npy` file already exists.
 
 You can create a small fake h5-only dataset for a local smoke test:
@@ -745,6 +765,12 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 常用命令：`python scripts/visualize_example_tokens.py --dump_features ... --dataset_info ... --wsi_path ... --prompt_type slideLabel --class_num 17 --all_classes --example_ratio 0.6 --example_ratio_max_per_class 20 --out_dir records/example_token_vis`。如果还需要旧版每个类别单独一张 one-vs-rest 图，加 `--plot_mode both`。
    - 新增 `scripts/visualize_class_vs_rest_tokens.py`，用于单独查看某个目标类别和其他前景类别、未标注/背景 token 之间的区分度。推荐配合 `--prompt_type mask` 使用；输出 `class_{id}_target_vs_rest_tsne.svg/csv`，并在 `summary.json` 中写入 target-vs-non-target AUC、target-vs-other-foreground AUC、target-vs-unannotated/background AUC、nearest-centroid accuracy 和 silhouette 等诊断指标。
    - 新增 `scripts/quantify_example_token_distances.py`，用于量化 t-SNE 背后的类间距离；输出类内紧凑度、类中心距离、随机 token-pair 距离分位数和 nearest-centroid 混淆矩阵，便于排序查看哪些类别和 2/3 类最接近。默认还会在安装了 `matplotlib` 时写出 `centroid_distance_heatmap.png/svg`、`pairwise_token_median_distance_heatmap.png/svg`、`nearest_centroid_confusion_heatmap.png/svg` 和 `class_distance_summary.png/svg`，可以直接看类别之间谁更接近、哪些 token 容易被分到其他类中心；如只需要原始 CSV/JSON，可加 `--no_plots`。
+
+21. **单标签多分类 WSI 评测**
+   - 当 `CLASS_NUM > 1` 且不设置 `MULTILABEL=1` 时，PRET 现在会把每个类别的一对多 logits 汇总成单标签多分类结果。
+   - 汇总规则为 `argmax`：每张 WSI 只能预测为一个类别；逐类阈值仍保留在日志和 records 中，用于 one-vs-rest 诊断，但多分类最终类别不依赖这些阈值。
+   - 多分类指标沿用多标签指标字段：`acc_exact_match`、`acc_hamming`、`auc_micro`、`auc_macro`、`f1_micro`、`f1_macro`、`f1_samples`，并额外提供等价于 exact-match 的 `class_acc` 和 `confusion_matrix`。
+   - 数据格式要求每张 WSI 使用单个 `wsi_label`，类别编号为 `1..CLASS_NUM`；如果某张 WSI 在 one-vs-rest 标签中不是恰好一个阳性类别，会在多分类汇总时被跳过并打印 warning。
 
 ## Citation
 

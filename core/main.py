@@ -1294,6 +1294,42 @@ def multilabel_metrics(y_true, y_score, y_pred):
     }
 
 
+def multiclass_metrics(y_true_onehot, y_score):
+    y_true_onehot = np.asarray(y_true_onehot).astype(int)
+    y_score = np.asarray(y_score, dtype=float)
+    if y_true_onehot.ndim != 2 or y_score.ndim != 2:
+        raise ValueError('multiclass metrics require 2D one-hot labels and 2D class scores')
+    if y_true_onehot.shape != y_score.shape:
+        raise ValueError(
+            f'multiclass labels/scores shape mismatch: {y_true_onehot.shape} vs {y_score.shape}'
+        )
+    valid = y_true_onehot.sum(1) == 1
+    invalid_count = int((~valid).sum())
+    if valid.sum() == 0:
+        return None, valid, invalid_count
+
+    y_true_valid = y_true_onehot[valid]
+    y_score_valid = y_score[valid]
+    pred_idx = y_score_valid.argmax(1)
+    y_pred_valid = np.zeros_like(y_true_valid)
+    y_pred_valid[np.arange(y_pred_valid.shape[0]), pred_idx] = 1
+    metrics = multilabel_metrics(y_true_valid, y_score_valid, y_pred_valid)
+    metrics['class_acc'] = metrics['acc_exact_match']
+    metrics['valid_samples'] = int(valid.sum())
+    metrics['ignored_invalid_label_samples'] = invalid_count
+    return metrics, valid, invalid_count
+
+
+def multiclass_confusion_matrix(y_true_classes, y_pred_classes, class_num):
+    y_true_classes = np.asarray(y_true_classes).astype(int).reshape(-1)
+    y_pred_classes = np.asarray(y_pred_classes).astype(int).reshape(-1)
+    matrix = np.zeros((class_num, class_num), dtype=int)
+    for true_cls, pred_cls in zip(y_true_classes, y_pred_classes):
+        if 1 <= true_cls <= class_num and 1 <= pred_cls <= class_num:
+            matrix[true_cls - 1, pred_cls - 1] += 1
+    return matrix
+
+
 def format_metric_value(value):
     if value is None:
         return 'nan'
@@ -1455,6 +1491,7 @@ def evaluate(args, val_only=False):
             'If --require_label is enabled, provide wsi_label/wsi_labels for at least one slide.'
         )
     multilabel_repeat_metrics = []
+    multiclass_repeat_metrics = []
 
     records = {}
     txt_rec = []
@@ -1601,6 +1638,7 @@ def evaluate(args, val_only=False):
 
         # for subtyping, use different example for each cls and apply marco metics, other tasks have one class
         multilabel_repeat = {}
+        multiclass_repeat = {}
         for cls in range(1, args.c + 1):
 
             # ====================== process example and prompts ======================
@@ -1947,6 +1985,14 @@ def evaluate(args, val_only=False):
                         'labels': labels.cpu().numpy().astype(int).reshape(-1),
                         'preds': thresh_preds.cpu().numpy().astype(int).reshape(-1),
                     }
+                elif args.c > 1 and not args.seg:
+                    multiclass_repeat[cls] = {
+                        'threshold': float(thresh),
+                        'names': list(test_names if use_test_threshold(args) else (val_names if val_only else test_names)),
+                        'logits': preds.cpu().numpy().reshape(-1),
+                        'labels': labels.cpu().numpy().astype(int).reshape(-1),
+                        'threshold_preds': thresh_preds.cpu().numpy().astype(int).reshape(-1),
+                    }
 
             class_timer.add('validation', time.perf_counter() - validation_start)
             repeat_timer.merge(class_timer)
@@ -1986,6 +2032,74 @@ def evaluate(args, val_only=False):
                 p = f"multilabel preview {item['name']}: pred={item['pred']}, label={item['label']}"
                 print(p)
                 txt_rec.append(p)
+        if args.c > 1 and not multilabel and not args.seg and multiclass_repeat:
+            names = multiclass_repeat[1]['names']
+            for cls in range(2, args.c + 1):
+                if multiclass_repeat[cls]['names'] != names:
+                    raise ValueError(
+                        'multiclass aggregation requires identical query order across classes; '
+                        f'class 1 and class {cls} differ.'
+                    )
+            y_score = np.stack([multiclass_repeat[cls]['logits'] for cls in range(1, args.c + 1)], axis=1)
+            y_true = np.stack([multiclass_repeat[cls]['labels'] for cls in range(1, args.c + 1)], axis=1)
+            metrics, valid_mask, invalid_count = multiclass_metrics(y_true, y_score)
+            if metrics is None:
+                warning_s = (
+                    'multiclass aggregation skipped: no WSI has exactly one positive class label. '
+                    'For single-label multiclass tasks, use wsi_label in 1..class_num.'
+                )
+                print(warning_s)
+                txt_rec.append(warning_s)
+            else:
+                valid_names = [name for name, keep in zip(names, valid_mask.tolist()) if keep]
+                y_score_valid = y_score[valid_mask]
+                y_true_valid = y_true[valid_mask]
+                pred_classes = y_score_valid.argmax(1).astype(int) + 1
+                label_classes = y_true_valid.argmax(1).astype(int) + 1
+                confusion = multiclass_confusion_matrix(label_classes, pred_classes, args.c)
+                multiclass_repeat_metrics.append(metrics)
+                preview = [
+                    {'name': valid_names[idx], 'pred': int(pred_classes[idx]), 'label': int(label_classes[idx])}
+                    for idx in range(min(10, len(valid_names)))
+                ]
+                records['repeat_' + str(i)]['multiclass'] = {
+                    'decision_rule': 'argmax over per-class logits; thresholds are kept for one-vs-rest diagnostics',
+                    'class_thresholds': {str(cls): float(multiclass_repeat[cls]['threshold']) for cls in range(1, args.c + 1)},
+                    'names': valid_names,
+                    'labels': label_classes.astype(int).tolist(),
+                    'logits': y_score_valid.tolist(),
+                    'preds': pred_classes.astype(int).tolist(),
+                    'pred_onehot': np.eye(args.c, dtype=int)[pred_classes - 1].tolist(),
+                    'metrics': metrics,
+                    'confusion_matrix': confusion.astype(int).tolist(),
+                    'preview': preview,
+                    'ignored_invalid_label_names': [
+                        name for name, keep in zip(names, valid_mask.tolist()) if not keep
+                    ],
+                }
+                if invalid_count > 0:
+                    warning_s = (
+                        'multiclass aggregation ignored ' + str(invalid_count) +
+                        ' WSI(s) whose one-vs-rest labels did not contain exactly one positive class.'
+                    )
+                    print(warning_s)
+                    txt_rec.append(warning_s)
+                s = (
+                    'multiclass test acc_exact_match: ' + format_metric_value(metrics['acc_exact_match']) +
+                    ', acc_hamming: ' + format_metric_value(metrics['acc_hamming']) +
+                    ', auc_micro: ' + format_metric_value(metrics['auc_micro']) +
+                    ', auc_macro: ' + format_metric_value(metrics['auc_macro']) +
+                    ', f1_micro: ' + format_metric_value(metrics['f1_micro']) +
+                    ', f1_macro: ' + format_metric_value(metrics['f1_macro']) +
+                    ', f1_samples: ' + format_metric_value(metrics['f1_samples']) +
+                    ', class_acc: ' + format_metric_value(metrics['class_acc'])
+                )
+                print(s)
+                txt_rec.append(s)
+                for item in preview:
+                    p = f"multiclass preview {item['name']}: pred={item['pred']}, label={item['label']}"
+                    print(p)
+                    txt_rec.append(p)
         del example_feats
         torch.cuda.empty_cache()
         repeat_timer.report(total_elapsed=time.perf_counter() - repeat_start)
@@ -2007,6 +2121,33 @@ def evaluate(args, val_only=False):
             ', f1_micro: ' + format_metric_value(mean_metrics['f1_micro_mean']) +
             ', f1_macro: ' + format_metric_value(mean_metrics['f1_macro_mean']) +
             ', f1_samples: ' + format_metric_value(mean_metrics['f1_samples_mean'])
+        )
+        print(s)
+        txt_rec.append(s)
+        records['mean'] = mean_metrics
+        records['text_records'] = txt_rec
+        return round(mean_metrics['auc_macro_mean'], 4), records
+
+    if multiclass_repeat_metrics:
+        metric_keys = ['acc_exact_match', 'acc_hamming', 'auc_micro', 'auc_macro', 'f1_micro', 'f1_macro', 'f1_samples', 'class_acc']
+        mean_metrics = {}
+        for key in metric_keys:
+            values = np.array([m[key] for m in multiclass_repeat_metrics], dtype=float)
+            mean_metrics[key + '_mean'] = float(np.nanmean(values))
+            mean_metrics[key + '_std'] = float(np.nanstd(values))
+        mean_metrics['valid_samples_mean'] = float(np.mean([m['valid_samples'] for m in multiclass_repeat_metrics]))
+        mean_metrics['ignored_invalid_label_samples_mean'] = float(np.mean([
+            m['ignored_invalid_label_samples'] for m in multiclass_repeat_metrics
+        ]))
+        s = (
+            'multiclass mean acc_exact_match: ' + format_metric_value(mean_metrics['acc_exact_match_mean']) +
+            ', acc_hamming: ' + format_metric_value(mean_metrics['acc_hamming_mean']) +
+            ', auc_micro: ' + format_metric_value(mean_metrics['auc_micro_mean']) +
+            ', auc_macro: ' + format_metric_value(mean_metrics['auc_macro_mean']) +
+            ', f1_micro: ' + format_metric_value(mean_metrics['f1_micro_mean']) +
+            ', f1_macro: ' + format_metric_value(mean_metrics['f1_macro_mean']) +
+            ', f1_samples: ' + format_metric_value(mean_metrics['f1_samples_mean']) +
+            ', class_acc: ' + format_metric_value(mean_metrics['class_acc_mean'])
         )
         print(s)
         txt_rec.append(s)
