@@ -1114,6 +1114,18 @@ def labels_for_h5_coordinates(
     return labels
 
 
+def count_positive_h5_patches(labels):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Counting h5 patch labels requires numpy') from exc
+
+    labels = np.asarray(labels)
+    if labels.ndim == 2:
+        return int((labels > 0).any(axis=1).sum())
+    return int((labels > 0).sum())
+
+
 def write_h5_label_files(
     regions_by_slide,
     h5_dir,
@@ -1168,7 +1180,7 @@ def write_h5_label_files(
         )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
-        pos_counts[slide_name] = int((labels == 1).sum())
+        pos_counts[slide_name] = count_positive_h5_patches(labels)
         written += 1
         del labels
         elapsed = time.perf_counter() - start
@@ -1357,6 +1369,12 @@ def main():
 
     print('[info] loading label map and size map', flush=True)
     label_map = load_label_map(args.label_map)
+    if not args.include_zero_labels and 0 in set(label_map.values()):
+        print(
+            '[warning] label map contains id 0, but --include-zero-labels is not set; '
+            'rows mapped to 0 will be skipped. Use 1-based class ids for PRET class labels.',
+            flush=True,
+        )
     size_map = load_size_map(args.size_json)
     h5_files = find_h5_files(args.h5_dir, recursive=args.h5_recursive)
     if args.h5_label_out and not h5_files:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, math, copy, math
+import os, math, copy
 import numpy as np
 import openslide
 import torch
@@ -625,6 +625,17 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
 
 # ====================== inference with classifier, aggregator, post processor ======================
 
+def _torch_label_counts_text(labels):
+    labels_cpu = torch.as_tensor(labels).detach().cpu()
+    if labels_cpu.numel() == 0:
+        return '{}'
+    unique_labels, unique_counts = torch.unique(labels_cpu, return_counts=True)
+    return '{' + ', '.join(
+        f'{int(label.item())}:{int(count.item())}'
+        for label, count in zip(unique_labels, unique_counts)
+    ) + '}'
+
+
 def inference(args, example_feats, example_labels, example_patch_names,
     query_feats, query_patch_names, wsi_size, top_instance=1, vis_info=None, smooth=None):
 
@@ -637,8 +648,18 @@ def inference(args, example_feats, example_labels, example_patch_names,
         'adaptive_min_k': getattr(args, 'adaptive_min_topk', 1),
         'adaptive_window': getattr(args, 'adaptive_window', 0.6),
     }
-    pos_score = compute_similarity(query_feats, example_feats[example_labels == 1], topk=args.topk, **similarity_kwargs)
-    neg_score = compute_similarity(query_feats, example_feats[example_labels == 0], topk=args.topk, **similarity_kwargs)
+    pos_mask = example_labels == 1
+    neg_mask = example_labels == 0
+    pos_count = int(pos_mask.sum().item())
+    neg_count = int(neg_mask.sum().item())
+    if pos_count == 0 or neg_count == 0:
+        raise ValueError(
+            'PRET inference needs both positive (1) and negative (0) reference tokens, '
+            f'but got pos={pos_count}, neg={neg_count}. '
+            f'Reference label counts: {_torch_label_counts_text(example_labels)}.'
+        )
+    pos_score = compute_similarity(query_feats, example_feats[pos_mask], topk=args.topk, **similarity_kwargs)
+    neg_score = compute_similarity(query_feats, example_feats[neg_mask], topk=args.topk, **similarity_kwargs)
     query_logits = (pos_score - neg_score).to(query_feats.device)
     query_logits = spatially_smooth_logits(
         query_logits, query_patch_names,

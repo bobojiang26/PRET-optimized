@@ -27,7 +27,6 @@ import h5py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchmetrics
 
 import numpy as np
 import cv2
@@ -570,6 +569,16 @@ def dataset_info_path_exists(args):
     return args.dataset_info != '' and os.path.exists(args.dataset_info)
 
 
+def resolve_dataset_path(path, args):
+    if not path or os.path.isabs(path) or os.path.exists(path):
+        return path
+    if dataset_info_path_exists(args):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(args.dataset_info)), path)
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
 def select_h5_files_for_dataset_info(h5_files, dataset_info, limit_to_dataset_info=False):
     if not limit_to_dataset_info:
         return h5_files
@@ -856,19 +865,21 @@ def infer_h5_grid_size(coords, args, patch_size=None, coordinate_mode=None):
 
 def load_h5_patch_labels(info, coords, args, patch_size=None, coordinate_mode=None):
     if 'h5_patch_labels' in info:
-        labels = np.load(info['h5_patch_labels']).astype(np.uint8, copy=False)
+        label_path = resolve_dataset_path(info['h5_patch_labels'], args)
+        labels = np.load(label_path).astype(np.uint8, copy=False)
         if labels.shape[0] != coords.shape[0]:
             raise ValueError(
-                f"{info['h5_patch_labels']}: expected {coords.shape[0]} labels, got {labels.shape[0]}"
+                f"{label_path}: expected {coords.shape[0]} labels, got {labels.shape[0]}"
             )
         return labels
 
     if 'patch_labels' not in info:
         return np.array([], dtype=np.uint8)
 
-    mask = cv2.imread(info['patch_labels'])
+    mask_path = resolve_dataset_path(info['patch_labels'], args)
+    mask = cv2.imread(mask_path)
     if mask is None:
-        raise ValueError(f"Cannot read patch label mask: {info['patch_labels']}")
+        raise ValueError(f"Cannot read patch label mask: {mask_path}")
     mask = mask[:, :, 0]
 
     labels = []
@@ -900,6 +911,89 @@ def get_wsi_size(wsi_path, slide_name, wsi_suffix, patch_scale):
     return (wsi.level_dimensions[0][1] // patch_scale, wsi.level_dimensions[0][0] // patch_scale)
 
 
+def file_signature(path):
+    if not path:
+        return None
+    abs_path = os.path.abspath(path)
+    try:
+        stat = os.stat(path)
+        return {
+            'path': abs_path,
+            'size': int(stat.st_size),
+            'mtime_ns': int(stat.st_mtime_ns),
+        }
+    except OSError:
+        return {
+            'path': abs_path,
+            'missing': True,
+        }
+
+
+def feature_cache_meta_path(cache_path):
+    return cache_path + '.meta.json'
+
+
+def feature_cache_metadata(slide_name, dataset_entry, args, h5_path=None):
+    metadata = {
+        'version': 1,
+        'slide_name': slide_name,
+        'h5_path': file_signature(h5_path),
+        'h5_patch_labels': file_signature(resolve_dataset_path(dataset_entry.get('h5_patch_labels'), args)),
+        'patch_labels': file_signature(resolve_dataset_path(dataset_entry.get('patch_labels'), args)),
+    }
+    if h5_path is not None:
+        metadata['h5_coordinate_args'] = {
+            'h5_coordinate_mode': args.h5_coordinate_mode,
+            'h5_pixel_step_threshold': int(args.h5_pixel_step_threshold),
+            'h5_patch_size': int(args.h5_patch_size),
+            'patch_scale': int(args.patch_scale),
+        }
+    return metadata
+
+
+def feature_cache_can_reuse(cache_path, current_metadata, require_metadata=False):
+    if not os.path.exists(cache_path):
+        return False
+
+    meta_path = feature_cache_meta_path(cache_path)
+    if not os.path.exists(meta_path):
+        if require_metadata:
+            print(
+                f'[feature_processor] refreshing {os.path.basename(cache_path)}: '
+                'cached feature has no source metadata for current h5/mask labels.',
+                flush=True,
+            )
+            return False
+        return True
+
+    try:
+        with open(meta_path, 'r', encoding='utf8') as f:
+            cached_metadata = json.load(f)
+    except Exception as exc:
+        print(
+            f'[feature_processor] refreshing {os.path.basename(cache_path)}: '
+            f'cannot read cache metadata ({exc}).',
+            flush=True,
+        )
+        return False
+
+    if cached_metadata == current_metadata:
+        return True
+
+    print(
+        f'[feature_processor] refreshing {os.path.basename(cache_path)}: '
+        'h5 feature source, patch-label source, or h5 coordinate settings changed.',
+        flush=True,
+    )
+    return False
+
+
+def write_feature_cache_metadata(cache_path, metadata):
+    meta_path = feature_cache_meta_path(cache_path)
+    with open(meta_path, 'w', encoding='utf8') as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+
 # ====================== collect features and information ======================
 
 def feature_processor(args):
@@ -917,15 +1011,21 @@ def feature_processor(args):
     os.makedirs(args.dump_features, exist_ok=True)
 
     for k, v in dataset_info.items():
-        if os.path.exists(os.path.join(args.dump_features, k + '.npy')):
+        cache_path = os.path.join(args.dump_features, k + '.npy')
+        h5_path = h5_map.get(k)
+        current_metadata = feature_cache_metadata(k, v, args, h5_path=h5_path)
+        require_cache_metadata = h5_path is not None and (
+            args.prompt_type == 'mask' or 'h5_patch_labels' in v or 'patch_labels' in v
+        )
+        if feature_cache_can_reuse(cache_path, current_metadata, require_metadata=require_cache_metadata):
             continue
 
         feats, names, patch_label, wsi_label = [], [], [], -1
 
-        if k in h5_map:
-            feats, coords = load_h5_feature_file(h5_map[k])
-            h5_coordinate_mode = infer_h5_coordinate_mode(coords, args, context=h5_map[k])
-            h5_patch_size = get_h5_patch_size(args, coords, context=h5_map[k], coordinate_mode=h5_coordinate_mode)
+        if h5_path is not None:
+            feats, coords = load_h5_feature_file(h5_path)
+            h5_coordinate_mode = infer_h5_coordinate_mode(coords, args, context=h5_path)
+            h5_patch_size = get_h5_patch_size(args, coords, context=h5_path, coordinate_mode=h5_coordinate_mode)
             patch_label = load_h5_patch_labels(v, coords, args, h5_patch_size, h5_coordinate_mode)
             h5_grid_size = infer_h5_grid_size(coords, args, h5_patch_size, h5_coordinate_mode)
             names = []
@@ -941,14 +1041,15 @@ def feature_processor(args):
                 info['h5_grid_size'] = h5_grid_size
             info['h5_coordinate_mode'] = h5_coordinate_mode
             info['h5_patch_size'] = h5_patch_size
-            np.save(os.path.join(args.dump_features, k + '.npy'), info)
+            np.save(cache_path, info)
+            write_feature_cache_metadata(cache_path, current_metadata)
             continue
         
         wsi_label = v.get('wsi_label', 1 if get_wsi_label_ids(v) else 0)
 
         # patch label as segmentation gt, if any
         if 'patch_labels' in v:
-            mask = cv2.imread(v['patch_labels'])[:, :, 0]
+            mask = cv2.imread(resolve_dataset_path(v['patch_labels'], args))[:, :, 0]
 
         in_dir = os.path.join(args.raw_feature_path, k + '_files')
         in_dir = in_dir if in_dir[-1] != '/' else in_dir[:-1]
@@ -983,7 +1084,8 @@ def feature_processor(args):
             'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
         if 'wsi_labels' in v:
             info['wsi_labels'] = v['wsi_labels']
-        np.save(os.path.join(args.dump_features, k + '.npy'), info)
+        np.save(cache_path, info)
+        write_feature_cache_metadata(cache_path, current_metadata)
     
     print('finish feature processing and saving!')
     timer.add('io', time.perf_counter() - io_start)
@@ -1286,6 +1388,19 @@ def reference_label_counts(labels):
     }
 
 
+def format_reference_label_counts(counts):
+    if not counts:
+        return '{}'
+    return '{' + ', '.join(f'{label}:{counts[label]}' for label in sorted(counts)) + '}'
+
+
+def print_reference_label_counts(context, labels):
+    print(
+        f'[reference] {context}: label_counts={format_reference_label_counts(reference_label_counts(labels))}',
+        flush=True,
+    )
+
+
 def filter_reference_labels(example_feats, example_labels, keep_labels, context):
     keep = torch.zeros_like(example_labels, dtype=torch.bool)
     for label in keep_labels:
@@ -1300,6 +1415,11 @@ def filter_reference_labels(example_feats, example_labels, keep_labels, context)
     if int((example_labels[keep] == 1).sum().item()) == 0:
         raise ValueError(
             f'{context}: no positive reference tokens remain after filtering labels {keep_labels}. '
+            f'Label counts: {reference_label_counts(example_labels)}.'
+        )
+    if 0 in [int(label) for label in keep_labels] and int((example_labels[keep] == 0).sum().item()) == 0:
+        raise ValueError(
+            f'{context}: no negative reference tokens remain after filtering labels {keep_labels}. '
             f'Label counts: {reference_label_counts(example_labels)}.'
         )
     if kept < total:
@@ -1763,6 +1883,11 @@ def evaluate(args, val_only=False):
             example_feats = torch.from_numpy(np.concatenate(example_feats, 0).astype(np.float32, copy=False)).cuda()
             example_labels = torch.from_numpy(np.concatenate(example_labels, 0)).cuda().long()
             class_timer.add('io.examples', time.perf_counter() - io_start)
+            if args.prompt_type == 'mask' or args.c > 1:
+                print_reference_label_counts(
+                    f'repeat={i} class={cls} initial prompt={args.prompt_type}',
+                    example_labels
+                )
 
             if args.dump_pseudo != '':
                 vis_info = {'wsi_dir': args.wsi_path, 'vis_dir': os.path.join(args.dump_pseudo, 'vis') + str(args.example_num) + '/' + str(i) + '/' + str(cls), \
@@ -1825,6 +1950,11 @@ def evaluate(args, val_only=False):
                         example_labels[example_labels_others == 0] = 255
                         example_labels[example_labels_this == 0] = 255
             class_timer.add('tagger', time.perf_counter() - tagger_start)
+            if args.prompt_type == 'mask' or args.c > 1:
+                print_reference_label_counts(
+                    f'repeat={i} class={cls} after_tagger prompt={args.prompt_type}',
+                    example_labels
+                )
 
             if multilabel and args.prompt_type == 'mask' and multilabel_mask_negative_source(args) in ['other_positive', 'none']:
                 example_feats, example_labels = filter_reference_labels(
@@ -1832,6 +1962,10 @@ def evaluate(args, val_only=False):
                     example_labels,
                     keep_labels=[0, 1],
                     context=f'evaluate repeat={i} class={cls} multilabel mask'
+                )
+                print_reference_label_counts(
+                    f'repeat={i} class={cls} after_mask_filter',
+                    example_labels
                 )
 
             sparse_start = time.perf_counter()
@@ -1846,6 +1980,11 @@ def evaluate(args, val_only=False):
                 strategy=sparsify_strategy,
                 random_ratio=args.reference_random_ratio
             )
+            if args.prompt_type == 'mask' or args.c > 1:
+                print_reference_label_counts(
+                    f'repeat={i} class={cls} final_reference',
+                    example_labels
+                )
             class_timer.add('reference_sparse', time.perf_counter() - sparse_start)
 
             # ====================== predict for test slides (queries)======================
