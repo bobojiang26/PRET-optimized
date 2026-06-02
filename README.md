@@ -152,7 +152,7 @@ python core/main.py \
   --dump_records records/MY_H5_screening_slideLabel_eval.npy
 ```
 
-`--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. If `data_info/MY_H5.json` is missing, or if a slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
+`--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. When `data_info/MY_H5.json` exists, PRET only processes h5 files whose decoded stem appears in that JSON; extra h5 files in the folder are skipped instead of being added as pseudo-labeled slides. If `data_info/MY_H5.json` is missing, or if a listed slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
 
 When your dataset contains a mix of labeled and unlabeled slides, use `--require_label` to exclude unlabeled and pseudo-labeled slides from feature processing, example construction, and evaluation. The terminal prints a `[require_label]` summary near dataset loading so you can confirm how many WSIs were skipped before val/test splits are built:
 
@@ -771,6 +771,11 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 汇总规则为 `argmax`：每张 WSI 只能预测为一个类别；逐类阈值仍保留在日志和 records 中，用于 one-vs-rest 诊断，但多分类最终类别不依赖这些阈值。
    - 多分类指标沿用多标签指标字段：`acc_exact_match`、`acc_hamming`、`auc_micro`、`auc_macro`、`f1_micro`、`f1_macro`、`f1_samples`，并额外提供等价于 exact-match 的 `class_acc` 和 `confusion_matrix`。
    - 数据格式要求每张 WSI 使用单个 `wsi_label`，类别编号为 `1..CLASS_NUM`；如果某张 WSI 在 one-vs-rest 标签中不是恰好一个阳性类别，会在多分类汇总时被跳过并打印 warning。
+
+22. **按 JSON 限制 h5 输入**
+   - 当 `--dataset_info` 指向一个已存在的 JSON 文件时，PRET 现在只处理 JSON key 中列出的 h5 slide；h5 文件夹里额外存在但 JSON 未标注的文件会被跳过，不再自动加入 `dataset_info` 并分配 pseudo label。
+   - 当 `--dataset_info` 不存在时，仍保留原来的 smoke-test 行为：扫描 h5 文件夹并按文件顺序生成 deterministic pseudo label。
+   - 终端会打印 `[dataset] ... matched X/Y h5 file(s) to dataset_info; skipped Z h5 file(s) not listed in JSON.`，用于确认实际进入评测的数据量。
 
 ## Citation
 

@@ -566,6 +566,28 @@ def h5_file_map(h5_files):
     return out
 
 
+def dataset_info_path_exists(args):
+    return args.dataset_info != '' and os.path.exists(args.dataset_info)
+
+
+def select_h5_files_for_dataset_info(h5_files, dataset_info, limit_to_dataset_info=False):
+    if not limit_to_dataset_info:
+        return h5_files
+
+    selected = []
+    selected_set = set()
+    for h5_path in h5_files:
+        raw_slide_name = h5_slide_stem(h5_path)
+        slide_name = h5_slide_key(h5_path)
+        if slide_name not in dataset_info and raw_slide_name not in dataset_info:
+            continue
+        get_dataset_slide_entry(dataset_info, slide_name, raw_slide_name)
+        if h5_path not in selected_set:
+            selected.append(h5_path)
+            selected_set.add(h5_path)
+    return selected
+
+
 def get_dataset_slide_entry(dataset_info, slide_name, raw_slide_name=None):
     if slide_name in dataset_info:
         return slide_name
@@ -683,10 +705,23 @@ def normalize_multiclass_wsi_labels(dataset_info, class_num):
 
 def load_dataset_info(args, context='dataset loading'):
     dataset_info = {}
-    if args.dataset_info != '' and os.path.exists(args.dataset_info):
+    loaded_dataset_info = dataset_info_path_exists(args)
+    if loaded_dataset_info:
         dataset_info = json.load(open(args.dataset_info))
 
     h5_files = find_h5_files(args.raw_feature_path)
+    if h5_files:
+        total_h5_files = len(h5_files)
+        h5_files = select_h5_files_for_dataset_info(
+            h5_files, dataset_info, limit_to_dataset_info=loaded_dataset_info
+        )
+        if loaded_dataset_info:
+            skipped = total_h5_files - len(h5_files)
+            print(
+                f'[dataset] {context}: matched {len(h5_files)}/{total_h5_files} h5 file(s) '
+                f'to dataset_info; skipped {skipped} h5 file(s) not listed in JSON.',
+                flush=True,
+            )
     if h5_files:
         created_or_filled = False
         missing_label_slides = []
@@ -873,7 +908,12 @@ def feature_processor(args):
     print_memory_usage('feature_processor start')
     io_start = time.perf_counter()
     dataset_info = load_dataset_info(args, context='feature processing')
-    h5_map = h5_file_map(find_h5_files(args.raw_feature_path))
+    h5_files = select_h5_files_for_dataset_info(
+        find_h5_files(args.raw_feature_path),
+        dataset_info,
+        limit_to_dataset_info=dataset_info_path_exists(args)
+    )
+    h5_map = h5_file_map(h5_files)
     os.makedirs(args.dump_features, exist_ok=True)
 
     for k, v in dataset_info.items():
