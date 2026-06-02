@@ -393,6 +393,12 @@ def basic_tagger(ukn_sim, ukn_mask, label, uncertain, positive=False):
     return label
 
 
+def normalize_similarity_values(values):
+    if values.numel() == 0:
+        return values
+    return (values - values.min()) / (values.max() - values.min()).clamp_min(1e-8)
+
+
 # ====================== in-context tagger (algorithm 2) ======================
 
 # binary classification via sparse annotations (slideLabel, box, roughMask)
@@ -526,6 +532,94 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
             vis_heat(score, labels_n, info_dic[n]['pos'], n + '.svs', vis_info['wsi_dir'], \
                 vis_info['vis_dir'], vis_info['mask_dir'], side=512)
 
+    return labels
+
+
+def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_binary_labels, \
+        vis_info=None, uncertain=0.1, topk=40):
+    pos_anchor = labels == 1
+    neg_anchor = labels == 0
+    pos_count = int(pos_anchor.sum().item())
+    neg_count = int(neg_anchor.sum().item())
+    if pos_count == 0 or neg_count == 0:
+        unique_labels, unique_counts = torch.unique(labels.detach().cpu(), return_counts=True)
+        label_counts = ', '.join(
+            f'{int(label.item())}:{int(count.item())}'
+            for label, count in zip(unique_labels, unique_counts)
+        )
+        raise ValueError(
+            'Mask subtyping tagger needs explicit positive (1) and negative (0) anchor tokens, '
+            f'but got pos={pos_count}, neg={neg_count}. Label counts: {label_counts}. '
+            'This usually means the selected example WSIs do not contain annotated patches '
+            'from both the current class and other classes.'
+        )
+
+    label_by_wsi = dict(wsi_binary_labels)
+    assigned_pos, assigned_neg, kept_bg, kept_uncertain = 0, 0, 0, 0
+    total_unknown = 0
+
+    for n in wsi_names:
+        idx = []
+        for i, pn in enumerate(patch_names):
+            if n in pn:
+                idx.append(i)
+        if len(idx) == 0:
+            continue
+        if n not in label_by_wsi:
+            raise ValueError(f'Missing one-vs-rest WSI label for mask subtyping tagger: {n}')
+
+        wsi_label = int(label_by_wsi[n])
+        if wsi_label not in [0, 1]:
+            raise ValueError(f'Mask subtyping WSI label must be 0 or 1, got {wsi_label} for {n}')
+
+        idx_t = torch.as_tensor(idx, device=labels.device, dtype=torch.long)
+        unknown_mask = (labels[idx_t] == 255) | (labels[idx_t] == 254) | (labels[idx_t] == -1)
+        if int(unknown_mask.sum().item()) == 0:
+            continue
+
+        unknown_idx = idx_t[unknown_mask]
+        unknown_feats = feats[unknown_idx]
+        sim_pos = compute_similarity(unknown_feats, feats[pos_anchor], topk=topk)
+        sim_neg = compute_similarity(unknown_feats, feats[neg_anchor], topk=topk)
+        if wsi_label == 1:
+            target_sim = sim_pos
+            other_sim = sim_neg
+        else:
+            target_sim = sim_neg
+            other_sim = sim_pos
+
+        fg_score = normalize_similarity_values(torch.maximum(sim_pos, sim_neg))
+        fg_labels = torch.zeros(unknown_feats.shape[0], device=labels.device).long()
+        fg_labels = basic_tagger(fg_score, fg_labels == 0, fg_labels, uncertain, positive=True)
+
+        updated = torch.full((unknown_feats.shape[0],), 255, device=labels.device, dtype=torch.long)
+        updated[fg_labels == -1] = 254
+        class_candidate = fg_labels == 1
+
+        if int(class_candidate.sum().item()) > 0:
+            class_score = normalize_similarity_values(target_sim[class_candidate] - other_sim[class_candidate])
+            class_labels = torch.zeros(int(class_candidate.sum().item()), device=labels.device).long()
+            class_labels = basic_tagger(class_score, class_labels == 0, class_labels, uncertain, positive=True)
+            class_updated = torch.full_like(class_labels, 255)
+            class_updated[class_labels == 1] = wsi_label
+            class_updated[class_labels == -1] = 254
+            updated[class_candidate] = class_updated
+
+        labels[unknown_idx] = updated
+        total_unknown += int(updated.shape[0])
+        assigned_pos += int((updated == 1).sum().item())
+        assigned_neg += int((updated == 0).sum().item())
+        kept_bg += int((updated == 255).sum().item())
+        kept_uncertain += int((updated == 254).sum().item())
+
+    print(
+        '[tagger] mask subtyping: refined unknown tokens=' + str(total_unknown) +
+        ', assigned_pos=' + str(assigned_pos) +
+        ', assigned_neg=' + str(assigned_neg) +
+        ', background=' + str(kept_bg) +
+        ', uncertain=' + str(kept_uncertain) +
+        ', anchors pos/neg=' + str(pos_count) + '/' + str(neg_count)
+    )
     return labels
 
 

@@ -35,7 +35,7 @@ import openslide
 from sklearn.metrics import accuracy_score, f1_score, hamming_loss, precision_recall_curve, roc_auc_score
 
 from modules import inference, load_weak_prompts, execute_tagger, \
-        execute_subtyping_tagger, execute_miner
+        execute_subtyping_tagger, execute_mask_subtyping_tagger, execute_miner
 
 try:
     import psutil
@@ -1687,6 +1687,7 @@ def evaluate(args, val_only=False):
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
             example_feature_names = []
+            example_wsi_binary_labels = {}
             io_start = time.perf_counter()
             for n in example_names:
                 example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
@@ -1694,6 +1695,11 @@ def evaluate(args, val_only=False):
                     example_wsi_label = 1 if has_wsi_label(dataset_info[n], cls) else 0
                 else:
                     example_wsi_label = dataset_info[n].get('wsi_label', example_n.get('wsi_label', 0)) if n in dataset_info else example_n.get('wsi_label', 0)
+                if args.c > 1:
+                    if multilabel:
+                        example_wsi_binary_labels[n] = 1 if has_wsi_label(dataset_info[n], cls) else 0
+                    else:
+                        example_wsi_binary_labels[n] = 1 if int(example_wsi_label) == cls else 0
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
                 example_feature_names.append(n)
@@ -1782,6 +1788,13 @@ def evaluate(args, val_only=False):
             if args.prompt_type == 'slideLabel' and args.c > 1 and not multilabel:
                 example_labels = execute_subtyping_tagger(example_feats, example_labels, example_patch_names, \
                     example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+
+            if args.prompt_type == 'mask' and args.c > 1 and args.mask_subtyping_tagger:
+                example_labels = execute_mask_subtyping_tagger(
+                    example_feats, example_labels, example_patch_names,
+                    example_names, example_wsi_binary_labels,
+                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk
+                )
             
             # subtyping + box / roughMask. Need to process "execute_tagger" twice. 
             # Once for shared bg and this class, another for shared bg and other classes
@@ -2830,6 +2843,8 @@ if __name__ == '__main__':
     parser.add_argument('--multilabel_mask_negative_source', default='other_positive',
         choices=['all_zero', 'other_positive', 'none'],
         help='for mask+multilabel examples: all_zero treats every non-target patch as negative; other_positive uses only other annotated classes as hard negatives and ignores unannotated patches; none uses no negative reference tokens')
+    parser.add_argument('--mask_subtyping_tagger', default=False, action='store_true',
+        help='for multiclass or multilabel mask prompts, refine unknown mask tokens with a mask-compatible one-vs-rest subtyping tagger')
     parser.add_argument('--require_label', default=False, action='store_true',
         help='exclude WSIs without real labels from example construction and evaluation; unlabeled and pseudo-labeled slides are skipped')
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',

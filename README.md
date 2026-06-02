@@ -419,6 +419,19 @@ RUNS=5 \
 bash scripts/run_h5_eval.sh
 ```
 
+For `PROMPT_TYPE=mask`, you can optionally refine unannotated/uncertain mask tokens with a mask-compatible one-vs-rest subtyping tagger:
+
+```
+PROMPT_TYPE=mask \
+CLASS_NUM=2 \
+MASK_SUBTYPING_TAGGER=1 \
+bash scripts/run_h5_eval.sh
+```
+
+This keeps explicit mask anchors unchanged (`1=current class`, `0=other class`) and only relabels unknown tokens (`255/254/-1`) using the current WSI's one-vs-rest slide label. Use this when mask annotations are partial and unannotated regions may still contain lesion tissue.
+
+For multi-label mask runs, prefer `MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive` with this switch. `other_positive` provides explicit hard-negative anchors from other annotated classes while leaving unannotated/outside-mask tokens as `255` for refinement.
+
 Use a fresh `DUMP_FEATURES` directory for mask runs, because PRET skips feature collection when a cached `dump_features/{slide}.npy` file already exists.
 
 You can create a small fake h5-only dataset for a local smoke test:
@@ -788,6 +801,13 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 当 `--dataset_info` 指向一个已存在的 JSON 文件时，PRET 现在只处理 JSON key 中列出的 h5 slide；h5 文件夹里额外存在但 JSON 未标注的文件会被跳过，不再自动加入 `dataset_info` 并分配 pseudo label。
    - 当 `--dataset_info` 不存在时，仍保留原来的 smoke-test 行为：扫描 h5 文件夹并按文件顺序生成 deterministic pseudo label。
    - 终端会打印 `[dataset] ... matched X/Y h5 file(s) to dataset_info; skipped Z h5 file(s) not listed in JSON.`，用于确认实际进入评测的数据量。
+
+23. **mask one-vs-rest tagger refinement**
+   - 新增 `--mask_subtyping_tagger`，h5 wrapper 对应 `MASK_SUBTYPING_TAGGER=1`。
+   - 该开关用于 `PROMPT_TYPE=mask`、`CLASS_NUM>1` 的 one-vs-rest reference refinement；单标签多分类和多标签任务均可使用。默认关闭，保持旧的 mask 行为。
+   - 开启后，明确 mask anchor 不会被覆盖：`1` 仍表示当前类，`0` 仍表示其他类；仅对 `255/254/-1` 这类 unknown/uncertain token 做 refinement。
+   - refinement 会显式使用当前 WSI 的 one-vs-rest slide label，而不是像旧 `execute_subtyping_tagger` 那样假设同一 WSI 的初始 patch label 全部相同，因此可以适配 mask 内部混合 `1/0/255` 的情况。
+   - 多标签 mask 使用时建议配合 `MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive`，用其他已标注类别提供明确 hard-negative anchors，同时让未标注/框外 token 维持 `255` 后再由 tagger refinement。
 
 ## Citation
 
