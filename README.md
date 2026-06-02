@@ -389,6 +389,18 @@ Set `CLASS_NUM` to the number of entries in the generated label map. Add `SEG=1`
 
 For ordinary single-label multi-class classification, each WSI should have exactly one `wsi_label` in `1..CLASS_NUM`; do not set `MULTILABEL=1`. PRET still computes one-vs-rest class scores internally, then combines the `N x CLASS_NUM` logits with `argmax` so each WSI receives exactly one predicted class. The terminal and records will include `multiclass test ...` and `multiclass mean ...` metrics with the same metric names used by multi-label evaluation: `acc_exact_match`, `acc_hamming`, `auc_micro`, `auc_macro`, `f1_micro`, `f1_macro`, and `f1_samples`. The saved repeat record also contains `labels`, `preds`, `logits`, `pred_onehot`, and a `confusion_matrix`.
 
+If you already have a multi-label JSON and want to extract mutually exclusive labels into a single-label multi-class task, convert it first. For example, to build a 2-class task from original labels 5 and 7:
+
+```
+python scripts/convert_multilabel_json_to_multiclass.py \
+  --input_json data_info/16k_subtype_10x.json \
+  --output_json data_info/16k_subtype_10x_class5_7.json \
+  --classes 5 7 \
+  --out_h5_label_dir data/16k_subtype_10x_5_7/patch/h5_labels
+```
+
+By default, original class 5 is mapped to new `wsi_label=1`, and original class 7 is mapped to new `wsi_label=2`, so run with `CLASS_NUM=2`. The script reads each source `h5_patch_labels` `.npy`, writes a new one-dimensional class-id `.npy`, and recomputes `pos_patch_num` for the selected class. It also writes `{output_json_stem}_summary.json` with slide and patch-count summaries.
+
 Example h5 single-label multi-class run:
 
 ```
