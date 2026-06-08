@@ -20,6 +20,7 @@ import random
 import json
 import time
 import math
+from collections import Counter
 from contextlib import contextmanager
 from urllib.parse import unquote
 
@@ -802,9 +803,8 @@ def infer_h5_axis_step(values):
     diffs = [b - a for a, b in zip(values, values[1:]) if b > a]
     if not diffs:
         return None
-    step = diffs[0]
-    for diff in diffs[1:]:
-        step = math.gcd(step, diff)
+    counts = Counter(diffs)
+    step, _ = min(counts.items(), key=lambda item: (-item[1], item[0]))
     return step if step > 0 else None
 
 

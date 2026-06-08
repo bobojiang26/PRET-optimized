@@ -357,8 +357,8 @@ python prepare/csv_to_pret_annotations.py \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
-  --h5-coordinate-mode grid \
-  --patch-scale 0 \
+  --h5-coordinate-mode pixel \
+  --patch-scale 512 \
   --prompt-type mask \
   --wsi-label-mode multi-label \
   --slide-reader auto
@@ -387,8 +387,8 @@ MULTILABEL=1 \
 MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive \
 CLASS_NUM=6 \
 BALANCED_VAL_SPLIT=1 \
-H5_COORDINATE_MODE=grid \
-H5_PATCH_SIZE=0 \
+H5_COORDINATE_MODE=pixel \
+H5_PATCH_SIZE=512 \
 EXAMPLE_NUM=8 \
 VAL_NUM=100 \
 TEST_NUM=-1 \

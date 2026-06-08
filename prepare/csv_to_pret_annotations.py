@@ -7,7 +7,7 @@ import math
 import os
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import unquote
 from xml.sax.saxutils import escape
@@ -691,9 +691,8 @@ def infer_axis_step(values):
     diffs = [b - a for a, b in zip(values, values[1:]) if b > a]
     if not diffs:
         return None
-    step = diffs[0]
-    for diff in diffs[1:]:
-        step = math.gcd(step, diff)
+    counts = Counter(diffs)
+    step, _ = min(counts.items(), key=lambda item: (-item[1], item[0]))
     if step <= 0:
         return None
     return step
