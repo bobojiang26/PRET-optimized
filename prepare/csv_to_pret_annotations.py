@@ -32,7 +32,6 @@ DEFAULT_WSI_EXTENSIONS = (
     '.bif',
 )
 DEFAULT_SLIDE_READERS = ('openslide', 'opensdpc')
-DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 DEFAULT_PATCH_SCALE = 512
 PROGRESS_INTERVAL = 10
 H5_EXTENSIONS = ('.h5', '.hdf5')
@@ -713,13 +712,13 @@ def infer_patch_scale_from_coordinates(coords):
     return min(steps)
 
 
-def infer_h5_coordinate_mode(coords, requested_mode='auto', pixel_step_threshold=DEFAULT_H5_PIXEL_STEP_THRESHOLD):
-    if requested_mode != 'auto':
-        return requested_mode
-    inferred_step = infer_patch_scale_from_coordinates(coords)
-    if inferred_step is not None and inferred_step >= pixel_step_threshold:
-        return 'pixel'
-    return 'grid'
+def infer_h5_coordinate_mode(coords, requested_mode='grid'):
+    if requested_mode not in ['grid', 'pixel']:
+        raise ValueError(
+            'Set --h5-coordinate-mode to grid or pixel. Auto coordinate-mode detection has been removed; '
+            'inspect coordinates first with scripts/visualize_h5_coordinates.py.'
+        )
+    return requested_mode
 
 
 def h5_grid_shape_from_coordinates(coords):
@@ -822,11 +821,7 @@ def infer_h5_metadata(h5_files, args, known_size_map=None):
         slide_name = os.path.splitext(os.path.basename(h5_path))[0]
         coords = read_h5_coordinates(h5_path)
         coordinate_step = infer_patch_scale_from_coordinates(coords)
-        coordinate_mode = infer_h5_coordinate_mode(
-            coords,
-            requested_mode=args.h5_coordinate_mode,
-            pixel_step_threshold=args.h5_pixel_step_threshold,
-        )
+        coordinate_mode = infer_h5_coordinate_mode(coords, requested_mode=args.h5_coordinate_mode)
         known_size = lookup_known_slide_size(slide_name, known_size_map)
 
         if args.patch_scale > 0:
@@ -1296,10 +1291,8 @@ def parse_args():
         help='WSI file extensions to scan under --wsi-dir; default includes sdpc, svs, tif, tiff, mrxs, ndpi, scn')
     parser.add_argument('--slide-reader', default='auto', choices=['auto', 'openslide', 'opensdpc'],
         help='slide reader used for WSI sizes; auto tries OpenSlide first, then opensdpc for sdpc-like files')
-    parser.add_argument('--h5-coordinate-mode', default='auto', choices=['auto', 'pixel', 'grid'],
-        help='how to interpret h5 coordinates: pixel=level-0 top-left pixels, grid=patch indices, auto detects from coordinate step')
-    parser.add_argument('--h5-pixel-step-threshold', type=int, default=DEFAULT_H5_PIXEL_STEP_THRESHOLD,
-        help='auto mode treats h5 coordinate step >= this value as pixel coordinates; smaller steps are patch-grid coordinates')
+    parser.add_argument('--h5-coordinate-mode', default='grid', choices=['pixel', 'grid'],
+        help='how to interpret h5 coordinates: pixel=level-0 top-left pixels, grid=patch indices')
     parser.add_argument('--patch-scale', type=int, default=0,
         help='level-0 pixels per patch; 0 infers from h5 pixel coordinates or WSI size for h5 grid coordinates, otherwise uses 512')
     parser.add_argument('--prompt-type', default='mask',
@@ -1339,8 +1332,6 @@ def parse_args():
         args.skip_missing_h5 = bool(args.h5_label_out)
     if args.patch_scale < 0:
         parser.error('--patch-scale must be >= 0')
-    if args.h5_pixel_step_threshold <= 0:
-        parser.error('--h5-pixel-step-threshold must be positive')
     return args
 
 

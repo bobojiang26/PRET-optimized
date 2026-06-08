@@ -46,7 +46,6 @@ try:
 except ImportError:
     resource = None
 
-DEFAULT_H5_PIXEL_STEP_THRESHOLD = 16
 H5_COORDINATE_KEYS = ('coords', 'coordinates')
 SPARSIFY_QUERY_CHUNK = max(1, int(os.environ.get('PRET_SPARSIFY_QUERY_CHUNK', 4096)))
 SPARSIFY_REF_CHUNK = max(1, int(os.environ.get('PRET_SPARSIFY_REF_CHUNK', 1024)))
@@ -823,15 +822,13 @@ def infer_h5_patch_size(coords):
 
 
 def infer_h5_coordinate_mode(coords, args, context='h5 input'):
-    if args.h5_coordinate_mode != 'auto':
-        return args.h5_coordinate_mode
-    inferred_step = infer_h5_patch_size(coords)
-    if inferred_step is not None and inferred_step >= args.h5_pixel_step_threshold:
-        mode = 'pixel'
-    else:
-        mode = 'grid'
-    print(f'[info] {context}: inferred h5 coordinate mode {mode} from coordinate step {inferred_step}.')
-    return mode
+    if args.h5_coordinate_mode not in ['grid', 'pixel']:
+        raise ValueError(
+            f'{context}: set --h5_coordinate_mode to grid or pixel. '
+            'Auto coordinate-mode detection has been removed; inspect coordinates first with '
+            'scripts/visualize_h5_coordinates.py.'
+        )
+    return args.h5_coordinate_mode
 
 
 def get_h5_patch_size(args, coords=None, context='h5 input', coordinate_mode=None):
@@ -944,7 +941,6 @@ def feature_cache_metadata(slide_name, dataset_entry, args, h5_path=None):
     if h5_path is not None:
         metadata['h5_coordinate_args'] = {
             'h5_coordinate_mode': args.h5_coordinate_mode,
-            'h5_pixel_step_threshold': int(args.h5_pixel_step_threshold),
             'h5_patch_size': int(args.h5_patch_size),
             'patch_scale': int(args.patch_scale),
         }
@@ -2947,10 +2943,8 @@ if __name__ == '__main__':
     parser.add_argument('--vis_path', default='', help='Path where to save heatmap')
     parser.add_argument('--dataset_info', default='/path/to/data_list_gt_and_split', type=str, help='json file recording dataset info')
     parser.add_argument('--patch_scale', default=512, type=int, help='patch size in 40x for anno loading')
-    parser.add_argument('--h5_coordinate_mode', default='auto', choices=['auto', 'grid', 'pixel'],
-        help='interpret h5 coordinates as patch-grid indices, level-0 pixel top-left coordinates, or auto-detect from coordinate step')
-    parser.add_argument('--h5_pixel_step_threshold', default=DEFAULT_H5_PIXEL_STEP_THRESHOLD, type=int,
-        help='auto mode treats h5 coordinate step >= this value as pixel coordinates; smaller steps are patch-grid coordinates')
+    parser.add_argument('--h5_coordinate_mode', default='grid', choices=['grid', 'pixel'],
+        help='interpret h5 coordinates as patch-grid indices or level-0 pixel top-left coordinates')
     parser.add_argument('--h5_patch_size', default=0, type=int,
         help='level-0 patch size for h5 pixel coordinates; 0 infers from h5 coordinates when possible')
     parser.add_argument('--file_min_size', default=5000, type=int, help='skip background and patches with a few content')
@@ -2993,9 +2987,6 @@ if __name__ == '__main__':
         parser.error('--example_ratio must be in [0, 1]')
     if args.example_ratio_max_per_class < 0:
         parser.error('--example_ratio_max_per_class must be >= 0')
-    if args.h5_pixel_step_threshold <= 0:
-        parser.error('--h5_pixel_step_threshold must be positive')
-
     random.seed(args.seed)
     if args.seed_torch_sampling:
         torch.manual_seed(args.seed)

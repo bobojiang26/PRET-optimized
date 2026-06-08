@@ -85,7 +85,7 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain a `features` key. A `coordinates` key is optional:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coords` or `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. `H5_COORDINATE_MODE=auto` detects this from the coordinate step; step values below `H5_PIXEL_STEP_THRESHOLD` are treated as patch-grid coordinates, and larger steps are treated as pixel coordinates. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
+* `coords` or `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. Coordinate mode is no longer auto-detected during conversion/evaluation; inspect the h5 files first, then use one explicit mode: `H5_COORDINATE_MODE=grid` or `H5_COORDINATE_MODE=pixel`. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
 
 Put all h5 files in one folder, for example:
 
@@ -277,7 +277,19 @@ For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labe
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
 * `coords` or `coordinates`: a 2D array with shape `(num_patches, >=2)`.
 
-H5 `coordinates` can be stored in two formats. If they are level-0 pixel top-left coordinates, use `--h5-coordinate-mode pixel`, or leave `auto` when the coordinate step is large, for example `256` or `512`. If they are patch-grid coordinates, for example step `1`, use `--h5-coordinate-mode grid`, or leave `auto` and the converter will detect grid mode. In grid mode, `--patch-scale` means the level-0 pixel size of one patch; when `--patch-scale 0`, the converter tries to infer it from `--size-json` or `--wsi-dir`, then falls back to `512`. If the h5 only keeps a tissue subset instead of the full slide grid, pass the real patch size explicitly with `--patch-scale 256` or `--patch-scale 512`.
+H5 `coordinates` can be stored in two formats. If they are level-0 pixel top-left coordinates, use `--h5-coordinate-mode pixel`. If they are patch-grid coordinates, for example step `1`, use `--h5-coordinate-mode grid`. PRET no longer auto-detects this during conversion or evaluation; decide once for a dataset and reuse the same mode everywhere. In grid mode, `--patch-scale` means the level-0 pixel size of one patch; when `--patch-scale 0`, the converter tries to infer it from `--size-json` or `--wsi-dir`, then falls back to `512`. If the h5 only keeps a tissue subset instead of the full slide grid, pass the real patch size explicitly with `--patch-scale 256` or `--patch-scale 512`.
+
+Before conversion, visualize a few h5 coordinate layouts:
+
+```
+python scripts/visualize_h5_coordinates.py \
+  --h5_dir data/MY_H5/h5 \
+  --out_dir records/MY_H5_h5_coordinate_vis \
+  --max_files 24 \
+  --max_points 8000
+```
+
+The script writes per-slide SVG scatter plots plus `summary.json`. If the reported coordinate step is `1`, use `grid`; if the step is the real patch size such as `256` or `512`, use `pixel`.
 
 The CSV annotation file must have three columns:
 
@@ -345,7 +357,7 @@ python prepare/csv_to_pret_annotations.py \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
-  --h5-coordinate-mode auto \
+  --h5-coordinate-mode grid \
   --patch-scale 0 \
   --prompt-type mask \
   --wsi-label-mode multi-label \
@@ -375,8 +387,7 @@ MULTILABEL=1 \
 MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive \
 CLASS_NUM=6 \
 BALANCED_VAL_SPLIT=1 \
-H5_COORDINATE_MODE=auto \
-H5_PIXEL_STEP_THRESHOLD=16 \
+H5_COORDINATE_MODE=grid \
 H5_PATCH_SIZE=0 \
 EXAMPLE_NUM=8 \
 VAL_NUM=100 \

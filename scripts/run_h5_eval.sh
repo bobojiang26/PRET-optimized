@@ -16,8 +16,8 @@ PROMPT_TYPE="${PROMPT_TYPE:-slideLabel}"
 DUMP_RECORDS="${DUMP_RECORDS:-records/${DATASET_NAME}_${PROMPT_TYPE}_eval.npy}"
 
 CLASS_NUM="${CLASS_NUM:-1}"
-H5_COORDINATE_MODE="${H5_COORDINATE_MODE:-auto}"
-H5_PIXEL_STEP_THRESHOLD="${H5_PIXEL_STEP_THRESHOLD:-16}"
+PATCH_SCALE="${PATCH_SCALE:-512}"
+H5_COORDINATE_MODE="${H5_COORDINATE_MODE:-grid}"
 H5_PATCH_SIZE="${H5_PATCH_SIZE:-0}"
 SEG="${SEG:-0}"
 MULTILABEL="${MULTILABEL:-0}"
@@ -163,8 +163,8 @@ EXTRA_ARGS=("$@")
   --ignore 0 \
   --file_min_size 0 \
   --class_num "${CLASS_NUM}" \
+  --patch_scale "${PATCH_SCALE}" \
   --h5_coordinate_mode "${H5_COORDINATE_MODE}" \
-  --h5_pixel_step_threshold "${H5_PIXEL_STEP_THRESHOLD}" \
   --h5_patch_size "${H5_PATCH_SIZE}" \
   --runs "${RUNS}" \
   --dump_records "${DUMP_RECORDS}" \
