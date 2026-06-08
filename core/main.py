@@ -1116,19 +1116,16 @@ def get_example_names_at_same_num(all_names, dataset_info, example_num, check_nu
 
     labels = list(expected_labels) if expected_labels is not None else list(record.keys())
     if check_num:
-        shortages = []
-        for k in labels:
-            candidate_num = len(record.get(k, []))
-            if candidate_num < example_num:
-                shortages.append(f'{k}: need {example_num}, found {candidate_num}')
-        if shortages:
-            counts = ', '.join(f'{k}:{len(record[k])}' for k in sorted(record))
+        missing = [str(k) for k in labels if len(record.get(k, [])) == 0]
+        if missing:
+            count_labels = sorted(set(labels) | set(record))
+            counts = ', '.join(f'{k}:{len(record.get(k, []))}' for k in count_labels)
             raise ValueError(
                 'Insufficient example WSIs for balanced multiclass sampling. '
-                f'Missing/short classes: {", ".join(shortages)}. '
+                f'Missing classes: {", ".join(missing)}. '
                 f'Candidate label counts: {counts}. '
                 'For slideLabel multiclass runs, make sure every class has at least '
-                'example_num non-fixed-test WSI candidates.'
+                'one non-fixed-test WSI candidate.'
             )
 
     names = []
@@ -1174,7 +1171,8 @@ def get_example_names_at_label_ratio(all_names, dataset_info, ratio, max_per_cla
     if check_num:
         shortages = [str(k) for k in labels if len(record.get(k, [])) == 0]
         if shortages:
-            counts = ', '.join(f'{k}:{len(record[k])}' for k in sorted(record))
+            count_labels = sorted(set(labels) | set(record))
+            counts = ', '.join(f'{k}:{len(record.get(k, []))}' for k in count_labels)
             raise ValueError(
                 'Insufficient example WSIs for ratio-based multiclass sampling. '
                 f'Missing classes: {", ".join(shortages)}. '
@@ -1248,6 +1246,24 @@ def label_counts(names, dataset_info):
 
 def format_label_counts(counts):
     return ', '.join(f'{k}:{counts[k]}' for k in sorted(counts))
+
+
+def print_underfilled_fixed_example_counts(prefix, args, counts):
+    if use_example_ratio(args) or args.c <= 1:
+        return
+    underfilled = {
+        k: counts.get(k, 0)
+        for k in range(1, args.c + 1)
+        if 0 < counts.get(k, 0) < args.example_num
+    }
+    if underfilled:
+        print(
+            '[split] ' + prefix +
+            ' fixed example target=' + str(args.example_num) +
+            '; underfilled classes use all available candidates: ' +
+            format_label_counts(underfilled),
+            flush=True,
+        )
 
 
 def patch_labels_for_class(patch_labels, cls, class_num, multilabel=False, multilabel_negative_source='all_zero'):
@@ -1724,7 +1740,9 @@ def evaluate(args, val_only=False):
                 ' target label counts: ' + format_label_counts(example_target_counts)
             )
         if args.c > 1 or use_example_ratio(args):
-            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
+            example_label_counts = label_counts(example_names, dataset_info)
+            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(example_label_counts))
+            print_underfilled_fixed_example_counts('repeat=' + str(i), args, example_label_counts)
 
         # split val set out of example and test set
         for n in all_names:
@@ -2462,7 +2480,9 @@ def evaluate_baseline(args, mode):
                 ' target label counts: ' + format_label_counts(example_target_counts)
             )
         if args.c > 1 or use_example_ratio(args):
-            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(label_counts(example_names, dataset_info)))
+            example_label_counts = label_counts(example_names, dataset_info)
+            print('[split] repeat=' + str(i) + ' example label counts: ' + format_label_counts(example_label_counts))
+            print_underfilled_fixed_example_counts('baseline ' + mode + ' repeat=' + str(i), args, example_label_counts)
 
         # split val set out of example and test set
         for n in all_names:

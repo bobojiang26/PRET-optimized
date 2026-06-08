@@ -194,6 +194,8 @@ BALANCED_VAL_SPLIT=1 VAL_NUM=100 MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive 
 
 In multi-label mode, `BALANCED_VAL_SPLIT=1` greedily covers rare class labels in validation. Per-class terminal lines also print the chosen threshold plus `tp/fp/tn/fn`, so classes like 2 and 3 can be checked directly for false positives.
 
+For fixed-shot multi-class runs, `EXAMPLE_NUM` and `MULTIPLE_NUM` now mean "up to this many examples per class". If a class has fewer non-fixed-test candidates than the requested shot count, PRET automatically uses all available candidates for that class and prints an underfilled-class summary. A class with zero candidates still raises an error because no reference examples can be built for it.
+
 If a fixed shot count underuses large classes, set an example ratio instead of relying on `EXAMPLE_NUM`. Add a per-class cap to avoid loading too many reference examples into GPU memory. For example, this samples at most 60% of each class candidate pool, rounded up per class, but never more than 20 WSIs per class:
 
 ```bash
