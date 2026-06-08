@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -61,6 +62,20 @@ def axis_step(values):
     return int(step) if step > 0 else None
 
 
+def axis_gap_summary(values, top_k=6):
+    values = sorted({int(round(float(v))) for v in values})
+    diffs = [b - a for a, b in zip(values, values[1:]) if b > a]
+    if not diffs:
+        return None, None, []
+
+    counts = Counter(diffs)
+    top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top_k]
+    mode_step = int(top[0][0])
+    median_step = int(round(float(np.median(diffs))))
+    top_gaps = [{'gap': int(gap), 'count': int(count)} for gap, count in top]
+    return mode_step, median_step, top_gaps
+
+
 def read_h5_info(path):
     import h5py
 
@@ -78,9 +93,13 @@ def read_h5_info(path):
 def summarize_coords(path, coords, coord_key, feature_count, pixel_step_threshold):
     x_step = axis_step(coords[:, 0])
     y_step = axis_step(coords[:, 1])
-    steps = [s for s in [x_step, y_step] if s is not None]
-    min_step = min(steps) if steps else None
-    recommended = 'pixel' if min_step is not None and min_step >= pixel_step_threshold else 'grid'
+    x_mode_step, x_median_step, x_top_gaps = axis_gap_summary(coords[:, 0])
+    y_mode_step, y_median_step, y_top_gaps = axis_gap_summary(coords[:, 1])
+    gcd_steps = [s for s in [x_step, y_step] if s is not None]
+    min_gcd_step = min(gcd_steps) if gcd_steps else None
+    mode_steps = [s for s in [x_mode_step, y_mode_step] if s is not None]
+    min_mode_step = min(mode_steps) if mode_steps else None
+    recommended = 'pixel' if min_mode_step is not None and min_mode_step >= pixel_step_threshold else 'grid'
     return {
         'path': path,
         'slide': safe_name(path),
@@ -95,7 +114,14 @@ def summarize_coords(path, coords, coord_key, feature_count, pixel_step_threshol
         'y_unique': int(np.unique(coords[:, 1]).shape[0]),
         'x_step_gcd': x_step,
         'y_step_gcd': y_step,
-        'min_step_gcd': min_step,
+        'min_step_gcd': min_gcd_step,
+        'x_step_mode': x_mode_step,
+        'y_step_mode': y_mode_step,
+        'min_step_mode': min_mode_step,
+        'x_step_median': x_median_step,
+        'y_step_median': y_median_step,
+        'x_gap_top': x_top_gaps,
+        'y_gap_top': y_top_gaps,
         'diagnostic_mode': recommended,
     }
 
@@ -127,7 +153,11 @@ def write_scatter_svg(path, coords, summary, out_path, svg_size=900, max_points=
     x_svg = margin + (pts[:, 0] - x_min) / x_span * plot_w
     y_svg = margin + (pts[:, 1] - y_min) / y_span * plot_h
 
-    title = f"{summary['slide']}  n={summary['point_count']}  step={summary['min_step_gcd']}  looks={summary['diagnostic_mode']}"
+    title = (
+        f"{summary['slide']}  n={summary['point_count']}  "
+        f"mode_step={summary['min_step_mode']}  gcd={summary['min_step_gcd']}  "
+        f"looks={summary['diagnostic_mode']}"
+    )
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fbfbf7"/>',
@@ -151,7 +181,7 @@ def write_overview_svg(summaries, out_path):
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fbfbf7"/>',
         '<text x="24" y="34" font-family="monospace" font-size="18" fill="#222">H5 coordinate summary</text>',
-        '<text x="24" y="64" font-family="monospace" font-size="12" fill="#555">slide | n | x range | y range | gcd step | diagnostic mode</text>',
+        '<text x="24" y="64" font-family="monospace" font-size="12" fill="#555">slide | n | x range | y range | mode step | gcd step | diagnostic mode</text>',
     ]
     y = 92
     for item in summaries:
@@ -159,7 +189,7 @@ def write_overview_svg(summaries, out_path):
             f"{item['slide']} | n={item['point_count']} | "
             f"x={item['x_min']:.0f}..{item['x_max']:.0f} | "
             f"y={item['y_min']:.0f}..{item['y_max']:.0f} | "
-            f"step={item['min_step_gcd']} | {item['diagnostic_mode']}"
+            f"mode_step={item['min_step_mode']} | gcd={item['min_step_gcd']} | {item['diagnostic_mode']}"
         )
         color = '#166534' if item['diagnostic_mode'] == 'grid' else '#9a3412'
         lines.append(f'<text x="24" y="{y}" font-family="monospace" font-size="13" fill="{color}">{svg_escape(text)}</text>')
@@ -190,7 +220,8 @@ def main():
             f"[coords] {idx}/{len(h5_files)} {summary['slide']}: "
             f"n={summary['point_count']} x={summary['x_min']:.0f}..{summary['x_max']:.0f} "
             f"y={summary['y_min']:.0f}..{summary['y_max']:.0f} "
-            f"step={summary['min_step_gcd']} looks={summary['diagnostic_mode']} -> {out_svg}",
+            f"mode_step={summary['min_step_mode']} gcd={summary['min_step_gcd']} "
+            f"looks={summary['diagnostic_mode']} -> {out_svg}",
             flush=True,
         )
 

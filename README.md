@@ -289,7 +289,7 @@ python scripts/visualize_h5_coordinates.py \
   --max_points 8000
 ```
 
-The script writes per-slide SVG scatter plots plus `summary.json`. If the reported coordinate step is `1`, use `grid`; if the step is the real patch size such as `256` or `512`, use `pixel`.
+The script writes per-slide SVG scatter plots plus `summary.json`. Use `min_step_mode` / `x_step_mode` / `y_step_mode` as the main diagnostic: if the dominant coordinate gap is `1`, use `grid`; if the dominant gap is the real patch size such as `256` or `512`, use `pixel`. The `*_step_gcd` fields are kept only as anomaly hints, because a single edge or irregular coordinate can reduce the GCD to `1`.
 
 The CSV annotation file must have three columns:
 
