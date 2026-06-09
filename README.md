@@ -272,6 +272,24 @@ This writes `class_stats.csv`, `centroid_distances.csv`, `pairwise_token_distanc
 
 If the script reports that `sparsify_reference_tokens()` got an unexpected `return_indices` argument, the copied checkout is mixing a new `scripts/visualize_example_tokens.py` with an older `core/main.py`. Sync both files from `optimized/main` before running the visualization, because the script needs the latest sparsification helper to map kept tokens back to their slide/patch names.
 
+To visually inspect h5 mask alignment and PRET's mask-processing semantics, run:
+
+```bash
+python scripts/visualize_mask_processing.py \
+  --h5_dir data/MY_H5/h5 \
+  --dataset_info data_info/MY_H5.json \
+  --out_dir records/MY_H5_mask_processing_vis \
+  --slides 02 \
+  --classes 2 3 \
+  --class_num 17 \
+  --multilabel \
+  --multilabel_mask_negative_source other_positive \
+  --h5_coordinate_mode pixel \
+  --h5_patch_size 512
+```
+
+This writes per-slide/per-class SVG panels for raw target-vs-other labels, PRET's initial one-vs-rest mask labels, and the final `0/1` reference tokens kept after dropping ignored labels. Add `--run_mask_tagger` to also draw the post-refinement mask labels produced by `execute_mask_subtyping_tagger`.
+
 ### H5 mask evaluation from CSV annotations
 
 For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labels directly to the h5 feature order. This is useful when each h5 file stores:
