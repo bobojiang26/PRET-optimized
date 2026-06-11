@@ -683,6 +683,17 @@ def dataset_is_multilabel(dataset_info, args=None):
     return any('wsi_labels' in info for info in dataset_info.values())
 
 
+def validate_prompt_task_combination(args, multilabel, context='dataset'):
+    if multilabel and getattr(args, 'prompt_type', None) == 'slideLabel':
+        raise ValueError(
+            f'{context}: prompt_type=slideLabel is not supported for multilabel tasks. '
+            'Slide-level labels cannot localize multiple co-existing classes to token-level '
+            'references without creating ambiguous one-vs-rest positives/negatives. '
+            'Use prompt_type=mask with h5_patch_labels for multilabel evaluation, or convert '
+            'mutually exclusive classes to a single-label multiclass JSON and run without --multilabel.'
+        )
+
+
 def infer_dataset_class_num(dataset_info):
     max_label = 0
     for info in dataset_info.values():
@@ -755,7 +766,10 @@ def load_dataset_info(args, context='dataset loading'):
 
     dataset_info = apply_require_label_filter(dataset_info, args, context=context)
 
-    if dataset_is_multilabel(dataset_info, args):
+    multilabel = dataset_is_multilabel(dataset_info, args)
+    validate_prompt_task_combination(args, multilabel, context=context)
+
+    if multilabel:
         inferred_class_num = infer_dataset_class_num(dataset_info)
         if args.c < inferred_class_num:
             print(
@@ -3007,6 +3021,12 @@ if __name__ == '__main__':
         parser.error('--example_ratio must be in [0, 1]')
     if args.example_ratio_max_per_class < 0:
         parser.error('--example_ratio_max_per_class must be >= 0')
+    if args.prompt_type == 'slideLabel' and args.multilabel:
+        parser.error(
+            '--prompt_type slideLabel cannot be used with --multilabel. '
+            'Use --prompt_type mask with h5_patch_labels, or convert mutually exclusive labels '
+            'to single-label multiclass and run without --multilabel.'
+        )
     random.seed(args.seed)
     if args.seed_torch_sampling:
         torch.manual_seed(args.seed)

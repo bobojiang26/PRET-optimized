@@ -85,7 +85,7 @@ python scripts/run.py 0 ESCC screening default slideLabel model.pth
 This optimized fork can run directly from pre-extracted WSI patch features saved as `.h5` or `.hdf5` files. Each h5 file is treated as one slide and must contain a `features` key. A `coordinates` key is optional:
 
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
-* `coords` or `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or level-0 pixel top-left coordinates such as `0,512,1024...`. Coordinate mode is no longer auto-detected during conversion/evaluation; inspect the h5 files first, then use one explicit mode: `H5_COORDINATE_MODE=grid` or `H5_COORDINATE_MODE=pixel`. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
+* `coords` or `coordinates`: optional 2D array with shape `(num_patches, 2)` or `(num_patches, >=2)`. The first two columns may be patch grid coordinates `(x, y)` such as `0,1,2...`, or coordinates in another fixed patch-layout unit such as `0,512,1024...`. CSV-to-h5 mask conversion defaults to relative alignment and does not need a grid/pixel decision. `H5_COORDINATE_MODE=grid|pixel` is still used for legacy absolute conversion and for h5 heatmap/grid visualization. If this key is missing, PRET generates deterministic row-major synthetic grid coordinates so slide-level h5 evaluation can continue.
 
 Put all h5 files in one folder, for example:
 
@@ -153,6 +153,8 @@ python core/main.py \
 ```
 
 `--wsi_path` and `--prompt_path` can point to non-existing folders when you only evaluate slide-level h5 features without heatmap visualization or segmentation. When `data_info/MY_H5.json` exists, PRET only processes h5 files whose decoded stem appears in that JSON; extra h5 files in the folder are skipped instead of being added as pseudo-labeled slides. If `data_info/MY_H5.json` is missing, or if a listed slide has no `wsi_label`, PRET assigns deterministic pseudo labels by h5 file order so the pipeline can be smoke-tested. These pseudo-label results are only for verifying that the code runs; they are not meaningful benchmark metrics.
+
+`PROMPT_TYPE=slideLabel` is only valid for binary screening or single-label multiclass runs. It is intentionally disabled for multilabel datasets (`MULTILABEL=1` or JSON entries with `wsi_labels`), because slide-level labels cannot tell which patch tokens belong to each co-existing class. For multilabel evaluation, use `PROMPT_TYPE=mask` with h5-aligned patch labels, or convert mutually exclusive labels into a single-label multiclass JSON first.
 
 When your dataset contains a mix of labeled and unlabeled slides, use `--require_label` to exclude unlabeled and pseudo-labeled slides from feature processing, example construction, and evaluation. The terminal prints a `[require_label]` summary near dataset loading so you can confirm how many WSIs were skipped before val/test splits are built:
 
@@ -297,7 +299,9 @@ For `prompt_type=mask` with pre-extracted h5 features, PRET can align patch labe
 * `features`: a 2D array with shape `(num_patches, feature_dim)`.
 * `coords` or `coordinates`: a 2D array with shape `(num_patches, >=2)`.
 
-H5 `coordinates` can be stored in two formats. If they are level-0 pixel top-left coordinates, use `--h5-coordinate-mode pixel`. If they are patch-grid coordinates, for example step `1`, use `--h5-coordinate-mode grid`. PRET no longer auto-detects this during conversion or evaluation; decide once for a dataset and reuse the same mode everywhere. In grid mode, `--patch-scale` means the level-0 pixel size of one patch; when `--patch-scale 0`, the converter tries to infer it from `--size-json` or `--wsi-dir`, then falls back to `512`. If the h5 only keeps a tissue subset instead of the full slide grid, pass the real patch size explicitly with `--patch-scale 256` or `--patch-scale 512`.
+For h5-aligned `.npy` label generation, the converter now defaults to relative alignment: `--h5-label-coordinate-space relative`. It uses the normalized CSV coordinates directly and maps them onto the relative h5 patch layout, so you usually do not need to decide whether h5 coordinates are `grid` or `pixel`, and you do not need to know whether the coordinate step is `1`, `256`, or `512`. This avoids scale errors when WSI magnification or h5 export coordinate units differ from level-0 WSI pixels.
+
+The older absolute alignment is still available with `--h5-label-coordinate-space absolute`. In that mode, `--h5-coordinate-mode pixel` means level-0 pixel top-left coordinates, and `--h5-coordinate-mode grid` means patch-grid coordinates. Use this only when you have verified that h5 coordinates, CSV coordinates, and `--patch-scale` are in the same WSI coordinate system.
 
 Before conversion, visualize a few h5 coordinate layouts:
 
@@ -309,7 +313,7 @@ python scripts/visualize_h5_coordinates.py \
   --max_points 8000
 ```
 
-The script writes per-slide SVG scatter plots plus `summary.json`. Use `min_step_mode` / `x_step_mode` / `y_step_mode` as the main diagnostic: if the dominant coordinate gap is `1`, use `grid`; if the dominant gap is the real patch size such as `256` or `512`, use `pixel`. The `*_step_gcd` fields are kept only as anomaly hints, because a single edge or irregular coordinate can reduce the GCD to `1`.
+The script writes per-slide SVG scatter plots plus `summary.json`. In the default relative h5 label mode this visualization is mainly for sanity-checking patch layout orientation and coverage, not for choosing `grid` versus `pixel`. The `*_step_gcd` fields are kept only as anomaly hints, because a single edge or irregular coordinate can reduce the GCD to `1`.
 
 The CSV annotation file must have three columns:
 
@@ -319,7 +323,7 @@ wsi_path,labels,coordinates
 
 `wsi_path` is the WSI path, `labels` is mapped by a JSON label map, and `coordinates` is a flat list of normalized coordinates in `[0, 1]`: `x1,y1,x2,y2,...`. URL-escaped slide names are decoded before matching h5 files. For example, `2026-004317%238%231.sdpc` is converted to `2026-004317#8#1` and then matched with `2026-004317#8#1.h5`; if the CSV already contains `#`, the name is kept unchanged. The `labels` field may be a plain label or a JSON/Python-style list such as `["fibroadenoma"]`.
 
-Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. If `--h5-dir` is provided and its coordinates are pixel coordinates, the converter can infer each slide size as `max_coordinate + inferred_patch_size`. If h5 coordinates are patch-grid coordinates, pass `--size-json`, `--wsi-dir`, or explicit `--patch-scale` so normalized CSV annotations can be mapped back to level-0 pixels correctly. You can still provide a size JSON to override inferred sizes:
+Two points are interpreted as opposite rectangle corners. More than two points are interpreted as a polygon. For h5-only workflows, use `prompt_type=mask` after converting these rectangles/polygons to h5-aligned patch labels; PRET's `box` and `roughMask` prompt modes are XML/WSI weak-prompt modes and are less suitable when only h5 features are available. With the default relative h5 label mode, the `.npy` label arrays do not require WSI dimensions, `size.json`, or readable SDPC/SVS files. You still need true WSI sizes if you also write XML/PNG masks for non-h5 workflows or visual inspection:
 
 ```json
 {
@@ -362,7 +366,7 @@ Label conversion rules:
 * For multi-label tasks, use `--wsi-label-mode multi-label`. The generated `data_info` writes only `wsi_labels`, for example `"wsi_labels": [1, 3, 5]`; it does not write `wsi_label`.
 * With `--wsi-label-mode multi-label`, the h5 patch label file has shape `(num_patches, class_num)` and is multi-hot by class. For binary mode, the h5 patch label file remains a one-dimensional `0/1` array.
 * When `--h5-label-out` is used, CSV rows whose slide name has no matching h5 file are skipped by default and reported as warnings. Add `--no-skip-missing-h5` if you prefer a hard failure. This avoids falling back to SDPC size readers for slides that cannot produce h5-aligned labels anyway.
-* During h5 label conversion, unreadable WSI files under `--wsi-dir` are skipped with a warning unless `--strict-wsi-size-errors` is set; h5 metadata and `--patch-scale` can still provide the slide size needed for normalized CSV coordinates.
+* During default relative h5 label conversion, unreadable WSI files under `--wsi-dir` do not affect `.npy` label generation. WSI sizes are only needed for XML/PNG mask outputs or legacy absolute h5 alignment.
 * H5 conversion is optimized by default: the converter reuses the initial h5 file index instead of scanning `--h5-dir` again, and h5 patch overlap checks use an integral-image vectorized path instead of per-patch Python loops. No GPU flag or extra command-line option is required.
 
 First generate h5-aligned patch labels and a PRET `data_info` file:
@@ -372,16 +376,12 @@ python prepare/csv_to_pret_annotations.py \
   --csv /path/to/annotations.csv \
   --auto-label-map \
   --label-map-out data_info/MY_H5_label_map.json \
-  --wsi-dir /path/to/sdpc_folder \
-  --size-json-out data_info/MY_H5_size.json \
   --h5-dir data/MY_H5/h5 \
   --h5-label-out data/MY_H5/patch/h5_labels \
   --data-info-out data_info/MY_H5_mask.json \
-  --h5-coordinate-mode pixel \
-  --patch-scale 512 \
+  --h5-label-coordinate-space relative \
   --prompt-type mask \
-  --wsi-label-mode multi-label \
-  --slide-reader auto
+  --wsi-label-mode multi-label
 ```
 
 This writes:
@@ -389,9 +389,8 @@ This writes:
 * `data/MY_H5/patch/h5_labels/{slide}.npy`: one label array per slide, strictly aligned to the h5 `features` row order.
 * `data_info/MY_H5_mask.json`: slide-level `wsi_labels`, `h5_patch_labels`, and `pos_patch_num`.
 * `data_info/MY_H5_label_map.json`: label names assigned in first-seen CSV order as `1, 2, 3, ...`.
-* `data_info/MY_H5_size.json`: slide level-0 sizes read from the SDPC folder and/or inferred from h5 coordinates.
 
-Add `--mask-out data/MY_H5/patch/gt` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`), but h5-aligned `.npy` labels only require `h5py` and `numpy`.
+Add `--mask-out data/MY_H5/patch/gt` plus `--wsi-dir` or `--size-json` if patch-grid PNGs are also needed for inspection or non-h5 workflows. Writing PNGs requires OpenCV (`cv2`) and a valid slide size, but h5-aligned `.npy` labels only require `h5py` and `numpy`.
 
 By default, all non-zero label IDs are treated as positive regions. Use `--positive-labels tumor invasive` or `--positive-labels 1 2` if only selected labels should become positive mask regions. If unannotated negative slides are needed for a binary or single-label task, add them to the generated `data_info` JSON with `wsi_label: 0` and `fixed_test_set: false`. For multi-label tasks, a negative slide should use `wsi_labels: []`.
 
@@ -407,8 +406,6 @@ MULTILABEL=1 \
 MULTILABEL_MASK_NEGATIVE_SOURCE=other_positive \
 CLASS_NUM=6 \
 BALANCED_VAL_SPLIT=1 \
-H5_COORDINATE_MODE=pixel \
-H5_PATCH_SIZE=512 \
 EXAMPLE_NUM=8 \
 VAL_NUM=100 \
 TEST_NUM=-1 \
@@ -417,6 +414,7 @@ bash scripts/run_h5_eval.sh
 ```
 
 Set `CLASS_NUM` to the number of entries in the generated label map. Add `SEG=1` only when you want patch-level segmentation metrics instead of WSI-level multi-label classification metrics.
+When `DATASET_INFO` already points to `h5_patch_labels`, `H5_COORDINATE_MODE` and `H5_PATCH_SIZE` do not change those labels; set them only if you need h5 heatmap/grid visualization to use a specific coordinate convention.
 
 For ordinary single-label multi-class classification, each WSI should have exactly one `wsi_label` in `1..CLASS_NUM`; do not set `MULTILABEL=1`. PRET still computes one-vs-rest class scores internally, then combines the `N x CLASS_NUM` logits with `argmax` so each WSI receives exactly one predicted class. The terminal and records will include `multiclass test ...` and `multiclass mean ...` metrics with the same metric names used by multi-label evaluation: `acc_exact_match`, `acc_hamming`, `auc_micro`, `auc_macro`, `f1_micro`, `f1_macro`, and `f1_samples`. The saved repeat record also contains `labels`, `preds`, `logits`, `pred_onehot`, and a `confusion_matrix`.
 

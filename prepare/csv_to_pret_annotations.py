@@ -372,7 +372,7 @@ def parse_points(coord_text, width, height, clip=True):
     if len(nums) < 4 or len(nums) % 2 != 0:
         raise ValueError(f'coordinates must contain 2 or more x/y pairs, got: {coord_text!r}')
 
-    points = []
+    relative_points = []
     for i in range(0, len(nums), 2):
         x_rel, y_rel = nums[i], nums[i + 1]
         if clip:
@@ -380,19 +380,21 @@ def parse_points(coord_text, width, height, clip=True):
             y_rel = min(1.0, max(0.0, y_rel))
         elif not (0 <= x_rel <= 1 and 0 <= y_rel <= 1):
             raise ValueError(f'normalized coordinate out of [0, 1]: ({x_rel}, {y_rel})')
-        points.append((x_rel * width, y_rel * height))
+        relative_points.append((x_rel, y_rel))
 
-    if len(points) == 2:
-        (x1, y1), (x2, y2) = points
+    if len(relative_points) == 2:
+        (x1, y1), (x2, y2) = relative_points
         left, right = sorted([x1, x2])
         top, bottom = sorted([y1, y2])
-        points = [
+        relative_points = [
             (left, top),
             (right, top),
             (right, bottom),
             (left, bottom),
         ]
-    return points
+
+    points = [(x * width, y * height) for x, y in relative_points]
+    return points, relative_points
 
 
 def normalize_label_value(value):
@@ -510,7 +512,7 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
                 wsi_size_map,
                 slide_readers=slide_readers,
             )
-            points = parse_points(coords, width, height, clip=not args.no_clip)
+            points, relative_points = parse_points(coords, width, height, clip=not args.no_clip)
 
             if not labels:
                 skipped['<empty>'] += 1
@@ -530,6 +532,7 @@ def read_regions(args, label_map, size_map, h5_size_map=None, wsi_size_map=None,
                     'label_id': label_id,
                     'annotation_id': pret_annotation_id(label_id, args.prompt_type),
                     'points': points,
+                    'relative_points': relative_points,
                     'size': (width, height),
                 })
             report_csv_progress()
@@ -1056,6 +1059,131 @@ def _fill_polygon_numpy_local(mask, contour):
     mask[min_y:max_y, min_x:max_x][inside] = 1
 
 
+def h5_relative_canvas_from_coords(coords, oversample=4, origin='zero'):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[0] == 0 or coords.shape[1] < 2:
+        raise ValueError(f'h5 coordinates must have shape (N, >=2), got {coords.shape}')
+
+    oversample = max(1, int(oversample))
+    x_step = infer_axis_step(coords[:, 0]) or 1
+    y_step = infer_axis_step(coords[:, 1]) or 1
+    if x_step <= 0 or y_step <= 0:
+        raise ValueError(f'cannot infer positive h5 coordinate step: x={x_step}, y={y_step}')
+
+    min_x = float(coords[:, 0].min())
+    min_y = float(coords[:, 1].min())
+    if origin == 'bbox':
+        origin_x, origin_y = min_x, min_y
+    else:
+        origin_x, origin_y = min(0.0, min_x), min(0.0, min_y)
+
+    grid_w = (float(coords[:, 0].max()) - origin_x) / float(x_step) + 1.0
+    grid_h = (float(coords[:, 1].max()) - origin_y) / float(y_step) + 1.0
+    if grid_w <= 0 or grid_h <= 0:
+        raise ValueError(f'invalid relative h5 grid size: {grid_w}x{grid_h}')
+
+    synthetic_coords = np.empty((coords.shape[0], 2), dtype=np.float64)
+    synthetic_coords[:, 0] = ((coords[:, 0] - origin_x) / float(x_step)) * oversample
+    synthetic_coords[:, 1] = ((coords[:, 1] - origin_y) / float(y_step)) * oversample
+    canvas_w = grid_w * oversample
+    canvas_h = grid_h * oversample
+    full_mid_w = max(1, int(math.ceil(canvas_w)))
+    full_mid_h = max(1, int(math.ceil(canvas_h)))
+    meta = {
+        'x_step': int(x_step),
+        'y_step': int(y_step),
+        'origin_x': origin_x,
+        'origin_y': origin_y,
+        'grid_w': grid_w,
+        'grid_h': grid_h,
+        'canvas_w': canvas_w,
+        'canvas_h': canvas_h,
+        'oversample': oversample,
+    }
+    return synthetic_coords, oversample, full_mid_h, full_mid_w, meta
+
+
+def regions_to_relative_canvas(regions, canvas_w, canvas_h):
+    out = []
+    for region in regions:
+        rel_points = region.get('relative_points')
+        if rel_points is None:
+            width, height = region['size']
+            rel_points = [(x / width, y / height) for x, y in region['points']]
+
+        converted = dict(region)
+        converted['points'] = [
+            (
+                min(1.0, max(0.0, float(x))) * canvas_w,
+                min(1.0, max(0.0, float(y))) * canvas_h,
+            )
+            for x, y in rel_points
+        ]
+        out.append(converted)
+    return out
+
+
+def labels_for_h5_relative_coordinates(
+    regions,
+    h5_path,
+    multi_label=False,
+    class_num=0,
+    binary_labels=True,
+    coords=None,
+    oversample=4,
+    origin='zero',
+):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('Writing h5 patch labels requires numpy') from exc
+
+    if coords is None:
+        coords = read_h5_coordinates(h5_path)
+    synthetic_coords, synthetic_patch_scale, full_mid_h, full_mid_w, meta = h5_relative_canvas_from_coords(
+        coords,
+        oversample=oversample,
+        origin=origin,
+    )
+    relative_regions = regions_to_relative_canvas(regions, meta['canvas_w'], meta['canvas_h'])
+
+    def _compute(regs):
+        return _compute_patch_labels_chunked(
+            synthetic_coords,
+            regs,
+            synthetic_patch_scale,
+            1,
+            full_mid_h,
+            full_mid_w,
+        )
+
+    if multi_label:
+        if class_num <= 0:
+            raise ValueError('--multi-label h5 label writing requires at least one class')
+        labels = np.zeros((coords.shape[0], class_num), dtype=np.uint8)
+        for cls in range(1, class_num + 1):
+            cls_regions = [r for r in relative_regions if int(r['label_id']) == cls]
+            if not cls_regions:
+                continue
+            labels[:, cls - 1] = _compute(cls_regions)
+        return labels, meta
+
+    if binary_labels:
+        return _compute(relative_regions), meta
+
+    labels = np.zeros(coords.shape[0], dtype=np.uint16)
+    for cls in sorted({int(r['label_id']) for r in relative_regions}):
+        cls_regions = [r for r in relative_regions if int(r['label_id']) == cls]
+        cls_hits = _compute(cls_regions)
+        labels[cls_hits == 1] = cls
+    return labels, meta
+
+
 def labels_for_h5_coordinates(
     regions,
     h5_path,
@@ -1130,6 +1258,9 @@ def write_h5_label_files(
     binary_labels=True,
     h5_metadata=None,
     h5_files=None,
+    label_coordinate_space='relative',
+    relative_oversample=4,
+    relative_origin='zero',
 ):
     if not h5_label_out:
         return {}, 0
@@ -1157,21 +1288,41 @@ def write_h5_label_files(
         label_ids = sorted({int(r['label_id']) for r in regions})
         print(
             f'[info] writing h5 labels {idx}/{total}: {slide_name} '
-            f'mode={slide_coordinate_mode} patch_scale={slide_patch_scale} '
+            f'coordinate_space={label_coordinate_space} mode={slide_coordinate_mode} patch_scale={slide_patch_scale} '
             f'regions={len(regions)} labels={label_ids}',
             flush=True,
         )
         start = time.perf_counter()
-        labels = labels_for_h5_coordinates(
-            regions,
-            h5_path,
-            slide_patch_scale,
-            coordinate_mode=slide_coordinate_mode,
-            multi_label=multi_label,
-            class_num=class_num,
-            binary_labels=binary_labels,
-            coords=None,
-        )
+        if label_coordinate_space == 'relative':
+            coords = read_h5_coordinates(h5_path)
+            labels, relative_meta = labels_for_h5_relative_coordinates(
+                regions,
+                h5_path,
+                multi_label=multi_label,
+                class_num=class_num,
+                binary_labels=binary_labels,
+                coords=coords,
+                oversample=relative_oversample,
+                origin=relative_origin,
+            )
+            print(
+                f'[info] relative h5 layout {slide_name}: '
+                f'x_step={relative_meta["x_step"]} y_step={relative_meta["y_step"]} '
+                f'grid={relative_meta["grid_w"]:.1f}x{relative_meta["grid_h"]:.1f} '
+                f'origin={relative_origin} oversample={relative_meta["oversample"]}',
+                flush=True,
+            )
+        else:
+            labels = labels_for_h5_coordinates(
+                regions,
+                h5_path,
+                slide_patch_scale,
+                coordinate_mode=slide_coordinate_mode,
+                multi_label=multi_label,
+                class_num=class_num,
+                binary_labels=binary_labels,
+                coords=None,
+            )
         out_path = os.path.join(h5_label_out, slide_name + '.npy')
         np_save(out_path, labels)
         pos_counts[slide_name] = count_positive_h5_patches(labels)
@@ -1291,7 +1442,13 @@ def parse_args():
     parser.add_argument('--slide-reader', default='auto', choices=['auto', 'openslide', 'opensdpc'],
         help='slide reader used for WSI sizes; auto tries OpenSlide first, then opensdpc for sdpc-like files')
     parser.add_argument('--h5-coordinate-mode', default='grid', choices=['pixel', 'grid'],
-        help='how to interpret h5 coordinates: pixel=level-0 top-left pixels, grid=patch indices')
+        help='legacy absolute h5 label mode and evaluation visualization coordinate interpretation: pixel=level-0 top-left pixels, grid=patch indices')
+    parser.add_argument('--h5-label-coordinate-space', default='relative', choices=['relative', 'absolute'],
+        help='how to align CSV annotations to h5 patches when writing --h5-label-out; relative uses normalized CSV coordinates and the h5 patch layout, absolute uses legacy grid/pixel + patch-scale coordinates')
+    parser.add_argument('--h5-relative-origin', default='zero', choices=['zero', 'bbox'],
+        help='origin for relative h5 label alignment: zero preserves coordinate origin 0, bbox normalizes the observed h5 patch bounding box to [0,1]')
+    parser.add_argument('--h5-relative-oversample', type=int, default=4,
+        help='sub-patch rasterization factor for relative h5 label alignment; larger is more boundary-sensitive but slower')
     parser.add_argument('--patch-scale', type=int, default=0,
         help='level-0 pixels per patch; 0 infers from h5 pixel coordinates or WSI size for h5 grid coordinates, otherwise uses 512')
     parser.add_argument('--prompt-type', default='mask',
@@ -1331,6 +1488,8 @@ def parse_args():
         args.skip_missing_h5 = bool(args.h5_label_out)
     if args.patch_scale < 0:
         parser.error('--patch-scale must be >= 0')
+    if args.h5_relative_oversample <= 0:
+        parser.error('--h5-relative-oversample must be > 0')
     return args
 
 
@@ -1414,6 +1573,9 @@ def main():
         binary_labels=h5_binary_labels,
         h5_metadata=h5_metadata,
         h5_files=h5_files,
+        label_coordinate_space=args.h5_label_coordinate_space,
+        relative_oversample=args.h5_relative_oversample,
+        relative_origin=args.h5_relative_origin,
     )
     write_data_info(
         regions_by_slide,
