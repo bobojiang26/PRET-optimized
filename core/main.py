@@ -1946,7 +1946,8 @@ def evaluate(args, val_only=False):
                 example_labels = execute_mask_subtyping_tagger(
                     example_feats, example_labels, example_patch_names,
                     example_names, example_wsi_binary_labels,
-                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk
+                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                    retag_anchors=args.mask_subtyping_retag_anchors
                 )
             
             # subtyping + box / roughMask. Need to process "execute_tagger" twice. 
@@ -3012,6 +3013,8 @@ if __name__ == '__main__':
         help='for mask+multilabel examples: all_zero treats every non-target patch as negative; other_positive uses only other annotated classes as hard negatives and ignores unannotated patches; none uses no negative reference tokens')
     parser.add_argument('--mask_subtyping_tagger', default=False, action='store_true',
         help='for multiclass or multilabel mask prompts, refine unknown mask tokens with a mask-compatible one-vs-rest subtyping tagger')
+    parser.add_argument('--mask_subtyping_retag_anchors', default=False, action='store_true',
+        help='when --mask_subtyping_tagger is enabled, also re-evaluate original 0/1 mask anchor tokens instead of only unknown 255/254/-1 tokens')
     parser.add_argument('--require_label', default=False, action='store_true',
         help='exclude WSIs without real labels from example construction and evaluation; unlabeled and pseudo-labeled slides are skipped')
     parser.add_argument('--seed_torch_sampling', default=False, action='store_true',

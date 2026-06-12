@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument('--h5_patch_size', '--h5-patch-size', type=int, default=512)
     parser.add_argument('--run_mask_tagger', '--run-mask-tagger', action='store_true',
         help='run execute_mask_subtyping_tagger on selected slides before plotting the after_tagger panel')
+    parser.add_argument('--mask_subtyping_retag_anchors', '--mask-subtyping-retag-anchors', action='store_true',
+        help='when --run_mask_tagger is set, also re-evaluate original 0/1 anchor tokens')
     parser.add_argument('--topk', type=int, default=3)
     parser.add_argument('--ignore', type=float, default=0.0, help='uncertainty width passed to mask tagger')
     parser.add_argument('--device', default='auto', choices=['auto', 'cuda', 'cpu'])
@@ -385,7 +387,8 @@ def run_mask_tagger_for_class(slides, slide_data, dataset_info, cls, args):
     labels_t = torch.from_numpy(np.concatenate(labels, 0).astype(np.int64, copy=False)).to(device)
     labels_t = execute_mask_subtyping_tagger(
         feats_t, labels_t, patch_names, wsi_names, wsi_binary_labels,
-        vis_info=None, uncertain=args.ignore, topk=args.topk
+        vis_info=None, uncertain=args.ignore, topk=args.topk,
+        retag_anchors=args.mask_subtyping_retag_anchors
     )
     labels_np = labels_t.detach().cpu().numpy()
     return {slide: labels_np[start:end] for slide, (start, end) in offsets.items()}

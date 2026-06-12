@@ -536,9 +536,10 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
 
 
 def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_binary_labels, \
-        vis_info=None, uncertain=0.1, topk=40):
-    pos_anchor = labels == 1
-    neg_anchor = labels == 0
+        vis_info=None, uncertain=0.1, topk=40, retag_anchors=False):
+    initial_labels = labels.clone()
+    pos_anchor = initial_labels == 1
+    neg_anchor = initial_labels == 0
     pos_count = int(pos_anchor.sum().item())
     neg_count = int(neg_anchor.sum().item())
     if pos_count == 0 or neg_count == 0:
@@ -557,6 +558,9 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
     label_by_wsi = dict(wsi_binary_labels)
     assigned_pos, assigned_neg, kept_bg, kept_uncertain = 0, 0, 0, 0
     total_unknown = 0
+    total_anchor_candidates = 0
+    changed_anchors = 0
+    fallback_current_wsi_refs = 0
 
     for n in wsi_names:
         idx = []
@@ -573,14 +577,32 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
             raise ValueError(f'Mask subtyping WSI label must be 0 or 1, got {wsi_label} for {n}')
 
         idx_t = torch.as_tensor(idx, device=labels.device, dtype=torch.long)
-        unknown_mask = (labels[idx_t] == 255) | (labels[idx_t] == 254) | (labels[idx_t] == -1)
-        if int(unknown_mask.sum().item()) == 0:
+        labels_n_initial = initial_labels[idx_t]
+        unknown_mask = (labels_n_initial == 255) | (labels_n_initial == 254) | (labels_n_initial == -1)
+        anchor_mask = (labels_n_initial == 0) | (labels_n_initial == 1)
+        candidate_mask = unknown_mask | anchor_mask if retag_anchors else unknown_mask
+        if int(candidate_mask.sum().item()) == 0:
             continue
 
-        unknown_idx = idx_t[unknown_mask]
-        unknown_feats = feats[unknown_idx]
-        sim_pos = compute_similarity(unknown_feats, feats[pos_anchor], topk=topk)
-        sim_neg = compute_similarity(unknown_feats, feats[neg_anchor], topk=topk)
+        candidate_idx = idx_t[candidate_mask]
+        candidate_initial = initial_labels[candidate_idx]
+        candidate_feats = feats[candidate_idx]
+
+        ref_pos_anchor = pos_anchor
+        ref_neg_anchor = neg_anchor
+        if retag_anchors:
+            other_pos_anchor = pos_anchor.clone()
+            other_neg_anchor = neg_anchor.clone()
+            other_pos_anchor[idx_t] = False
+            other_neg_anchor[idx_t] = False
+            if int(other_pos_anchor.sum().item()) > 0 and int(other_neg_anchor.sum().item()) > 0:
+                ref_pos_anchor = other_pos_anchor
+                ref_neg_anchor = other_neg_anchor
+            else:
+                fallback_current_wsi_refs += 1
+
+        sim_pos = compute_similarity(candidate_feats, feats[ref_pos_anchor], topk=topk)
+        sim_neg = compute_similarity(candidate_feats, feats[ref_neg_anchor], topk=topk)
         if wsi_label == 1:
             target_sim = sim_pos
             other_sim = sim_neg
@@ -589,10 +611,10 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
             other_sim = sim_pos
 
         fg_score = normalize_similarity_values(torch.maximum(sim_pos, sim_neg))
-        fg_labels = torch.zeros(unknown_feats.shape[0], device=labels.device).long()
+        fg_labels = torch.zeros(candidate_feats.shape[0], device=labels.device).long()
         fg_labels = basic_tagger(fg_score, fg_labels == 0, fg_labels, uncertain, positive=True)
 
-        updated = torch.full((unknown_feats.shape[0],), 255, device=labels.device, dtype=torch.long)
+        updated = torch.full((candidate_feats.shape[0],), 255, device=labels.device, dtype=torch.long)
         updated[fg_labels == -1] = 254
         class_candidate = fg_labels == 1
 
@@ -605,8 +627,12 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
             class_updated[class_labels == -1] = 254
             updated[class_candidate] = class_updated
 
-        labels[unknown_idx] = updated
-        total_unknown += int(updated.shape[0])
+        labels[candidate_idx] = updated
+        candidate_anchor = (candidate_initial == 0) | (candidate_initial == 1)
+        total_unknown += int((~candidate_anchor).sum().item())
+        total_anchor_candidates += int(candidate_anchor.sum().item())
+        if int(candidate_anchor.sum().item()) > 0:
+            changed_anchors += int((updated[candidate_anchor] != candidate_initial[candidate_anchor]).sum().item())
         assigned_pos += int((updated == 1).sum().item())
         assigned_neg += int((updated == 0).sum().item())
         kept_bg += int((updated == 255).sum().item())
@@ -614,11 +640,14 @@ def execute_mask_subtyping_tagger(feats, labels, patch_names, wsi_names, wsi_bin
 
     print(
         '[tagger] mask subtyping: refined unknown tokens=' + str(total_unknown) +
+        ', retag_anchor_tokens=' + str(total_anchor_candidates) +
+        ', changed_anchors=' + str(changed_anchors) +
         ', assigned_pos=' + str(assigned_pos) +
         ', assigned_neg=' + str(assigned_neg) +
         ', background=' + str(kept_bg) +
         ', uncertain=' + str(kept_uncertain) +
-        ', anchors pos/neg=' + str(pos_count) + '/' + str(neg_count)
+        ', anchors pos/neg=' + str(pos_count) + '/' + str(neg_count) +
+        ', fallback_current_wsi_refs=' + str(fallback_current_wsi_refs)
     )
     return labels
 

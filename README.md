@@ -290,7 +290,7 @@ python scripts/visualize_mask_processing.py \
   --h5_patch_size 512
 ```
 
-This writes per-slide/per-class SVG panels for raw target-vs-other labels, PRET's initial one-vs-rest mask labels, and the final `0/1` reference tokens kept after dropping ignored labels. Add `--run_mask_tagger` to also draw the post-refinement mask labels produced by `execute_mask_subtyping_tagger`.
+This writes per-slide/per-class SVG panels for raw target-vs-other labels, PRET's initial one-vs-rest mask labels, and the final `0/1` reference tokens kept after dropping ignored labels. Add `--run_mask_tagger` to also draw the post-refinement mask labels produced by `execute_mask_subtyping_tagger`. Add `--mask_subtyping_retag_anchors` when you also want the visualizer to re-evaluate the original `0/1` mask anchor tokens, matching `MASK_SUBTYPING_RETAG_ANCHORS=1` during evaluation.
 
 ### H5 mask evaluation from CSV annotations
 
@@ -803,6 +803,7 @@ SIMILARITY_AGGREGATION=adaptive CONTEXT_CENTERING=joint SPATIAL_SMOOTH_STRENGTH=
    - 默认 `other_positive`：当前类标注 token 是 `1`，其他已标注癌区 token 是 hard negative `0`，未标注/框外 token 作为 `255` 忽略，不进入 reference pool。
    - `all_zero` 保留旧逻辑：当前类列为 `0` 的所有 token 都作为负样本。只有当标注是穷尽的、框外区域确实可靠阴性时才建议使用。
    - `none` 只用当前类阳性 reference，不使用负样本，主要用于消融诊断。
+   - `MASK_SUBTYPING_TAGGER=1` 默认只会重新评估 `255/254/-1` unknown token，原始 `0/1` mask token 作为 anchor 保持不变。若怀疑 mask 中原始 `0/1` 也有噪声，可额外设置 `MASK_SUBTYPING_RETAG_ANCHORS=1`，对应直接运行时的 `--mask_subtyping_retag_anchors`。开启后，tagger 会用原始 `0/1` 作为初始参照，并优先用其他 WSI 的 anchor 重新评估当前 WSI 的 `0/1/255/254/-1` token；原始 anchor 可能被改成 `0/1/255/254`。
    - h5 wrapper 现在也支持 `BALANCED_VAL_SPLIT=1`、`DISJOINT_VAL_TEST_SPLIT=1` 和 `VAL_RATIO=0.2`。多标签下的 balanced validation 会优先覆盖稀有类别，减少某些类别 calibration 缺正例导致阈值不稳定的问题。
 
 19. **按类别比例采样 example**
